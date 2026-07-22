@@ -31,6 +31,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(HERE, "web")
 PROJECT_ROOT = collector.PROJECT_ROOT
 COVERS_DIR = os.path.join(PROJECT_ROOT, "data", "covers")
+PROGRESS_FILE = os.path.join(PROJECT_ROOT, "data", "sync_progress.json")
+RESULT_FILE = os.path.join(PROJECT_ROOT, "data", "sync_result.json")
 
 # 同步状态（后台线程写，前端轮询读）
 sync_state = {"running": False, "last": None, "started_at": 0}
@@ -59,6 +61,85 @@ def human_dt(ts):
     if not ts:
         return ""
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
+def get_sync_meta():
+    """读取数据版本 / 最后成功同步时间 / 总条数，供前端常驻文字展示。"""
+    meta = {"version": None, "last_success_at": None, "total": 0}
+    db = get_db_path()
+    if os.path.exists(db):
+        conn = sqlite3.connect(db)
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key='sync_version'").fetchone()
+            if row:
+                meta["version"] = int(row[0])
+            row = conn.execute("SELECT value FROM meta WHERE key='last_success_at'").fetchone()
+            if row:
+                meta["last_success_at"] = int(row[0])
+            row = conn.execute("SELECT COUNT(*) FROM history").fetchone()
+            meta["total"] = row[0]
+        finally:
+            conn.close()
+    return meta
+
+
+def read_progress_file():
+    if os.path.exists(PROGRESS_FILE):
+        try:
+            with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def bump_sync_meta():
+    """同步成功后递增数据版本并记录最后成功时间。"""
+    db = get_db_path()
+    if not os.path.exists(db):
+        return
+    conn = sqlite3.connect(db)
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key='sync_version'").fetchone()
+        ver = int(row[0]) if row else 0
+        ver += 1
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES('sync_version',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(ver),),
+        )
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES('last_success_at',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(now),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def ensure_initial_meta():
+    """服务启动时，若已有数据但无版本记录，把初始载入记为 v1。"""
+    db = get_db_path()
+    if not os.path.exists(db):
+        return
+    conn = sqlite3.connect(db)
+    try:
+        cnt = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+        has_ver = conn.execute("SELECT 1 FROM meta WHERE key='sync_version'").fetchone()
+        if cnt > 0 and not has_ver:
+            conn.execute("INSERT INTO meta(key,value) VALUES('sync_version','1')")
+            lr = conn.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone()
+            if lr:
+                conn.execute(
+                    "INSERT INTO meta(key,value) VALUES('last_success_at',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (lr[0],),
+                )
+            conn.commit()
+    finally:
+        conn.close()
 
 
 def cover_ext(url):
@@ -120,6 +201,20 @@ def build_query(params):
     if date_to and date_to.isdigit():
         wheres.append("view_at <= ?")
         args.append(int(date_to))
+    # 时长筛选（秒）
+    dur_min = params.get("duration_min")
+    dur_max = params.get("duration_max")
+    if dur_min and dur_min.isdigit():
+        wheres.append("duration >= ?")
+        args.append(int(dur_min))
+    if dur_max and dur_max.isdigit():
+        wheres.append("duration <= ?")
+        args.append(int(dur_max))
+    # 设备筛选（dt 值，从 raw_json 提取）[V2]
+    dt = (params.get("dt") or "").strip()
+    if dt:
+        wheres.append("CAST(json_extract(raw_json, '$.history.dt') AS INTEGER) = ?")
+        args.append(int(dt))
     where_sql = (" WHERE " + " AND ".join(wheres)) if wheres else ""
     order = "view_at DESC"
     return where_sql, args, order
@@ -140,7 +235,9 @@ def fetch_history(params):
         ).fetchone()["n"]
         rows = conn.execute(
             f"SELECT kid, title, author_name, author_mid, view_at, bvid, business, "
-            f"cover, progress, duration, uri, archived_only "
+            f"cover, progress, duration, uri, archived_only, "
+            f"json_extract(raw_json, '$.history.dt') AS dt, "
+            f"json_extract(raw_json, '$.live_status') AS live_status "
             f"FROM history{where_sql} ORDER BY {order} LIMIT ? OFFSET ?",
             args + [limit, offset],
         ).fetchall()
@@ -154,13 +251,40 @@ def run_sync_background():
     def _job():
         sync_state["running"] = True
         sync_state["started_at"] = int(time.time())
+        # 清掉上一轮完成标记，避免前端误读旧结论
+        try:
+            if os.path.exists(RESULT_FILE):
+                os.remove(RESULT_FILE)
+        except Exception:
+            pass
         try:
             subprocess.run(
                 [sys.executable, os.path.join(HERE, "collector.py")],
                 cwd=PROJECT_ROOT,
                 timeout=600,
             )
-            sync_state["last"] = {"ok": True, "at": int(time.time())}
+            # 以 collector 写出的完成结论为准，而非子进程退出码
+            # （中途 break 也会 returncode=0，必须区分「完整完成」与「部分/失败」）
+            res = None
+            if os.path.exists(RESULT_FILE):
+                try:
+                    with open(RESULT_FILE, "r", encoding="utf-8") as f:
+                        res = json.load(f)
+                except Exception:
+                    res = None
+            completed = bool(res and res.get("completed"))
+            if completed:
+                bump_sync_meta()  # 只有真正完整拉取才更新数据版本
+                sync_state["last"] = {
+                    "ok": True,
+                    "at": int(time.time()),
+                    "fetched": (res or {}).get("fetched"),
+                }
+            else:
+                reason = (res or {}).get("error") or "同步未完成"
+                sync_state["last"] = {"ok": False, "at": int(time.time()), "err": reason}
+        except subprocess.TimeoutExpired:
+            sync_state["last"] = {"ok": False, "at": int(time.time()), "err": "同步超时（>600s）"}
         except Exception as e:  # noqa
             sync_state["last"] = {"ok": False, "at": int(time.time()), "err": str(e)}
         finally:
@@ -221,8 +345,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/sync":
             self._send(200, {
                 "running": sync_state["running"],
+                "progress": read_progress_file(),
                 "last": sync_state["last"],
                 "started_at": sync_state["started_at"],
+                "meta": get_sync_meta(),
             })
             return
         if path.startswith("/cover/"):
@@ -259,6 +385,16 @@ class Handler(BaseHTTPRequestHandler):
             if sync_state["running"]:
                 self._send(200, {"started": False, "running": True})
             else:
+                # 重置进度文件，避免前端残留上一轮的「完成」状态
+                try:
+                    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+                        json.dump({
+                            "phase": "start", "page": 0, "fetched": 0,
+                            "completed": False, "is_end": False,
+                            "total_estimate": None, "updated_at": int(time.time()),
+                        }, f)
+                except Exception:
+                    pass
                 run_sync_background()
                 self._send(200, {"started": True, "running": True})
             return
@@ -267,6 +403,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = get_web_port()
+    ensure_initial_meta()
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"[B站历史查看器] 已启动: http://127.0.0.1:{port}")
     print(f"[B站历史查看器] 数据库: {get_db_path()}")

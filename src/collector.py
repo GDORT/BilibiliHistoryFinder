@@ -30,6 +30,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(HERE)
 DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "config.json")
 DEFAULT_DB = os.path.join(PROJECT_ROOT, "data", "bilibili_history.db")
+PROGRESS_FILE = os.path.join(PROJECT_ROOT, "data", "sync_progress.json")
+RESULT_FILE = os.path.join(PROJECT_ROOT, "data", "sync_result.json")
 API_URL = "https://api.bilibili.com/x/web-interface/history/cursor"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -39,6 +41,54 @@ REFERER = "https://www.bilibili.com"
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}")
+
+
+def write_progress(page, fetched, phase, completed=False, is_end=False, total_estimate=None, error=None):
+    """把同步进度写到 data/sync_progress.json（server 轮询读取，前端展示进度条）。
+
+    total_estimate 是进度条分母的估计值：用已有条数初设，拉取过程中若超出则放大，
+    使前端能算出真实百分比（而非无限加载动画）。
+    """
+    try:
+        payload = {
+            "phase": phase,
+            "page": page,
+            "fetched": fetched,
+            "completed": completed,
+            "is_end": is_end,
+            "total_estimate": total_estimate,
+            "updated_at": int(time.time()),
+        }
+        if error is not None:
+            payload["error"] = error
+        tmp = PROGRESS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, PROGRESS_FILE)
+    except Exception:
+        pass
+
+
+def write_result(completed, fetched, total_estimate, error=None):
+    """同步结束结论：是否真正完整拉取成功（供 server 判定是否更新数据版本）。
+
+    与子进程退出码解耦——collector 中途 break（网络/接口错）也是 returncode 0，
+    必须用此结论区分「完整完成」与「部分/失败」。
+    """
+    try:
+        payload = {
+            "completed": completed,
+            "fetched": fetched,
+            "total_estimate": total_estimate,
+            "error": error,
+            "finished_at": int(time.time()),
+        }
+        tmp = RESULT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, RESULT_FILE)
+    except Exception:
+        pass
 
 
 def load_config(path):
@@ -211,30 +261,43 @@ def run(config, db_path, limit_pages=None, incremental=False):
     last_sync_row = conn.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone()
     last_sync_int = int(last_sync_row[0]) if last_sync_row else 0
 
+    # 进度条分母初值：用已有条数估计（全量重拉的合理上限）；首次为空时给一个保守初值
+    existing = conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+    total_estimate = existing if existing > 0 else 120
+
     max_v, view_at, business = 0, 0, ""
     pages, total = 0, 0
     added = updated = 0
+    completed = False
+    err_msg = None
+    write_progress(0, 0, "fetch", completed=False, is_end=False, total_estimate=total_estimate)
     seen_cur = conn.cursor()
     while True:
         if limit_pages is not None and pages >= limit_pages:
+            err_msg = "已达到 --limit-pages 上限（调试用，非完整同步）"
             break
         try:
             data = fetch_page(sessdata, ps, max_v, view_at, business)
         except urllib.error.HTTPError as e:
             log(f"❌ HTTP 错误 {e.code}: {e.reason}")
+            err_msg = f"HTTP 错误 {e.code}"
             break
         except urllib.error.URLError as e:
             log(f"❌ 网络错误: {e.reason}")
+            err_msg = f"网络错误: {e.reason}"
             break
 
         if data.get("code") != 0:
             log(f"❌ 接口返回错误 code={data.get('code')} message={data.get('message')}")
             if data.get("code") in (-101, -111):
                 log("   → 登录态失效/未登录，请更新 SESSDATA。")
+            err_msg = f"接口错误 code={data.get('code')}"
             break
 
         items = (data.get("data") or {}).get("list") or []
         if not items:
+            # 没有更多数据 = 已完整拉取
+            completed = True
             break
 
         for it in items:
@@ -255,47 +318,66 @@ def run(config, db_path, limit_pages=None, incremental=False):
         if pages % 10 == 0:
             log(f"已处理 {pages} 页，累计 {total} 条…")
         conn.commit()  # 每页提交，避免中断丢数据
+        # 估计分母：已拉取数超过估计则放大，使进度条持续推进
+        if total > total_estimate:
+            total_estimate = total
+        write_progress(pages, total, "fetch", completed=False, is_end=False, total_estimate=total_estimate)
 
         cursor = (data.get("data") or {}).get("cursor") or {}
         if cursor.get("is_end"):
-            log("已到末尾（cursor.is_end=true）。")
+            log("已到末尾（cursor.is_end=true），完整拉取完成。")
+            completed = True
             break
         n_max = cursor.get("max")
         n_view = cursor.get("view_at")
         n_business = cursor.get("business")
         if n_max == max_v and n_view == view_at:
-            log("游标未推进，停止以避免死循环。")
+            log("游标未推进，停止以避免死循环（仅部分同步）。")
+            err_msg = "游标未推进（疑似接口异常，仅部分同步）"
             break
         # 增量边界：已越过上次同步时刻，更早的条目不会变化，停止
         if incremental and last_sync_int and n_view and n_view < last_sync_int:
-            log(f"到达增量边界（view_at {n_view} < 上次同步 {last_sync_int}），停止。")
+            log(f"到达增量边界（view_at {n_view} < 上次同步 {last_sync_int}），本次增量完成。")
+            completed = True
             break
         max_v, view_at, business = n_max, n_view, n_business
         if interval > 0:
             time.sleep(interval)
 
-    # 全量同步：标记本轮未被返回的条目为"仅本地存档"（不硬删，保留留存价值）
+    # 全量同步：仅在「真正完整拉取」后才标记归档（避免部分拉取误把有效记录标为存档）
     archived = 0
-    if not incremental:
-        cur = conn.execute(
-            "UPDATE history SET archived_only=1 "
-            "WHERE (last_seen_sync IS NULL OR last_seen_sync < ?) AND archived_only=0",
-            (now,),
-        )
-        archived = cur.rowcount
+    if completed:
+        if not incremental:
+            cur = conn.execute(
+                "UPDATE history SET archived_only=1 "
+                "WHERE (last_seen_sync IS NULL OR last_seen_sync < ?) AND archived_only=0",
+                (now,),
+            )
+            archived = cur.rowcount
+            conn.execute(
+                "INSERT INTO meta(key,value) VALUES('last_full_sync',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(now),),
+            )
+        # 只有完整同步才推进 last_sync（作为下次增量边界；部分同步不推进，便于重试续拉）
         conn.execute(
-            "INSERT INTO meta(key,value) VALUES('last_full_sync',?) "
+            "INSERT INTO meta(key,value) VALUES('last_sync',?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(now),),
         )
 
-    log(f"完成：{pages} 页 / {total} 条（新增 {added}，更新 {updated}，"
-        f"标记归档 {archived}）{'[增量]' if incremental else '[全量]'}；写入 {db_path}")
-    conn.execute(
-        "INSERT INTO meta(key,value) VALUES('last_sync',?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (str(now),),
-    )
+    # 同步结论落地（server 轮询读取；前端进度条/完成文字）
+    if completed:
+        write_progress(pages, total, "done", completed=True, is_end=True, total_estimate=total_estimate)
+        write_result(True, total, total_estimate, None)
+        log(f"✅ 同步完成：{pages} 页 / {total} 条（新增 {added}，更新 {updated}，"
+            f"标记归档 {archived}）{'[增量]' if incremental else '[全量]'}；写入 {db_path}")
+    else:
+        write_progress(pages, total, "error", completed=False, is_end=False,
+                       total_estimate=total_estimate, error=err_msg)
+        write_result(False, total, total_estimate, err_msg)
+        log(f"⚠️ 同步未完成：{err_msg or '未知原因'}（已拉取 {total} 条，不更新数据版本）；写入 {db_path}")
+
     conn.commit()
     conn.close()
     return 0

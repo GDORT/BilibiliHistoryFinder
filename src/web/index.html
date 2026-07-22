@@ -7,37 +7,86 @@
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
+  <!-- 顶部工具栏 -->
   <header class="topbar">
-    <div class="brand">B站历史查看器</div>
-    <div class="search">
-      <input id="q" type="text" placeholder="搜索标题 / UP主 / BV号" autocomplete="off" />
+    <div class="topbar-inner">
+      <nav class="tabs">
+        <button class="tab active" data-biz="">综合</button>
+        <button class="tab" data-biz="archive">视频</button>
+        <button class="tab" data-biz="live">直播</button>
+        <button class="tab" data-biz="article">专栏</button>
+      </nav>
+
+      <!-- 本项目特殊筛选（工具栏中间） -->
+      <div class="special-filters">
+        <button class="sp-btn" id="spNeeds">需要观看</button>
+        <button class="sp-btn" id="spArch">含存档</button>
+      </div>
+
+      <div class="more-filter">
+        <button id="filterToggle" class="btn-filter">更多筛选 ▾</button>
+      </div>
+      <div class="search">
+        <input id="q" type="text" placeholder="搜索视频UP主或标题" autocomplete="off" />
+      </div>
+      <div class="top-actions">
+        <button id="syncBtn" class="btn-sm">同步数据</button>
+      </div>
     </div>
-    <div class="actions">
-      <button id="syncBtn" class="btn">立即同步</button>
+    <div class="topbar-status">
+      <div class="status-inner">
+        <div id="syncProgress" class="sync-progress hidden">
+          <div class="sync-bar"><i></i></div>
+          <span id="syncStep" class="sync-step">正在同步历史记录…</span>
+        </div>
+        <div id="syncDone" class="sync-done hidden">✓ 同步完成</div>
+        <span id="syncMeta" class="sync-meta">数据 v— · 更新于 —</span>
+      </div>
     </div>
   </header>
 
-  <section class="filters">
-    <label>类型
-      <select id="business">
-        <option value="">全部</option>
-        <option value="archive">视频</option>
-        <option value="pgc">番剧/影视</option>
-        <option value="live">直播</option>
-        <option value="article">专栏</option>
-      </select>
-    </label>
-    <label class="chk"><input type="checkbox" id="needs" /> 仅看「需要观看」(&lt;95%)</label>
-    <label class="chk"><input type="checkbox" id="archived" /> 含仅本地存档</label>
-    <label>从 <input type="date" id="dateFrom" /></label>
-    <label>到 <input type="date" id="dateTo" /></label>
-    <span id="stats" class="stats"></span>
+  <!-- 更多筛选面板（可折叠） -->
+  <section id="filterPanel" class="filter-panel hidden">
+    <div class="f-group">
+      <span class="f-label active" data-dur="">全部时长</span>
+      <span class="f-opt" data-dur="0-600">10分钟以下</span>
+      <span class="f-opt" data-dur="600-1800">10-30分钟</span>
+      <span class="f-opt" data-dur="1800-3600">30-60分钟</span>
+      <span class="f-opt" data-dur="3600-999999">60分钟以上</span>
+    </div>
+    <div class="f-group">
+      <span class="f-label active" data-time="">全部时间</span>
+      <span class="f-opt" data-time="today">今天</span>
+      <span class="f-opt" data-time="yesterday">昨天</span>
+      <span class="f-opt" data-time="week">近一周</span>
+      <input type="date" id="panelDateFrom" class="f-date" placeholder="开始日期" />
+      <span class="f-sep">至</span>
+      <input type="date" id="panelDateTo" class="f-date" placeholder="结束日期" />
+    </div>
+    <div class="f-group">
+      <span class="f-label active" data-dt="">全部设备</span>
+      <span class="f-opt" data-dt="2">设备A (dt=2)</span>
+      <span class="f-opt" data-dt="3">设备B (dt=3)</span>
+      <small class="f-note">⚠️ dt 含义未公开确认，标签为占位符</small>
+    </div>
   </section>
 
-  <main>
-    <ul id="list" class="list"></ul>
-    <div id="empty" class="empty hidden">没有匹配的记录</div>
-    <div id="loadMore" class="loadmore hidden"><button class="btn ghost" id="moreBtn">加载更多</button></div>
+  <!-- 主体：左侧时间导航 + 右侧卡片网格 -->
+  <main class="main-body">
+    <aside class="sidebar">
+      <div class="side-item active" data-range="today">今天</div>
+      <div class="side-item" data-range="yesterday">昨天</div>
+      <div class="side-item" data-range="week">近一周</div>
+      <div class="side-item" data-range="older">一周前</div>
+      <div class="side-item" data-range="month">一个月前</div>
+    </aside>
+
+    <section class="content">
+      <ul id="list" class="list"></ul>
+      <div id="empty" class="empty hidden">没有匹配的记录</div>
+      <div id="loadMore" class="loadmore hidden"><button class="btn ghost" id="moreBtn">加载更多</button></div>
+      <div id="stats" class="stats-bar"></div>
+    </section>
   </main>
 
   <div id="toast" class="toast hidden"></div>
