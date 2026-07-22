@@ -90,7 +90,9 @@ def init_db(db_path):
 
 
 def fetch_page(sessdata, ps, max_v, view_at, business):
-    params = {"ps": ps, "max": max_v, "view_at": view_at, "business": business}
+    params = {"ps": ps, "max": max_v, "view_at": view_at}
+    if business:
+        params["business"] = business
     url = API_URL + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(
         url,
@@ -194,7 +196,7 @@ def run(config, db_path, limit_pages=None):
         conn.close()
         return 0
 
-    max_v, view_at, business = 0, 0, "all"
+    max_v, view_at, business = 0, 0, ""
     pages, total = 0, 0
     while True:
         if limit_pages is not None and pages >= limit_pages:
