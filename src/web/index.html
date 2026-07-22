@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>B站历史查看器</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">B站历史查看器</div>
+    <div class="search">
+      <input id="q" type="text" placeholder="搜索标题 / UP主 / BV号" autocomplete="off" />
+    </div>
+    <div class="actions">
+      <button id="syncBtn" class="btn">立即同步</button>
+    </div>
+  </header>
+
+  <section class="filters">
+    <label>类型
+      <select id="business">
+        <option value="">全部</option>
+        <option value="archive">视频</option>
+        <option value="pgc">番剧/影视</option>
+        <option value="live">直播</option>
+        <option value="article">专栏</option>
+      </select>
+    </label>
+    <label class="chk"><input type="checkbox" id="needs" /> 仅看「需要观看」(&lt;95%)</label>
+    <label class="chk"><input type="checkbox" id="archived" /> 含仅本地存档</label>
+    <label>从 <input type="date" id="dateFrom" /></label>
+    <label>到 <input type="date" id="dateTo" /></label>
+    <span id="stats" class="stats"></span>
+  </section>
+
+  <main>
+    <ul id="list" class="list"></ul>
+    <div id="empty" class="empty hidden">没有匹配的记录</div>
+    <div id="loadMore" class="loadmore hidden"><button class="btn ghost" id="moreBtn">加载更多</button></div>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

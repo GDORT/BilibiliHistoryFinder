@@ -85,6 +85,15 @@ def init_db(db_path):
         )
         """
     )
+    # 迁移：增量同步 / 归档标记所需字段（幂等，列已存在则跳过）
+    for ddl in (
+        "ALTER TABLE history ADD COLUMN last_seen_sync INTEGER",
+        "ALTER TABLE history ADD COLUMN archived_only INTEGER NOT NULL DEFAULT 0",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     return conn
 
@@ -145,12 +154,12 @@ def upsert(conn, fields, now):
             kid, title, show_title, long_title, author_name, author_mid,
             view_at, bvid, oid, epid, cid, business, cover, progress,
             duration, uri, tag_name, badge, videos, raw_json,
-            created_at, updated_at
+            created_at, updated_at, last_seen_sync, archived_only
         ) VALUES (
             :kid, :title, :show_title, :long_title, :author_name, :author_mid,
             :view_at, :bvid, :oid, :epid, :cid, :business, :cover, :progress,
             :duration, :uri, :tag_name, :badge, :videos, :raw_json,
-            :created_at, :updated_at
+            :created_at, :updated_at, :last_seen_sync, 0
         )
         ON CONFLICT(kid) DO UPDATE SET
             title=excluded.title,
@@ -176,13 +185,15 @@ def upsert(conn, fields, now):
             badge=excluded.badge,
             videos=excluded.videos,
             raw_json=excluded.raw_json,
-            updated_at=excluded.updated_at
+            updated_at=excluded.updated_at,
+            last_seen_sync=excluded.last_seen_sync,
+            archived_only=0
         """,
-        {**fields, "created_at": now, "updated_at": now},
+        {**fields, "created_at": now, "updated_at": now, "last_seen_sync": now},
     )
 
 
-def run(config, db_path, limit_pages=None):
+def run(config, db_path, limit_pages=None, incremental=False):
     sessdata = (config.get("SESSDATA") or "").strip()
     ps = int(config.get("page_size", 30))
     interval = float(config.get("request_interval", 0.3))
@@ -196,8 +207,14 @@ def run(config, db_path, limit_pages=None):
         conn.close()
         return 0
 
+    # 上次同步时刻（增量边界 & 归档判定基准）
+    last_sync_row = conn.execute("SELECT value FROM meta WHERE key='last_sync'").fetchone()
+    last_sync_int = int(last_sync_row[0]) if last_sync_row else 0
+
     max_v, view_at, business = 0, 0, ""
     pages, total = 0, 0
+    added = updated = 0
+    seen_cur = conn.cursor()
     while True:
         if limit_pages is not None and pages >= limit_pages:
             break
@@ -224,7 +241,14 @@ def run(config, db_path, limit_pages=None):
             f = extract_fields(it)
             if not f["kid"]:
                 continue
+            exist = seen_cur.execute(
+                "SELECT 1 FROM history WHERE kid=?", (f["kid"],)
+            ).fetchone()
             upsert(conn, f, now)
+            if exist:
+                updated += 1
+            else:
+                added += 1
             total += 1
 
         pages += 1
@@ -242,15 +266,35 @@ def run(config, db_path, limit_pages=None):
         if n_max == max_v and n_view == view_at:
             log("游标未推进，停止以避免死循环。")
             break
+        # 增量边界：已越过上次同步时刻，更早的条目不会变化，停止
+        if incremental and last_sync_int and n_view and n_view < last_sync_int:
+            log(f"到达增量边界（view_at {n_view} < 上次同步 {last_sync_int}），停止。")
+            break
         max_v, view_at, business = n_max, n_view, n_business
         if interval > 0:
             time.sleep(interval)
 
-    log(f"完成：共 {pages} 页，{total} 条记录写入 {db_path}")
+    # 全量同步：标记本轮未被返回的条目为"仅本地存档"（不硬删，保留留存价值）
+    archived = 0
+    if not incremental:
+        cur = conn.execute(
+            "UPDATE history SET archived_only=1 "
+            "WHERE (last_seen_sync IS NULL OR last_seen_sync < ?) AND archived_only=0",
+            (now,),
+        )
+        archived = cur.rowcount
+        conn.execute(
+            "INSERT INTO meta(key,value) VALUES('last_full_sync',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(now),),
+        )
+
+    log(f"完成：{pages} 页 / {total} 条（新增 {added}，更新 {updated}，"
+        f"标记归档 {archived}）{'[增量]' if incremental else '[全量]'}；写入 {db_path}")
     conn.execute(
         "INSERT INTO meta(key,value) VALUES('last_sync',?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (str(int(time.time())),),
+        (str(now),),
     )
     conn.commit()
     conn.close()
@@ -262,6 +306,8 @@ def main():
     ap.add_argument("--config", default=DEFAULT_CONFIG, help="配置文件路径")
     ap.add_argument("--db", default=None, help="数据库路径（覆盖 config.json 的 db_path）")
     ap.add_argument("--limit-pages", type=int, default=None, help="只跑前 N 页（联调用）")
+    ap.add_argument("--incremental", action="store_true",
+                    help="增量同步：拉到上次同步时刻即停（快，但不捕获 B站端删除）")
     args = ap.parse_args()
 
     config = load_config(args.config)
@@ -271,7 +317,7 @@ def main():
 
     log(f"配置: {args.config}")
     log(f"数据库: {db_path}")
-    run(config, db_path, limit_pages=args.limit_pages)
+    run(config, db_path, limit_pages=args.limit_pages, incremental=args.incremental)
 
 
 if __name__ == "__main__":
