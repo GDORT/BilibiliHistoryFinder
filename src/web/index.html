@@ -20,17 +20,17 @@
       <!-- 本项目特殊筛选（工具栏中间） -->
       <div class="special-filters">
         <button class="sp-btn" id="spNeeds">需要观看</button>
+        <button class="sp-btn sp-drop" id="needFilterToggle" title="更多筛选 / 自动跳过规则">▾</button>
         <button class="sp-btn" id="spArch">含存档</button>
       </div>
 
-      <div class="more-filter">
-        <button id="filterToggle" class="btn-filter">更多筛选 ▾</button>
-      </div>
       <div class="search">
         <input id="q" type="text" placeholder="搜索视频UP主或标题" autocomplete="off" />
       </div>
       <div class="top-actions">
+        <button id="batchBtn" class="btn-sm btn-ghost" title="进入批量勾选模式：可批量跳过或恢复视频">批量</button>
         <button id="syncBtn" class="btn-sm">同步数据</button>
+        <button id="fullBtn" class="btn-sm btn-ghost" title="强制全量重新拉取：重新校准“仅本地存档”标记并刷新封面（增量同步不捕获删除，需偶尔全量）">全量重建</button>
       </div>
     </div>
     <div class="topbar-status">
@@ -68,6 +68,50 @@
       <span class="f-opt" data-dt="2">设备A (dt=2)</span>
       <span class="f-opt" data-dt="3">设备B (dt=3)</span>
       <small class="f-note">⚠️ dt 含义未公开确认，标签为占位符</small>
+    </div>
+
+    <hr class="f-div" />
+
+    <!-- 自动跳过规则（持久化到 data/filters.ini；修改即保存） -->
+    <div class="f-group f-rule">
+      <span class="f-label">类型（勾选 = 需要观看；未勾选 = 自动跳过）</span>
+      <label class="chk"><input type="checkbox" class="biz-chk" value="archive" checked />视频</label>
+      <label class="chk"><input type="checkbox" class="biz-chk" value="live" checked />直播</label>
+      <label class="chk"><input type="checkbox" class="biz-chk" value="article" checked />专栏</label>
+      <label class="chk"><input type="checkbox" class="biz-chk" value="pgc" checked />番剧</label>
+    </div>
+    <div class="f-group f-rule">
+      <span class="f-label">最短时长（分钟，0 = 不限；≥ 此值自动跳过）</span>
+      <input type="number" id="minDur" class="f-num" min="0" value="0" />
+    </div>
+    <div class="f-group f-rule">
+      <span class="f-label">UP主（逗号分隔，匹配则自动跳过）</span>
+      <input type="text" id="authors" class="f-text" placeholder="例如：老高与小茉, 影视飓风" />
+    </div>
+    <div class="f-group f-rule">
+      <button id="applyAutoSkip" class="btn-sm">应用为自动跳过</button>
+      <span id="autoSkipHint" class="f-note">按上方规则对全部记录重扫并标记「不需要观看」</span>
+    </div>
+    <div id="autoSkipProgress" class="sync-progress hidden">
+      <div class="sync-bar"><i></i></div>
+      <span id="autoSkipStep" class="sync-step"></span>
+    </div>
+  </section>
+
+  <!-- 批量勾选工具条（进入批量模式后显示） -->
+  <section id="batchBar" class="batch-bar hidden">
+    <div class="batch-inner">
+      <span class="batch-title">批量模式</span>
+      <span class="batch-view-tag" id="batchViewTag"></span>
+      <div class="batch-modes">
+        <select id="batchActionSel" class="btn-sm batch-sel" title="批量动作随当前视图变化"></select>
+      </div>
+      <span id="batchHint" class="batch-hint"></span>
+      <div class="batch-actions">
+        <button id="batchSelectAll" class="btn-ghost">全选可操作</button>
+        <button id="batchApply" class="btn-sm">应用 (<span id="batchCount">0</span>)</button>
+        <button id="batchExit" class="btn-ghost">退出</button>
+      </div>
     </div>
   </section>
 
