@@ -160,6 +160,7 @@ def init_db(db_path):
         "ALTER TABLE history ADD COLUMN archived_only INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE history ADD COLUMN manual_skip INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE history ADD COLUMN auto_skip INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE history ADD COLUMN auto_skip_reason TEXT NOT NULL DEFAULT ''",
     ):
         try:
             conn.execute(ddl)

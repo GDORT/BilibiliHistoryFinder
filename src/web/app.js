@@ -12,13 +12,14 @@ const state = {
   dur: "",        // 时长区间 "min-max"
   timeRange: "",  // 时间快捷预设 today/yesterday/week/""
   dt: "",         // 设备 dt 值
-  needs: false,
+  view: "all",    // 视图：all=全部 / needs=需要观看 / skipped=已跳过 / stale=已搁置
   archived: false,
   dateFrom: "",
   dateTo: "",
 };
 
 const $ = (id) => document.getElementById(id);
+const enc = (s) => encodeURIComponent(s);
 const listEl = $("list");
 const emptyEl = $("empty");
 const loadMoreEl = $("loadMore");
@@ -26,7 +27,15 @@ const statsEl = $("stats");
 
 // 批量勾选模式状态
 let batchMode = false;        // 是否进入批量模式
-let batchAction = "skip";     // "skip"=批量跳过 / "restore"=批量恢复
+let batchAction = "skip";     // "skip"=批量跳过 / "restore"=批量恢复 / "delete"=批量删除(隐藏)
+
+// 续看规则引擎（data/rules.json）
+let rulesData = null;         // { rules: [...] }
+let editingIdx = -1;          // 抽屉中当前展开编辑的规则下标
+let rulesDirty = false;       // 是否有未保存/未应用编辑
+
+// 规则抽屉开关状态
+let drawerOpen = false;
 
 /* ====== 工具函数 ====== */
 
@@ -104,7 +113,7 @@ function buildParams(reset) {
   const p = new URLSearchParams();
   if (state.q) p.set("q", state.q);
   if (state.biz) p.set("business", state.biz);
-  if (state.needs) p.set("needs_watching", "1");
+  if (state.view && state.view !== "all") p.set("view", state.view);
   if (state.archived) p.set("archived_only", "1");
 
   // 时间筛选：快捷预设优先，否则用面板日期
@@ -134,6 +143,22 @@ function buildParams(reset) {
 
 /* ====== 卡片渲染 ====== */
 
+function skipBadgeHtml(it) {
+  const skipState = it.skip_state || "";
+  const reason = it.auto_skip_reason || "";
+  if (skipState === "manual") {
+    return `<span class="badge-skip manual cancelable" data-kid="${escapeHtml(it.kid)}" title="手动跳过：点击取消（同步不会回退其进度）">已跳过·手动</span>`;
+  }
+  if (skipState === "auto") {
+    const label = reason.includes("::") ? reason.split("::")[1] : "";
+    if (reason.startsWith("stale::")) {
+      return `<span class="badge-skip stale cancelable" data-kid="${escapeHtml(it.kid)}" title="按规则自动搁置：点击取消">已搁置·${escapeHtml(label)}</span>`;
+    }
+    return `<span class="badge-skip auto cancelable" data-kid="${escapeHtml(it.kid)}" title="按规则自动跳过：点击取消">已跳过·${escapeHtml(label)}</span>`;
+  }
+  return "";
+}
+
 function cardHtml(it) {
   const pct = pctOf(it);
   const finished = pct != null && pct >= 95;
@@ -161,45 +186,36 @@ function cardHtml(it) {
   // 底部进度条（观看进度百分比）
   const pbar = (pct != null) ? `<div class="pbar"><i style="width:${pct}%"></i></div>` : "";
 
-  // 跳过状态（三态：manual / auto / 空）；徽标放在封面右上角，可点击取消
+  // 跳过状态徽标（含 manual/auto + reason 原因）
   const skipState = it.skip_state || "";
-  const skipBadge = skipState === "manual"
-    ? `<span class="badge-skip manual cancelable" data-kid="${escapeHtml(it.kid)}" title="手动跳过：点击取消（同步不会回退其进度）">已跳过·手动</span>`
-    : skipState === "auto"
-    ? `<span class="badge-skip auto cancelable" data-kid="${escapeHtml(it.kid)}" title="按规则自动跳过：点击取消">已跳过·自动</span>`
-    : "";
+  const skipBadge = skipBadgeHtml(it);
   // 右上角（未开播等）：有跳过徽标时让位
   let trBadge = "";
   if (!skipState && it.business === "live" && it.live_status != 1) trBadge = '<span class="badge-tr">未开播</span>';
 
-  // 左下角：仅本地存档徽标（§12.4，存档状态仅初始全量校准）
+  // 左下角：仅本地存档徽标
   const archBadge = (it.archived_only == 1)
     ? '<span class="badge-arch" title="B站端已无此记录，仅本地留存；存档状态仅初始全量校准">仅本地存档</span>'
     : "";
 
-  // 操作按钮：
-  // - 需要观看生效：用手动跳过按钮（替换删除按钮，更醒目）；已跳过的显示「取消跳过」可反悔
-  // - 完整历史：保留网络数据原貌，仅显示删除（隐藏）按钮，跳过状态由封面右上角徽标表达（可点击取消）
-  const needsActive = state.needs;
+  // 操作按钮
   let actionBtn;
-  if (needsActive) {
+  if (state.view === "needs") {
     if (skipState) {
       actionBtn = `<button class="skip-toggle on" data-kid="${escapeHtml(it.kid)}" data-act="cancel" title="已标记为不需要观看，点击恢复">取消跳过</button>`;
     } else {
       actionBtn = `<button class="skip-toggle" data-kid="${escapeHtml(it.kid)}" data-act="skip" title="标记为不需要观看（同步不会回退其进度）">不需要看?</button>`;
     }
+  } else if (state.view === "skipped" || state.view === "stale") {
+    actionBtn = `<button class="skip-toggle on restore-auto" data-kid="${escapeHtml(it.kid)}" data-act="restore-auto" title="按规则自动跳过/搁置，点击恢复（取消自动标记）">恢复</button>`;
   } else {
     actionBtn = `<button class="del-btn" title="隐藏此条" data-kid="${escapeHtml(it.kid)}">🗑</button>`;
   }
 
   // 批量勾选框（仅批量模式显示；按模式限定可勾选集合）
-  // - delete（完整历史）：所有卡片可勾选（对应 🗑 删除/隐藏）
-  // - skip（需要观看）：仅未跳过可勾选；restore：仅已跳过可勾选
   let cb = "";
   if (batchMode) {
-    const eligible = batchAction === "delete"
-      ? true
-      : (batchAction === "skip" ? !skipState : !!skipState);
+    const eligible = batchEligible(skipState);
     cb = `<label class="batch-cb-wrap"><input type="checkbox" class="batch-cb" data-kid="${escapeHtml(it.kid)}" ${eligible ? "" : "disabled"} /></label>`;
   }
 
@@ -281,87 +297,465 @@ document.querySelectorAll(".tab").forEach((btn) => {
   });
 });
 
-/* ====== 本项目特殊筛选（工具栏中间：需要观看 / 含存档）===== */
-$("spNeeds").addEventListener("click", () => {
-  state.needs = !state.needs;
-  $("spNeeds").classList.toggle("active", state.needs);
-  syncBatchKindToView();   // 批量模式下联动切换 删除/跳过 动作
+/* ====== 视图切换（全部 / 需要观看 / 已跳过 / 已搁置）===== */
+function setView(v) {
+  state.view = v;
+  document.querySelectorAll(".vtab").forEach((b) =>
+    b.classList.toggle("active", b.dataset.view === v));
+  syncBatchKindToView();
   load(true);
+}
+document.querySelectorAll(".vtab").forEach((btn) => {
+  btn.addEventListener("click", () => setView(btn.dataset.view));
 });
-$("spArch").addEventListener("click", () => {
-  state.archived = !state.archived;
-  $("spArch").classList.toggle("active", state.archived);
+
+/* ====== 浏览筛选 popover（时长/时间/设备/含存档，不落库）===== */
+$("browseToggle").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const bp = $("browsePanel");
+  const open = bp.classList.toggle("hidden");
+  // toggle 返回 false 表示已显示（open=true）
+  $("browseToggle").classList.toggle("open", !open);
+  $("archChk").checked = state.archived;
+});
+document.addEventListener("click", (e) => {
+  const bp = $("browsePanel");
+  if (bp.classList.contains("hidden")) return;
+  const t = e.target;
+  if (t === $("browseToggle") || $("browseToggle").contains(t) || bp.contains(t)) return;
+  bp.classList.add("hidden");
+  $("browseToggle").classList.remove("open");
+});
+$("archChk").addEventListener("change", () => {
+  state.archived = $("archChk").checked;
   load(true);
 });
 
-/* ====== 更多筛选面板开关（需要观看旁的下拉） ====== */
-const filterPanel = $("filterPanel");
-const needFilterToggle = $("needFilterToggle");
-needFilterToggle.addEventListener("click", () => {
-  filterPanel.classList.toggle("hidden");
-  needFilterToggle.classList.toggle("open");
-});
+/* ====== 续看规则引擎：字段词表与控件生成（data/rules.json） ====== */
+const FIELD_LABELS = {
+  business: "类型", duration: "时长(秒)", author_name: "UP主名",
+  author_mid: "UP主ID", progress_pct: "进度比例(0-1)", progress_sec: "进度(秒)",
+  view_at_age_days: "距今(天)", title: "标题",
+};
+const FIELD_TYPE = {
+  business: "types", duration: "num", author_name: "text", author_mid: "text",
+  progress_pct: "num", progress_sec: "num", view_at_age_days: "num", title: "text",
+};
+const OP_BY_FIELD = {
+  business: [["in", "属于"], ["not_in", "不属于"]],
+  duration: [">=", "≥", "<=", "≤", ">", ">", "<", "<", "between", "介于"],
+  author_name: [["in", "属于"], ["not_in", "不属于"], ["contains", "包含"]],
+  author_mid: [["in", "属于"], ["not_in", "不属于"]],
+  progress_pct: [">=", "≥", "<=", "≤", ">", ">", "<", "<"],
+  progress_sec: [">=", "≥", "<=", "≤", ">", ">", "<", "<"],
+  view_at_age_days: [">", ">", "<", "<", "between", "介于"],
+  title: [["contains", "包含"]],
+};
+const TYPE_OPTIONS = ["archive", "live", "article", "pgc"];
 
-/* ====== 自动跳过规则：加载 / 持久化（data/filters.ini） ====== */
-async function loadFilters() {
+function genFieldOptions(sel) {
+  return Object.keys(FIELD_LABELS).map(
+    (f) => `<option value="${f}" ${f === sel ? "selected" : ""}>${FIELD_LABELS[f]}</option>`
+  ).join("");
+}
+function genOpOptions(field, sel) {
+  const ops = OP_BY_FIELD[field] || [];
+  return ops.map((o) => {
+    const v = Array.isArray(o) ? o[0] : o;
+    const t = Array.isArray(o) ? o[1] : o;
+    return `<option value="${v}" ${v === sel ? "selected" : ""}>${t}</option>`;
+  }).join("");
+}
+function genValueWidget(field, cond, ri, gi, ci) {
+  const t = FIELD_TYPE[field];
+  const v = cond.value;
+  if (t === "types") {
+    const set = (typeof v === "string" && v) ? v.split(",").map((x) => x.trim()).filter(Boolean) : (Array.isArray(v) ? v : []);
+    const cbs = TYPE_OPTIONS.map((tp) =>
+      `<label class="chk mini"><input type="checkbox" data-ri="${ri}" data-g="${gi}" data-c="${ci}" data-k="value-types" value="${tp}" ${set.includes(tp) ? "checked" : ""}/>${tp}</label>`
+    ).join(" ");
+    return `<span class="val-types">${cbs}</span>`;
+  }
+  if (t === "num") {
+    const num = (typeof v === "number") ? v : (v != null ? v : "");
+    return `<input type="number" class="val-num" data-ri="${ri}" data-g="${gi}" data-c="${ci}" data-k="value" value="${escapeHtml(String(num))}" step="any" />`;
+  }
+  const txt = (typeof v === "string") ? v : (Array.isArray(v) ? v.join(",") : "");
+  return `<input type="text" class="val-text" data-ri="${ri}" data-g="${gi}" data-c="${ci}" data-k="value" value="${escapeHtml(txt)}" placeholder="逗号分隔多值" />`;
+}
+
+function condHtml(c, ri, gi, ci) {
+  return `<div class="rg-cond" data-ri="${ri}" data-g="${gi}" data-c="${ci}">
+    <select class="cond-field" data-ri="${ri}" data-g="${gi}" data-c="${ci}">${genFieldOptions(c.field)}</select>
+    <select class="cond-op" data-ri="${ri}" data-g="${gi}" data-c="${ci}">${genOpOptions(c.field, c.op)}</select>
+    ${genValueWidget(c.field, c, ri, gi, ci)}
+    <button class="cond-del btn-ghost btn-sm" data-ri="${ri}" data-g="${gi}" data-c="${ci}">✕</button>
+  </div>`;
+}
+
+function ruleCardHtml(rule, ri) {
+  const groups = (rule.groups || []).map((g, gi) => `
+    <div class="rule-group" data-ri="${ri}" data-g="${gi}">
+      <div class="rg-head">
+        <input type="text" class="rg-label" data-ri="${ri}" data-g="${gi}" value="${escapeHtml(g.label || "")}" placeholder="分组名(如 误触)" />
+        <select class="rg-action" data-ri="${ri}" data-g="${gi}">
+          <option value="auto_skip" ${g.action === "auto_skip" ? "selected" : ""}>自动跳过</option>
+          <option value="stale" ${g.action === "stale" ? "selected" : ""}>搁置</option>
+        </select>
+        <button class="rg-del btn-ghost btn-sm" data-ri="${ri}" data-g="${gi}">删除分组</button>
+      </div>
+      <div class="rg-conds">
+        ${(g.conditions || []).map((c, ci) => condHtml(c, ri, gi, ci)).join("")}
+      </div>
+      <button class="cond-add btn-ghost btn-sm" data-ri="${ri}" data-g="${gi}">+ 条件</button>
+    </div>`).join("");
+  const tag = rule.active
+    ? '<span class="rc-tag on">生效中</span>'
+    : '<span class="rc-tag">未生效</span>';
+  return `<div class="rule-card ${rule.active ? "active" : "inactive"} ${ri === editingIdx ? "expanded" : ""}" data-ri="${ri}">
+    <div class="rc-head" data-ri="${ri}">
+      <span class="rc-chevron">▸</span>
+      <label class="chk"><input type="checkbox" class="rc-active" data-ri="${ri}" ${rule.active ? "checked" : ""}/> 激活</label>
+      <span class="rc-name">${escapeHtml(rule.name || ("规则" + (ri + 1)))}</span>
+      ${tag}
+    </div>
+    <div class="rc-body">
+      <div class="rule-match">分组关系：
+        <select class="ruleMatch" data-ri="${ri}">
+          <option value="any" ${rule.match === "any" ? "selected" : ""}>任一分组命中(any)</option>
+          <option value="all" ${rule.match === "all" ? "selected" : ""}>全部分组命中(all)</option>
+        </select>
+      </div>
+      ${groups}
+      <button class="rg-add btn-ghost btn-sm" data-ri="${ri}">+ 分组</button>
+    </div>
+  </div>`;
+}
+
+function renderRuleList() {
+  const root = $("ruleList");
+  if (!rulesData || !rulesData.rules.length) {
+    root.innerHTML = '<div class="rule-empty">暂无规则，可点下方「新建空白规则」开始</div>';
+    attachRuleListEvents();
+    updateAddBar();
+    return;
+  }
+  // 生效中的规则排在最前并默认展开；其余（未生效）排在后面，可点开二次调整
+  const order = [];
+  const ai = rulesData.rules.findIndex((r) => r.active);
+  if (ai >= 0) order.push(ai);
+  rulesData.rules.forEach((r, i) => { if (i !== ai) order.push(i); });
+  root.innerHTML = order.map((i) => ruleCardHtml(rulesData.rules[i], i)).join("");
+  attachRuleListEvents();
+  updateAddBar();
+}
+
+function attachRuleListEvents() {
+  const root = $("ruleList");
+  // 展开/收起卡片（点头部，避开激活勾选框）
+  root.querySelectorAll(".rc-head").forEach((h) => h.addEventListener("click", (e) => {
+    if (e.target.closest(".rc-active")) return;
+    const ri = +h.dataset.ri;
+    editingIdx = ri;
+    root.querySelectorAll(".rule-card").forEach((c) =>
+      c.classList.toggle("expanded", +c.dataset.ri === ri));
+  }));
+  // 激活切换（单 active / C6）
+  root.querySelectorAll(".rc-active").forEach((cb) => cb.addEventListener("change", (e) => {
+    const ri = +cb.dataset.ri;
+    if (cb.checked) {
+      rulesData.rules.forEach((r, i) => { r.active = (i === ri); });
+    } else {
+      if (rulesData.rules.filter((r) => r.active).length <= 1) {
+        cb.checked = true; toast("至少保留一条激活规则（C6）"); return;
+      }
+      rulesData.rules[ri].active = false;
+    }
+    rulesDirty = true; renderRuleList();
+  }));
+  // 分组关系
+  root.querySelectorAll(".ruleMatch").forEach((s) => s.addEventListener("change", (e) => {
+    rulesData.rules[+e.target.dataset.ri].match = e.target.value; rulesDirty = true;
+  }));
+  // 新增分组 / 删除分组
+  root.querySelectorAll(".rg-add").forEach((b) => b.addEventListener("click", () => {
+    const ri = +b.dataset.ri;
+    rulesData.rules[ri].groups.push({ label: "新分组", action: "auto_skip", conditions: [{ field: "progress_pct", op: ">=", value: 0.95 }] });
+    rulesDirty = true; editingIdx = ri; renderRuleList();
+  }));
+  root.querySelectorAll(".rg-del").forEach((b) => b.addEventListener("click", () => {
+    const ri = +b.dataset.ri;
+    rulesData.rules[ri].groups.splice(+b.dataset.g, 1);
+    rulesDirty = true; renderRuleList();
+  }));
+  // 条件增删
+  root.querySelectorAll(".cond-add").forEach((b) => b.addEventListener("click", () => {
+    const ri = +b.dataset.ri, gi = +b.dataset.g;
+    rulesData.rules[ri].groups[gi].conditions.push({ field: "progress_pct", op: ">=", value: 0.95 });
+    rulesDirty = true; renderRuleList();
+  }));
+  root.querySelectorAll(".cond-del").forEach((b) => b.addEventListener("click", () => {
+    const ri = +b.dataset.ri, gi = +b.dataset.g, ci = +b.dataset.c;
+    rulesData.rules[ri].groups[gi].conditions.splice(ci, 1);
+    rulesDirty = true; renderRuleList();
+  }));
+  // 分组名 / 动作
+  root.querySelectorAll(".rg-label").forEach((el) => el.addEventListener("change", (e) => {
+    rulesData.rules[+e.target.dataset.ri].groups[+e.target.dataset.g].label = e.target.value; rulesDirty = true;
+  }));
+  root.querySelectorAll(".rg-action").forEach((el) => el.addEventListener("change", (e) => {
+    rulesData.rules[+e.target.dataset.ri].groups[+e.target.dataset.g].action = e.target.value; rulesDirty = true;
+  }));
+  // 字段切换：重置 op/value 防类型错配
+  root.querySelectorAll(".cond-field").forEach((el) => el.addEventListener("change", (e) => {
+    const ri = +e.target.dataset.ri, gi = +e.target.dataset.g, ci = +e.target.dataset.c;
+    const c = rulesData.rules[ri].groups[gi].conditions[ci];
+    c.field = e.target.value;
+    const ops = OP_BY_FIELD[c.field];
+    c.op = Array.isArray(ops[0]) ? ops[0][0] : ops[0];
+    c.value = (FIELD_TYPE[c.field] === "types") ? "" : (FIELD_TYPE[c.field] === "num" ? 0 : "");
+    rulesDirty = true; renderRuleList();
+  }));
+  root.querySelectorAll(".cond-op").forEach((el) => el.addEventListener("change", (e) => {
+    const ri = +e.target.dataset.ri, gi = +e.target.dataset.g, ci = +e.target.dataset.c;
+    rulesData.rules[ri].groups[gi].conditions[ci].op = e.target.value; rulesDirty = true;
+  }));
+  // 数值 / 文本值
+  root.querySelectorAll(".val-num, .val-text").forEach((el) => el.addEventListener("change", (e) => {
+    const ri = +e.target.dataset.ri, gi = +e.target.dataset.g, ci = +e.target.dataset.c;
+    let val = e.target.value;
+    if (el.classList.contains("val-num")) val = (val === "" ? 0 : parseFloat(val));
+    rulesData.rules[ri].groups[gi].conditions[ci].value = val; rulesDirty = true;
+  }));
+  // 类型多选
+  root.querySelectorAll(".val-types input[type=checkbox]").forEach((cb) => cb.addEventListener("change", () => {
+    const ri = +cb.dataset.ri, gi = +cb.dataset.g, ci = +cb.dataset.c;
+    const checked = [...document.querySelectorAll(`.val-types input[data-ri="${ri}"][data-g="${gi}"][data-c="${ci}"]:checked`)].map((x) => x.value);
+    rulesData.rules[ri].groups[gi].conditions[ci].value = checked.join(",");
+    rulesDirty = true;
+  }));
+}
+
+/* 类别（类型）词表与「未覆盖类别」预设 */
+const TYPE_LABELS = { archive: "视频/投稿", live: "直播", article: "专栏", pgc: "番剧" };
+function typeLabel(t) { return TYPE_LABELS[t] || t; }
+
+// 当前生效规则已覆盖的类别（business in [...] 条件列出的类型）
+function coveredTypes(rule) {
+  const s = new Set();
+  (rule.groups || []).forEach((g) => (g.conditions || []).forEach((c) => {
+    if (c.field === "business" && c.op === "in") {
+      String(c.value || "").split(",").map((x) => x.trim()).filter(Boolean).forEach((t) => s.add(t));
+    }
+  }));
+  return s;
+}
+// 当前生效规则未覆盖的类别（类型）
+function uncoveredTypes() {
+  const active = rulesData && rulesData.rules.find((r) => r.active);
+  const covered = active ? coveredTypes(active) : new Set();
+  return TYPE_OPTIONS.filter((t) => !covered.has(t));
+}
+// 抽屉底部「新建预设」按钮：根据未覆盖类别启停 + 动态标签
+function updateAddBar() {
+  const presetBtn = $("addPreset");
+  if (!presetBtn) return;
+  const unc = uncoveredTypes();
+  if (!unc.length) {
+    presetBtn.disabled = true;
+    presetBtn.title = "当前规则的类别已全覆盖，暂无可加入的预设";
+    presetBtn.textContent = "＋ 新建预设";
+  } else {
+    presetBtn.disabled = false;
+    presetBtn.title = "把未覆盖的类别打包成一套规则直接加入：" + unc.map(typeLabel).join("、");
+    presetBtn.textContent = "＋ 新建预设 (" + unc.length + ")";
+  }
+}
+function addBlankRule() {
+  if (!rulesData) return;
+  const blank = { id: "rule_" + Date.now(), name: "新规则", active: false, match: "any", groups: [] };
+  rulesData.rules.push(blank);
+  editingIdx = rulesData.rules.length - 1;
+  rulesDirty = true;
+  renderRuleList();
+  toast("已新建空白规则（未生效，可在卡片内添加分组/条件并激活）");
+}
+function addPresetRule() {
+  if (!rulesData) return;
+  const unc = uncoveredTypes();
+  if (!unc.length) { toast("当前规则的类别已全覆盖，暂无可加入的预设"); return; }
+  const preset = {
+    id: "rule_" + Date.now(),
+    name: "预设·" + unc.map(typeLabel).join("/"),
+    active: false, match: "any",
+    groups: [{ label: "未覆盖类别", action: "auto_skip",
+      conditions: [{ field: "business", op: "in", value: unc.join(",") }] }],
+  };
+  rulesData.rules.push(preset);
+  editingIdx = rulesData.rules.length - 1;
+  rulesDirty = true;
+  renderRuleList();
+  toast("已加入预设：" + unc.map(typeLabel).join("、") + "（可继续调整）");
+}
+
+/* ====== 规则：加载 / 抽屉开关 / 应用 / 状态角标 ====== */
+
+async function loadRules() {
   try {
-    const d = await (await fetch("/api/filters")).json();
-    const biz = d.business || [];
-    document.querySelectorAll(".biz-chk").forEach((c) => {
-      c.checked = biz.includes(c.value);
-    });
-    $("minDur").value = d.min_duration_min || 0;
-    $("authors").value = (d.authors || []).join(", ");
-  } catch (e) { /* 忽略：使用默认勾选 */ }
+    rulesData = await (await fetch("/api/rules")).json();
+    editingIdx = rulesData.rules.findIndex((r) => r.active);
+    if (editingIdx < 0 && rulesData.rules.length) editingIdx = 0;
+    renderRuleList();
+  } catch (e) {
+    toast("加载规则失败：" + e.message);
+  }
 }
 
-function collectFilters() {
-  const business = [...document.querySelectorAll(".biz-chk:checked")].map((c) => c.value);
-  const min_duration_min = parseInt($("minDur").value, 10) || 0;
-  const authors = $("authors").value.split(",").map((s) => s.trim()).filter(Boolean);
-  return { business, min_duration_min, authors };
-}
-
-function saveFilters() {
-  fetch("/api/filters", {
+async function saveRulesCall() {
+  const res = await fetch("/api/rules", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(collectFilters()),
-  }).then((r) => r.json()).then((d) => {
-    if (!d.ok) toast("保存筛选条件失败");
-  }).catch(() => {});
+    body: JSON.stringify(rulesData),
+  });
+  return res.json();
 }
 
-document.querySelectorAll(".biz-chk").forEach((c) => {
-  c.addEventListener("change", saveFilters);
-});
-$("minDur").addEventListener("change", saveFilters);
-let authorsTimer = null;
-$("authors").addEventListener("input", () => {
-  clearTimeout(authorsTimer);
-  authorsTimer = setTimeout(saveFilters, 500);
+function showConflicts(c) {
+  const box = $("ruleConflicts");
+  if (!box) return;
+  if (!c || ((!c.hard || !c.hard.length) && (!c.soft || !c.soft.length))) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  let html = "";
+  (c.hard || []).forEach((m) => html += `<div class="conf hard">⛔ ${escapeHtml(m)}</div>`);
+  (c.soft || []).forEach((m) => html += `<div class="conf soft">⚠️ ${escapeHtml(m)}</div>`);
+  box.innerHTML = html;
+  box.classList.remove("hidden");
+}
+
+function openRuleDrawer() {
+  if (drawerOpen) return;
+  drawerOpen = true;
+  if (!rulesData) loadRules(); else renderRuleList();
+  $("ruleOverlay").classList.remove("hidden");
+  const d = $("ruleDrawer");
+  d.classList.remove("hidden");
+  d.setAttribute("aria-hidden", "false");
+  requestAnimationFrame(() => d.classList.add("open"));
+  // 编辑中：屏蔽同步 / 全量
+  $("syncBtn").disabled = true; $("syncBtn").title = "规则编辑中不可用";
+  $("fullBtn").disabled = true; $("fullBtn").title = "规则编辑中不可用";
+  setTimeout(() => {
+    const f = d.querySelector(".rc-active") || d.querySelector("button");
+    if (f) f.focus();
+  }, 60);
+  document.addEventListener("keydown", onDrawerKey);
+}
+
+function closeRuleDrawer() {
+  if (!drawerOpen) return;
+  if (rulesDirty) {
+    if (!confirm("有未应用的规则改动，退出将丢弃？")) return;
+    rulesDirty = false;
+    loadRules();   // 丢弃：从服务端恢复编辑前状态
+  }
+  drawerOpen = false;
+  const d = $("ruleDrawer");
+  d.classList.remove("open");
+  d.setAttribute("aria-hidden", "true");
+  $("ruleOverlay").classList.add("hidden");
+  setTimeout(() => d.classList.add("hidden"), 220);
+  $("syncBtn").disabled = false; $("syncBtn").title = "同步数据";
+  $("fullBtn").disabled = false; $("fullBtn").title = "强制全量重新拉取";
+  document.removeEventListener("keydown", onDrawerKey);
+  $("ruleBtn").focus();
+}
+
+function onDrawerKey(e) {
+  if (e.key === "Escape") { e.preventDefault(); closeRuleDrawer(); return; }
+  if (e.key === "Tab") trapFocus(e, $("ruleDrawer"));
+}
+
+function trapFocus(e, container) {
+  const f = container.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+  const vis = [...f].filter((el) => el.offsetParent !== null && !el.disabled);
+  if (!vis.length) return;
+  const first = vis[0], last = vis[vis.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+
+async function pollRuleStatus() {
+  try {
+    const s = await (await fetch("/api/rules-status")).json();
+    const pend = $("rulePending"), dirty = $("ruleDirty");
+    pend.classList.toggle("hidden", !s.pending);
+    if (s.dirty_count > 0) {
+      dirty.textContent = s.dirty_count > 99 ? "99+" : String(s.dirty_count);
+      dirty.classList.remove("hidden");
+    } else {
+      dirty.classList.add("hidden");
+    }
+  } catch (e) { /* 忽略 */ }
+}
+
+$("ruleBtn").addEventListener("click", openRuleDrawer);
+$("ruleClose").addEventListener("click", closeRuleDrawer);
+$("ruleOverlay").addEventListener("click", closeRuleDrawer);
+
+$("saveRules").addEventListener("click", async () => {
+  const sv = await saveRulesCall();
+  if (sv.ok) {
+    rulesDirty = false;
+    showConflicts(null);
+    renderRuleList();
+    pollRuleStatus();   // 已保存未应用 → 显示『待应用』角标
+    if (sv.warnings && sv.warnings.length) toast("已保存（含警告：" + sv.warnings[0] + "）");
+    else toast("规则已保存（待应用）");
+  } else {
+    showConflicts(sv.conflicts);
+    toast("规则有冲突，未保存（见下方提示）");
+  }
 });
 
-/* ====== 应用为自动跳过（全量重扫，带进度屏蔽） ====== */
-$("applyAutoSkip").addEventListener("click", () => {
-  if (autoskipRunning) return;
-  fetch("/api/apply-autoskip", { method: "POST" })
-    .then((r) => r.json())
-    .then((d) => {
-      if (d.blocked) { toast(d.reason || "已有任务进行中"); return; }
-      if (d.started) startAutoSkipPoll();
-    })
-    .catch(() => toast("触发自动跳过失败"));
+let ruleRunning = false;
+$("applyRules").addEventListener("click", async () => {
+  if (ruleRunning) return;
+  const sv = await saveRulesCall();
+  if (!sv.ok) {
+    showConflicts(sv.conflicts);
+    toast("规则有冲突，未应用（见下方提示）");
+    return;
+  }
+  showConflicts(null);
+  rulesDirty = false;
+  renderRuleList();
+  let dry;
+  try {
+    dry = await (await fetch("/api/rules-dry")).json();
+  } catch (e) { toast("规则预览失败：" + e.message); return; }
+  if (!dry.ok) { toast("规则应用失败：" + (dry.err || "")); return; }
+  const msg = `将标记自动跳过 ${dry.auto_set} 条、搁置 ${dry.stale_set} 条`
+    + (dry.manual_cleared ? `（覆盖手动标记 ${dry.manual_cleared} 条）` : "")
+    + "。确认应用？";
+  if (!confirm(msg)) return;
+  const r = await (await fetch("/api/apply-rules", { method: "POST" })).json();
+  if (r.blocked) { toast(r.reason || "已有任务进行中"); return; }
+  if (r.started) startRulePoll();
 });
 
-let autoskipRunning = false;
-function startAutoSkipPoll() {
+$("addBlank").addEventListener("click", addBlankRule);
+$("addPreset").addEventListener("click", addPresetRule);
+
+function startRulePoll() {
   const prog = $("autoSkipProgress");
   const bar = prog.querySelector(".sync-bar > i");
   const step = $("autoSkipStep");
   prog.classList.remove("hidden");
-  $("applyAutoSkip").disabled = true;
-  autoskipRunning = true;
+  $("applyRules").disabled = true;
+  ruleRunning = true;
   const tick = () => {
     fetch("/api/auto-skip-status").then((r) => r.json()).then((s) => {
       const p = s.progress || {};
@@ -371,26 +765,28 @@ function startAutoSkipPoll() {
       else if (denom > 0 && p.done) pct = Math.min(99, Math.round((p.done / denom) * 100));
       bar.style.width = pct + "%";
       step.textContent = p.completed
-        ? `自动跳过应用完成：${p.auto_set || 0} 条被标记`
-        : `正在应用自动跳过…（${p.done || 0}/${denom}）`;
+        ? `规则应用完成：${p.auto_set || 0} 条跳过 / ${p.stale_set || 0} 条搁置`
+        : `正在应用规则…（${p.done || 0}/${denom}）`;
       if (s.running) {
         setTimeout(tick, 400);
       } else {
         prog.classList.add("hidden");
-        $("applyAutoSkip").disabled = false;
-        autoskipRunning = false;
+        $("applyRules").disabled = false;
+        ruleRunning = false;
         if (s.last && s.last.ok) {
-          toast(`已应用自动跳过：${s.last.auto_set} 条标记为跳过`
+          toast(`已应用规则：${s.last.auto_set} 条跳过`
+            + (s.last.stale_set ? ` / ${s.last.stale_set} 条搁置` : "")
             + (s.last.manual_cleared ? `（覆盖手动 ${s.last.manual_cleared} 条）` : ""));
           load(true);
+          pollRuleStatus();   // 应用后：待应用清除、脏计数归零
         } else if (s.last) {
-          toast("自动跳过失败：" + (s.last.err || ""));
+          toast("规则应用失败：" + (s.last.err || ""));
         }
       }
     }).catch(() => {
       prog.classList.add("hidden");
-      $("applyAutoSkip").disabled = false;
-      autoskipRunning = false;
+      $("applyRules").disabled = false;
+      ruleRunning = false;
     });
   };
   tick();
@@ -483,21 +879,31 @@ $("q").addEventListener("input", () => {
 /* ====== 加载更多 ====== */
 $("moreBtn").addEventListener("click", () => load(false));
 
-/* ====== 删除 / 手动跳过（就地切换，可反悔）/ 徽标取消 ====== */
+/* ====== 删除 / 手动跳过（就地切换，可反悔）/ 徽标取消 / 自动恢复 ====== */
 listEl.addEventListener("click", (e) => {
-  // 手动跳过按钮（需要观看视图下替换删除按钮）
   const skipToggle = e.target.closest(".skip-toggle");
   if (skipToggle) {
     e.preventDefault();
     const kid = skipToggle.dataset.kid;
-    const act = skipToggle.dataset.act; // "skip" 或 "cancel"
+    const act = skipToggle.dataset.act;
     const li = skipToggle.closest(".item");
+    if (act === "restore-auto") {
+      fetch(`/api/skip?kid=${enc(kid)}&kind=auto`, { method: "POST" })
+        .then((r) => r.json())
+        .then((d) => {
+          if (!d.ok) { toast("操作失败：" + (d.error || "")); return; }
+          if (li) li.remove();
+          toast("已恢复（取消自动跳过）");
+          if (batchMode) updateBatchEligibility();
+        })
+        .catch(() => toast("操作失败"));
+      return;
+    }
     const val = act === "cancel" ? 0 : 1;
-    fetch(`/api/skip?kid=${encodeURIComponent(kid)}&value=${val}`, { method: "POST" })
+    fetch(`/api/skip?kid=${enc(kid)}&value=${val}`, { method: "POST" })
       .then((r) => r.json())
       .then((d) => {
         if (!d.ok) { toast("操作失败：" + (d.error || "")); return; }
-        // 就地更新按钮与卡片状态，不移除（保留可反悔）
         if (val) {
           skipToggle.dataset.act = "cancel";
           skipToggle.classList.add("on");
@@ -511,28 +917,32 @@ listEl.addEventListener("click", (e) => {
           if (li) li.dataset.skip = "";
           toast("已恢复（需要观看）");
         }
+        if (batchMode) updateBatchEligibility();
       })
       .catch(() => toast("操作失败"));
     return;
   }
-  // 封面右上角跳过徽标：点击取消（完整历史 / 任意视图均可反悔）
   const badge = e.target.closest(".badge-skip.cancelable");
   if (badge) {
     e.preventDefault();
     const kid = badge.dataset.kid;
     const li = badge.closest(".item");
-    fetch(`/api/skip?kid=${encodeURIComponent(kid)}&value=0`, { method: "POST" })
+    const st = li ? (li.dataset.skip || "") : "";
+    const url = st === "auto"
+      ? `/api/skip?kid=${enc(kid)}&kind=auto`
+      : `/api/skip?kid=${enc(kid)}&value=0`;
+    fetch(url, { method: "POST" })
       .then((r) => r.json())
       .then((d) => {
         if (!d.ok) { toast("取消失败：" + (d.error || "")); return; }
         if (li) li.dataset.skip = "";
         badge.remove();
         toast("已取消跳过");
+        if (batchMode) updateBatchEligibility();
       })
       .catch(() => toast("取消失败"));
     return;
   }
-  // 删除（隐藏）按钮
   const btn = e.target.closest(".del-btn");
   if (!btn) return;
   e.preventDefault();
@@ -542,23 +952,30 @@ listEl.addEventListener("click", (e) => {
 });
 
 /* ====== 批量勾选模式 ====== */
-// 视图联动：进入批量模式时，按当前视图决定动作类型
-// - 完整历史（needs 关）：批量 = 删除（隐藏），对应 🗑 图标
-// - 需要观看（needs 开）：批量 = 跳过/恢复，对应「不需要看?」按钮
+function batchEligible(st) {
+  if (batchAction === "delete") return true;
+  if (batchAction === "skip") return st === "";
+  if (state.view === "needs") return st === "manual";
+  return st === "auto";
+}
+
 function syncBatchKindToView() {
   if (!batchMode) return;
   const sel = $("batchActionSel");
   const tag = $("batchViewTag");
-  if (state.needs) {
-    // 需要观看：批量 = 跳过 / 恢复（下拉仅给这两个选项，与「完整历史」明显不同）
+  if (state.view === "needs") {
     sel.innerHTML =
       '<option value="skip">跳过选中</option>' +
       '<option value="restore">恢复选中</option>';
-    if (batchAction !== "skip" && batchAction !== "restore") batchAction = "skip";
+    if (!["skip", "restore"].includes(batchAction)) batchAction = "skip";
     tag.textContent = "视图：需要观看";
     tag.className = "batch-view-tag tag-needs";
+  } else if (state.view === "skipped" || state.view === "stale") {
+    sel.innerHTML = '<option value="restore">恢复选中（取消自动跳过）</option>';
+    batchAction = "restore";
+    tag.textContent = state.view === "stale" ? "视图：已搁置" : "视图：已跳过";
+    tag.className = "batch-view-tag tag-stale";
   } else {
-    // 完整历史：批量 = 删除（隐藏），下拉仅一个选项，明确与「需要观看」区分
     sel.innerHTML = '<option value="delete">删除选中（隐藏）</option>';
     batchAction = "delete";
     tag.textContent = "视图：完整历史";
@@ -575,7 +992,11 @@ $("batchBtn").addEventListener("click", () => {
   $("batchBtn").classList.toggle("active", batchMode);
   if (batchMode) {
     syncBatchKindToView();
-    toast(state.needs ? "批量模式：勾选视频后「跳过」或「恢复」" : "批量模式：勾选视频后「删除选中」（隐藏）");
+    toast(
+      state.view === "needs" ? "批量模式：勾选视频后「跳过」或「恢复」"
+        : (state.view === "skipped" || state.view === "stale") ? "批量模式：勾选视频后「恢复」（取消自动跳过）"
+        : "批量模式：勾选视频后「删除选中」（隐藏）"
+    );
   }
   load(true);
 });
@@ -584,7 +1005,6 @@ function syncBatchButtons() {
   updateBatchEligibility();
 }
 
-// 下拉切换批量动作（选项已按当前视图限定，故切换即合法）
 $("batchActionSel").addEventListener("change", () => {
   batchAction = $("batchActionSel").value;
   updateBatchEligibility();
@@ -597,10 +1017,7 @@ function updateBatchEligibility() {
     const cb = li.querySelector(".batch-cb");
     if (!cb) return;
     const st = li.dataset.skip || "";
-    let ok;
-    if (batchAction === "delete") ok = true;          // 完整历史：所有卡片可删除
-    else if (batchAction === "skip") ok = !st;         // 跳过模式：仅未跳过
-    else ok = !!st;                                    // 恢复模式：仅已跳过
+    const ok = batchEligible(st);
     cb.disabled = !ok;
     li.classList.toggle("batch-disabled", !ok);
     if (ok) eligible++;
@@ -610,12 +1027,11 @@ function updateBatchEligibility() {
     ? `删除模式：勾选视频后「删除选中」即可隐藏（共 ${eligible} 条可操作）`
     : batchAction === "skip"
       ? `跳过模式：仅可勾选「未跳过」的视频（共 ${eligible} 条可操作）`
-      : `恢复模式：仅可勾选「已跳过」的视频（共 ${eligible} 条可操作）`;
+      : `恢复模式：仅可勾选「已${state.view === "needs" ? "手动跳过" : "自动跳过/搁置"}」的视频（共 ${eligible} 条可操作）`;
   $("batchHint").textContent = hint;
   $("batchCount").textContent = checked;
 }
 
-// 勾选变化实时更新计数
 listEl.addEventListener("change", (e) => {
   if (e.target.classList.contains("batch-cb")) updateBatchEligibility();
 });
@@ -638,7 +1054,6 @@ $("batchApply").addEventListener("click", async () => {
   if (cbs.length === 0) { toast("请先勾选视频"); return; }
   $("batchApply").disabled = true;
   if (batchAction === "delete") {
-    // 完整历史：批量删除（隐藏），与 🗑 图标行为一致（仅本次会话，刷新恢复）
     let n = 0;
     cbs.forEach((cb) => {
       const li = cb.closest(".item");
@@ -649,19 +1064,34 @@ $("batchApply").addEventListener("click", async () => {
     updateBatchEligibility();
     return;
   }
-  // 需要观看：批量跳过 / 恢复
-  const val = batchAction === "skip" ? 1 : 0;
+  if (batchAction === "skip") {
+    let okN = 0;
+    for (const cb of cbs) {
+      try {
+        const r = await fetch(`/api/skip?kid=${enc(cb.dataset.kid)}&value=1`, { method: "POST" });
+        const d = await r.json();
+        if (d.ok) okN++;
+      } catch (e) { /* 忽略单条失败 */ }
+    }
+    $("batchApply").disabled = false;
+    toast(`已跳过 ${okN} 条`);
+    load(true);
+    return;
+  }
+  const kind = state.view === "needs" ? "manual" : "auto";
   let okN = 0;
   for (const cb of cbs) {
-    const kid = cb.dataset.kid;
     try {
-      const r = await fetch(`/api/skip?kid=${encodeURIComponent(kid)}&value=${val}`, { method: "POST" });
+      const url = kind === "manual"
+        ? `/api/skip?kid=${enc(cb.dataset.kid)}&value=0`
+        : `/api/skip?kid=${enc(cb.dataset.kid)}&kind=auto`;
+      const r = await fetch(url, { method: "POST" });
       const d = await r.json();
       if (d.ok) okN++;
-    } catch (e) { /* 忽略单条失败，继续 */ }
+    } catch (e) { /* 忽略单条失败 */ }
   }
   $("batchApply").disabled = false;
-  toast(`已${batchAction === "skip" ? "跳过" : "恢复"} ${okN} 条`);
+  toast(`已恢复 ${okN} 条`);
   load(true);
 });
 
@@ -681,7 +1111,6 @@ function applySyncStatus(s) {
   const stepEl = $("syncStep");
   const metaEl = $("syncMeta");
 
-  // 进度百分比：分母取 progress.total_estimate，缺失时回退 meta.total（不必无限动画）
   const pr = s.progress || {};
   const meta = s.meta || {};
   const denom = pr.total_estimate || meta.total || 0;
@@ -693,7 +1122,6 @@ function applySyncStatus(s) {
   }
 
   if (s.running) {
-    // 同步中：显示进度条（真实百分比）+ 步骤文字
     progressEl.classList.remove("hidden");
     doneEl.classList.add("hidden");
     barEl.style.width = pct + "%";
@@ -706,7 +1134,6 @@ function applySyncStatus(s) {
       `${modeText}…（已拉取 ${pr.fetched || 0} 条 / 第 ${pr.page || 0} 页，进度 ${pct}%）`;
   } else {
     if (s.last && s.last.ok) {
-      // 完成：隐藏进度条，显示绿色「已完成」
       progressEl.classList.add("hidden");
       doneEl.className = "sync-done";
       doneEl.classList.remove("hidden");
@@ -715,8 +1142,8 @@ function applySyncStatus(s) {
       doneEl.textContent = (s.last.fetched != null)
         ? `✓ 同步完成（${s.last.fetched} 条${m}）`
         : "✓ 同步完成";
+      pollRuleStatus();   // 同步后：更新『脏』角标（可能有新记录命中规则）
     } else if (s.last && !s.last.ok) {
-      // 未完成：隐藏进度条，显示红色提示（不更新数据版本）
       progressEl.classList.add("hidden");
       doneEl.className = "sync-done sync-fail";
       doneEl.classList.remove("hidden");
@@ -727,7 +1154,6 @@ function applySyncStatus(s) {
     }
   }
 
-  // 常驻：数据版本 + 更新时间（+ 总条数）
   const ver = (meta.version != null && meta.version !== "") ? meta.version : "—";
   const ts = meta.last_success_at ? fmtDateTime(meta.last_success_at) : "—";
   const total = (meta.total != null) ? meta.total : 0;
@@ -750,5 +1176,6 @@ setInterval(pollSync, 3000);
 pollSync();
 
 /* ====== 初始加载 ====== */
-loadFilters();   // 拉取持久化在 filters.ini 的自动跳过规则，回填面板
+loadRules();
 load(true);
+pollRuleStatus();

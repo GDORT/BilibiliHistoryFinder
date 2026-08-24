@@ -17,17 +17,29 @@
         <button class="tab" data-biz="article">专栏</button>
       </nav>
 
-      <!-- 本项目特殊筛选（工具栏中间） -->
-      <div class="special-filters">
-        <button class="sp-btn" id="spNeeds">需要观看</button>
-        <button class="sp-btn sp-drop" id="needFilterToggle" title="更多筛选 / 自动跳过规则">▾</button>
-        <button class="sp-btn" id="spArch">含存档</button>
+      <!-- 生命周期视图：全部 / 需要观看 / 已跳过 / 已搁置 -->
+      <div class="view-tabs">
+        <button class="vtab active" data-view="all">全部</button>
+        <button class="vtab" data-view="needs">需要观看</button>
+        <button class="vtab" data-view="skipped">已跳过</button>
+        <button class="vtab" data-view="stale">已搁置</button>
       </div>
+
+      <!-- 临时浏览筛选（时长/时间/设备/含存档，不落库） -->
+      <button class="btn-sm btn-ghost" id="browseToggle" title="浏览筛选（时长 / 时间 / 设备 / 含存档）">筛选 ▾</button>
 
       <div class="search">
         <input id="q" type="text" placeholder="搜索视频UP主或标题" autocomplete="off" />
       </div>
       <div class="top-actions">
+        <button id="ruleBtn" class="btn-sm btn-ghost btn-gear" title="续看规则（编辑中同步 / 全量暂停）">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+          <span id="rulePending" class="badge-dot hidden" title="有已保存但未应用的规则改动"></span>
+          <span id="ruleDirty" class="badge-num hidden" title="自上次应用以来可能命中规则却未标记的新记录"></span>
+        </button>
         <button id="batchBtn" class="btn-sm btn-ghost" title="进入批量勾选模式：可批量跳过或恢复视频">批量</button>
         <button id="syncBtn" class="btn-sm">同步数据</button>
         <button id="fullBtn" class="btn-sm btn-ghost" title="强制全量重新拉取：重新校准“仅本地存档”标记并刷新封面（增量同步不捕获删除，需偶尔全量）">全量重建</button>
@@ -45,8 +57,8 @@
     </div>
   </header>
 
-  <!-- 更多筛选面板（可折叠） -->
-  <section id="filterPanel" class="filter-panel hidden">
+  <!-- 浏览筛选 popover（点击「筛选 ▾」展开；仅影响当前列表，不落库） -->
+  <section id="browsePanel" class="browse-pop hidden">
     <div class="f-group">
       <span class="f-label active" data-dur="">全部时长</span>
       <span class="f-opt" data-dur="0-600">10分钟以下</span>
@@ -69,34 +81,34 @@
       <span class="f-opt" data-dt="3">设备B (dt=3)</span>
       <small class="f-note">⚠️ dt 含义未公开确认，标签为占位符</small>
     </div>
+    <div class="f-group">
+      <label class="chk"><input type="checkbox" id="archChk" /> 含存档（仅本地留存）</label>
+    </div>
+  </section>
 
-    <hr class="f-div" />
-
-    <!-- 自动跳过规则（持久化到 data/filters.ini；修改即保存） -->
-    <div class="f-group f-rule">
-      <span class="f-label">类型（勾选 = 需要观看；未勾选 = 自动跳过）</span>
-      <label class="chk"><input type="checkbox" class="biz-chk" value="archive" checked />视频</label>
-      <label class="chk"><input type="checkbox" class="biz-chk" value="live" checked />直播</label>
-      <label class="chk"><input type="checkbox" class="biz-chk" value="article" checked />专栏</label>
-      <label class="chk"><input type="checkbox" class="biz-chk" value="pgc" checked />番剧</label>
+  <!-- 续看规则：右侧抽屉（默认隐藏；打开时屏蔽同步 / 全量） -->
+  <div id="ruleOverlay" class="drawer-overlay hidden"></div>
+  <aside id="ruleDrawer" class="rule-drawer hidden" aria-hidden="true" aria-label="续看规则编辑">
+    <div class="drawer-head">
+      <h2 class="drawer-title">续看规则</h2>
+      <button id="ruleClose" class="drawer-close" title="退出（不应用当前改动）">✕</button>
     </div>
-    <div class="f-group f-rule">
-      <span class="f-label">最短时长（分钟，0 = 不限；≥ 此值自动跳过）</span>
-      <input type="number" id="minDur" class="f-num" min="0" value="0" />
+    <div class="drawer-paused">● 编辑中 · 同步 / 全量已暂停</div>
+    <div id="ruleList" class="rule-list"></div>
+    <div class="rule-addbar">
+      <button id="addBlank" class="btn-ghost btn-sm" title="新建一条空白规则，自行添加分组与条件">＋ 新建空白规则</button>
+      <button id="addPreset" class="btn-ghost btn-sm" title="把当前规则未覆盖的类别（类型）打包成一套预设规则直接加入">＋ 新建预设</button>
     </div>
-    <div class="f-group f-rule">
-      <span class="f-label">UP主（逗号分隔，匹配则自动跳过）</span>
-      <input type="text" id="authors" class="f-text" placeholder="例如：老高与小茉, 影视飓风" />
-    </div>
-    <div class="f-group f-rule">
-      <button id="applyAutoSkip" class="btn-sm">应用为自动跳过</button>
-      <span id="autoSkipHint" class="f-note">按上方规则对全部记录重扫并标记「不需要观看」</span>
+    <div id="ruleConflicts" class="rule-conflicts hidden"></div>
+    <div class="drawer-foot">
+      <button id="saveRules" class="btn-ghost btn-sm" title="保存规则配置（不重算 auto_skip；会显示『待应用』角标）">保存配置</button>
+      <button id="applyRules" class="btn-sm" title="按当前 active 规则全量重扫 auto_skip">应用规则</button>
     </div>
     <div id="autoSkipProgress" class="sync-progress hidden">
       <div class="sync-bar"><i></i></div>
       <span id="autoSkipStep" class="sync-step"></span>
     </div>
-  </section>
+  </aside>
 
   <!-- 批量勾选工具条（进入批量模式后显示） -->
   <section id="batchBar" class="batch-bar hidden">
