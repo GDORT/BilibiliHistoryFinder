@@ -106,39 +106,46 @@ function durToSec(range) {
   return { min, max };
 }
 
-/* ====== 构建 API 参数 ====== */
+/* ====== 构建 API 查询体（统一走 POST /api/query） ====== */
 
-function buildParams(reset) {
+// 高级筛选器状态（engine.evaluate_filter 所用 spec）
+const advFilter = {
+  enabled: false,   // 是否启用高级筛选（false 时仅用快捷视图/搜索）
+  logic: "AND",     // 顶层分组间布尔：AND / OR / NOR
+  negate: false,    // 整体取反
+  groups: [],        // [{ logic: "AND"|"OR", conditions: [{field, op, value}] }]
+  having: null,      // { groupBy, op, value }
+};
+
+// 排序状态
+let sortFields = [];   // [{ field, dir: "asc"|"desc" }]
+
+// 选中的保存视图
+let activeViewId = null;
+
+function buildQueryBody(reset) {
   if (reset) offset = 0;
-  const p = new URLSearchParams();
-  if (state.q) p.set("q", state.q);
-  if (state.biz) p.set("business", state.biz);
-  if (state.view && state.view !== "all") p.set("view", state.view);
-  if (state.archived) p.set("archived_only", "1");
-
-  // 时间筛选：快捷预设优先，否则用面板日期
-  const tr = timeRangeToTs(state.timeRange);
-  if (tr) {
-    p.set("date_from", String(tr.from));
-    p.set("date_to", String(tr.to));
-  } else {
-    if (state.dateFrom) p.set("date_from", state.dateFrom);
-    if (state.dateTo) p.set("date_to", state.dateTo);
+  const body = {
+    view: state.view || "all",
+    q: state.q || "",
+    limit: PAGE,
+    offset: offset,
+    filter: advFilter.enabled ? advFilter : null,
+    sort: sortFields,
+    lists: {},
+  };
+  // 黑白名单引用（在筛选条件里以 in_list/not_in_list 引用，这里塞入值集）
+  if (advFilter.enabled) {
+    body.lists = loadListValuesForFilter();
   }
+  return body;
+}
 
-  // 时长筛选
-  const dr = durToSec(state.dur);
-  if (dr) {
-    p.set("duration_min", String(dr.min));
-    p.set("duration_max", String(dr.max));
-  }
-
-  // 设备筛选
-  if (state.dt) p.set("dt", state.dt);
-
-  p.set("limit", String(PAGE));
-  p.set("offset", String(offset));
-  return p;
+function loadListValuesForFilter() {
+  // 从已加载名单构建 {列表id: [values]}，供 in_list/not_in_list 引用
+  const out = {};
+  (window.__lists || []).forEach((l) => { out[l.id] = l.values || []; });
+  return out;
 }
 
 /* ====== 卡片渲染 ====== */
@@ -268,7 +275,11 @@ async function load(reset) {
   if (reset) offset = 0;
   loading = true;
   try {
-    const res = await fetch("/api/history?" + buildParams(!!reset).toString());
+    const res = await fetch("/api/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(buildQueryBody(!!reset)),
+    });
     const data = await res.json();
     render(data);
   } catch (e) {
@@ -336,6 +347,41 @@ const FIELD_LABELS = {
   business: "类型", duration: "时长(秒)", author_name: "UP主名",
   author_mid: "UP主ID", progress_pct: "进度比例(0-1)", progress_sec: "进度(秒)",
   view_at_age_days: "距今(天)", title: "标题",
+};
+/* ====== 高级筛选器：扩展字段词表（覆盖更多维度） ====== */
+const ADV_FIELD_LABELS = {
+  business: "类型", duration: "时长(秒)", author_name: "UP主名",
+  author_mid: "UP主ID", title: "标题", progress_pct: "进度比例(0-1)",
+  progress_sec: "进度(秒)", view_at_age_days: "距今(天)",
+  tag_name: "标签", remark: "备注", main_category: "分区",
+  is_fav: "已收藏", live_status: "直播状态", videos: "分P数",
+  progress: "进度(秒绝值)", view_at: "观看时间", dt: "设备",
+};
+const ADV_FIELD_TYPE = {
+  business: "types", duration: "num", author_name: "text", author_mid: "text",
+  title: "text", progress_pct: "num", progress_sec: "num", view_at_age_days: "num",
+  tag_name: "text", remark: "text", main_category: "text",
+  is_fav: "num", live_status: "num", videos: "num",
+  progress: "num", view_at: "num", dt: "num",
+};
+const ADV_OP_BY_FIELD = {
+  business: [["in", "属于"], ["not_in", "不属于"]],
+  duration: [">=", "≥", "<=", "≤", ">", ">", "<", "<", "between", "介于", "exists", "有值", "empty", "空值"],
+  author_name: [["in", "属于"], ["not_in", "不属于"], ["contains", "包含"], ["not_contains", "不含"], ["regex", "正则"], ["exists", "有值"], ["empty", "空值"]],
+  author_mid: [["in", "属于"], ["not_in", "不属于"], ["exists", "有值"], ["empty", "空值"], ["in_list", "在名单"], ["not_in_list", "不在名单"]],
+  title: [["contains", "包含"], ["not_contains", "不含"], ["regex", "正则"], ["exists", "有值"], ["empty", "空值"]],
+  progress_pct: [">=", "≥", "<=", "≤", ">", ">", "<", "<", "exists", "有值", "empty", "空值"],
+  progress_sec: [">=", "≥", "<=", "≤", ">", ">", "<", "<", "exists", "有值", "empty", "空值"],
+  view_at_age_days: [">", ">", "<", "<", "between", "介于", ">=", "≥", "<=", "≤", "exists", "有值", "empty", "空值"],
+  tag_name: [["contains", "包含"], ["not_contains", "不含"], ["exists", "有值"], ["empty", "空值"]],
+  remark: [["contains", "包含"], ["not_contains", "不含"], ["regex", "正则"], ["exists", "有值"], ["empty", "空值"]],
+  main_category: [["contains", "包含"], ["in", "属于"], ["not_in", "不属于"], ["exists", "有值"], ["empty", "空值"]],
+  is_fav: [["==", "等于"], ["!=", "不等于"], ["exists", "有值"], ["empty", "空值"]],
+  live_status: [["==", "等于"], ["!=", "不等于"], ["exists", "有值"], ["empty", "空值"]],
+  videos: [">", ">", ">=", "≥", "==", "=", "exists", "有值", "empty", "空值"],
+  progress: [">=", "≥", "<=", "≤", ">", ">", "<", "<", "exists", "有值", "empty", "空值"],
+  view_at: [">", ">", "<", "<", "exists", "有值", "empty", "空值", ["relative_after", "近N天内"], ["relative_before", "超过N天"]],
+  dt: [["==", "等于"], ["!=", "不等于"], ["exists", "有值"], ["empty", "空值"]],
 };
 const FIELD_TYPE = {
   business: "types", duration: "num", author_name: "text", author_mid: "text",
@@ -1179,3 +1225,419 @@ pollSync();
 loadRules();
 load(true);
 pollRuleStatus();
+
+/* ====== 高级筛选器（当前引擎规则的超集：读时查询层） ====== */
+let advDrawerOpen = false;
+
+// 高级筛选字段/算子控件生成（复用规则引擎同款 UI 思路，但字段更全）
+function advGenFieldOptions(sel) {
+  return Object.keys(ADV_FIELD_LABELS).map(
+    (f) => `<option value="${f}" ${f === sel ? "selected" : ""}>${ADV_FIELD_LABELS[f]}</option>`
+  ).join("");
+}
+function advGenOpOptions(field, sel) {
+  const ops = ADV_OP_BY_FIELD[field] || [];
+  return ops.map((o) => {
+    const v = Array.isArray(o) ? o[0] : o;
+    const t = Array.isArray(o) ? o[1] : o;
+    return `<option value="${v}" ${v === sel ? "selected" : ""}>${t}</option>`;
+  }).join("");
+}
+function advGenValueWidget(field, cond, gi, ci) {
+  const t = ADV_FIELD_TYPE[field];
+  const v = cond.value;
+  const noValOps = ["exists", "empty"];
+  if (noValOps.includes(cond.op)) {
+    return `<span class="adv-val-none">—</span>`;
+  }
+  if (cond.op === "in_list" || cond.op === "not_in_list") {
+    const lists = window.__lists || [];
+    const opts = lists.map((l) => `<option value="${l.id}" ${(v === l.id) ? "selected" : ""}>${escapeHtml(l.name)} (${l.kind === "whitelist" ? "白" : "黑"})</option>`).join("");
+    return `<select class="adv-val-list" data-g="${gi}" data-c="${ci}"><option value="">选择名单</option>${opts}</select>`;
+  }
+  if (cond.op === "relative_after" || cond.op === "relative_before") {
+    return `<input type="text" class="adv-val-text" data-g="${gi}" data-c="${ci}" value="${escapeHtml(String(v == null ? "" : v))}" placeholder="如 7d / 30d / 2w" />`;
+  }
+  if (t === "types") {
+    const set = (typeof v === "string" && v) ? v.split(",").map((x) => x.trim()).filter(Boolean) : (Array.isArray(v) ? v : []);
+    const cbs = TYPE_OPTIONS.map((tp) =>
+      `<label class="chk mini"><input type="checkbox" data-g="${gi}" data-c="${ci}" data-k="value-types" value="${tp}" ${set.includes(tp) ? "checked" : ""}/>${tp}</label>`
+    ).join(" ");
+    return `<span class="val-types">${cbs}</span>`;
+  }
+  if (t === "num") {
+    const num = (typeof v === "number") ? v : (v != null ? v : "");
+    return `<input type="number" class="adv-val-num" data-g="${gi}" data-c="${ci}" value="${escapeHtml(String(num))}" step="any" />`;
+  }
+  const txt = (typeof v === "string") ? v : (Array.isArray(v) ? v.join(",") : "");
+  return `<input type="text" class="adv-val-text" data-g="${gi}" data-c="${ci}" value="${escapeHtml(txt)}" placeholder="文本/正则" />`;
+}
+
+function advCondHtml(c, gi, ci) {
+  return `<div class="adv-cond" data-g="${gi}" data-c="${ci}">
+    <select class="adv-cond-field" data-g="${gi}" data-c="${ci}">${advGenFieldOptions(c.field)}</select>
+    <select class="adv-cond-op" data-g="${gi}" data-c="${ci}">${advGenOpOptions(c.field, c.op)}</select>
+    ${advGenValueWidget(c.field, c, gi, ci)}
+    <button class="adv-cond-del btn-ghost btn-sm" data-g="${gi}" data-c="${ci}">✕</button>
+  </div>`;
+}
+
+function advGroupHtml(g, gi) {
+  return `<div class="adv-group" data-g="${gi}">
+    <div class="adv-group-head">
+      <select class="adv-group-logic" data-g="${gi}">
+        <option value="AND" ${g.logic === "AND" ? "selected" : ""}>组内 AND</option>
+        <option value="OR" ${g.logic === "OR" ? "selected" : ""}>组内 OR</option>
+      </select>
+      <button class="adv-group-del btn-ghost btn-sm" data-g="${gi}">删除分组</button>
+    </div>
+    <div class="adv-group-conds">
+      ${(g.conditions || []).map((c, ci) => advCondHtml(c, gi, ci)).join("")}
+    </div>
+    <button class="adv-cond-add btn-ghost btn-sm" data-g="${gi}">＋ 条件</button>
+  </div>`;
+}
+
+function renderAdvGroups() {
+  const root = $("advGroups");
+  if (!advFilter.groups.length) {
+    root.innerHTML = '<div class="adv-empty">暂无条件分组，点下方「＋ 条件分组」添加</div>';
+    return;
+  }
+  root.innerHTML = advFilter.groups.map((g, gi) => advGroupHtml(g, gi)).join("");
+  attachAdvGroupEvents();
+}
+
+function attachAdvGroupEvents() {
+  const root = $("advGroups");
+  root.querySelectorAll(".adv-group-logic").forEach((s) => s.addEventListener("change", (e) => {
+    advFilter.groups[+e.target.dataset.g].logic = e.target.value;
+  }));
+  root.querySelectorAll(".adv-group-del").forEach((b) => b.addEventListener("click", () => {
+    advFilter.groups.splice(+b.dataset.g, 1); renderAdvGroups();
+  }));
+  root.querySelectorAll(".adv-cond-add").forEach((b) => b.addEventListener("click", () => {
+    const gi = +b.dataset.g;
+    advFilter.groups[gi].conditions.push({ field: "progress_pct", op: ">=", value: 0.95 });
+    renderAdvGroups();
+  }));
+  root.querySelectorAll(".adv-cond-del").forEach((b) => b.addEventListener("click", () => {
+    const gi = +b.dataset.g, ci = +b.dataset.c;
+    advFilter.groups[gi].conditions.splice(ci, 1); renderAdvGroups();
+  }));
+  root.querySelectorAll(".adv-cond-field").forEach((el) => el.addEventListener("change", (e) => {
+    const gi = +e.target.dataset.g, ci = +e.target.dataset.c;
+    const c = advFilter.groups[gi].conditions[ci];
+    c.field = e.target.value;
+    const ops = ADV_OP_BY_FIELD[c.field];
+    c.op = Array.isArray(ops[0]) ? ops[0][0] : ops[0];
+    c.value = (ADV_FIELD_TYPE[c.field] === "types") ? "" : (ADV_FIELD_TYPE[c.field] === "num" ? 0 : "");
+    renderAdvGroups();
+  }));
+  root.querySelectorAll(".adv-cond-op").forEach((el) => el.addEventListener("change", (e) => {
+    const gi = +e.target.dataset.g, ci = +e.target.dataset.c;
+    advFilter.groups[gi].conditions[ci].op = e.target.value;
+    renderAdvGroups();
+  }));
+  root.querySelectorAll(".adv-val-num, .adv-val-text").forEach((el) => el.addEventListener("change", (e) => {
+    const gi = +el.dataset.g, ci = +el.dataset.c;
+    let val = e.target.value;
+    if (el.classList.contains("adv-val-num")) val = (val === "" ? 0 : parseFloat(val));
+    advFilter.groups[gi].conditions[ci].value = val;
+  }));
+  root.querySelectorAll(".adv-val-list").forEach((el) => el.addEventListener("change", (e) => {
+    const gi = +el.dataset.g, ci = +el.dataset.c;
+    advFilter.groups[gi].conditions[ci].value = e.target.value;
+  }));
+  root.querySelectorAll(".val-types input[type=checkbox]").forEach((cb) => cb.addEventListener("change", () => {
+    const gi = +cb.dataset.g, ci = +cb.dataset.c;
+    const checked = [...document.querySelectorAll(`.val-types input[data-g="${gi}"][data-c="${ci}"]:checked`)].map((x) => x.value);
+    advFilter.groups[gi].conditions[ci].value = checked.join(",");
+  }));
+}
+
+function renderAdvHaving() {
+  const root = $("advHaving");
+  if (!advFilter.having) {
+    root.innerHTML = '<div class="adv-empty">未设置聚合条件</div>';
+    return;
+  }
+  const h = advFilter.having;
+  root.innerHTML = `<div class="adv-having-row">
+    <select class="adv-having-field">
+      <option value="author_mid" ${h.groupBy === "author_mid" ? "selected" : ""}>同UP主</option>
+      <option value="business" ${h.groupBy === "business" ? "selected" : ""}>同类型</option>
+      <option value="main_category" ${h.groupBy === "main_category" ? "selected" : ""}>同分区</option>
+    </select>
+    <select class="adv-having-op">
+      <option value=">" ${h.op === ">" ? "selected" : ""}>></option>
+      <option value=">=" ${h.op === ">=" ? "selected" : ""}>≥</option>
+      <option value="<" ${h.op === "<" ? "selected" : ""}>></option>
+      <option value="<=" ${h.op === "<=" ? "selected" : ""}>≤</option>
+      <option value="==" ${h.op === "==" ? "selected" : ""}>=</option>
+    </select>
+    <input type="number" class="adv-having-val" value="${escapeHtml(String(h.value != null ? h.value : 3))}" />
+    <button class="adv-having-del btn-ghost btn-sm">✕</button>
+  </div>`;
+  root.querySelector(".adv-having-field").addEventListener("change", (e) => { advFilter.having.groupBy = e.target.value; });
+  root.querySelector(".adv-having-op").addEventListener("change", (e) => { advFilter.having.op = e.target.value; });
+  root.querySelector(".adv-having-val").addEventListener("change", (e) => { advFilter.having.value = parseFloat(e.target.value) || 0; });
+  root.querySelector(".adv-having-del").addEventListener("click", () => { advFilter.having = null; renderAdvHaving(); });
+}
+
+function renderAdvSort() {
+  const root = $("advSort");
+  if (!sortFields.length) {
+    root.innerHTML = '<div class="adv-empty">未设置排序（默认按观看时间倒序）</div>';
+    return;
+  }
+  root.innerHTML = sortFields.map((s, i) => `<div class="adv-sort-row" data-i="${i}">
+    <select class="adv-sort-field" data-i="${i}">
+      <option value="view_at" ${s.field === "view_at" ? "selected" : ""}>观看时间</option>
+      <option value="duration" ${s.field === "duration" ? "selected" : ""}>时长</option>
+      <option value="progress" ${s.field === "progress" ? "selected" : ""}>进度(秒)</option>
+      <option value="progress_pct" ${s.field === "progress_pct" ? "selected" : ""}>进度比例</option>
+      <option value="progress_sec" ${s.field === "progress_sec" ? "selected" : ""}>已看秒数</option>
+      <option value="view_at_age_days" ${s.field === "view_at_age_days" ? "selected" : ""}>距今天数</option>
+      <option value="title" ${s.field === "title" ? "selected" : ""}>标题</option>
+      <option value="author_name" ${s.field === "author_name" ? "selected" : ""}>UP主</option>
+      <option value="business" ${s.field === "business" ? "selected" : ""}>类型</option>
+      <option value="main_category" ${s.field === "main_category" ? "selected" : ""}>分区</option>
+    </select>
+    <select class="adv-sort-dir" data-i="${i}">
+      <option value="desc" ${s.dir === "desc" ? "selected" : ""}>降序</option>
+      <option value="asc" ${s.dir === "asc" ? "selected" : ""}>升序</option>
+    </select>
+    <button class="adv-sort-del btn-ghost btn-sm" data-i="${i}">✕</button>
+  </div>`).join("");
+  root.querySelectorAll(".adv-sort-field").forEach((el) => el.addEventListener("change", (e) => { sortFields[+e.target.dataset.i].field = e.target.value; }));
+  root.querySelectorAll(".adv-sort-dir").forEach((el) => el.addEventListener("change", (e) => { sortFields[+e.target.dataset.i].dir = e.target.value; }));
+  root.querySelectorAll(".adv-sort-del").forEach((b) => b.addEventListener("click", () => { sortFields.splice(+b.dataset.i, 1); renderAdvSort(); }));
+}
+
+function renderAdvViews() {
+  const root = $("advViews");
+  const views = window.__views || [];
+  if (!views.length) {
+    root.innerHTML = '<div class="adv-empty">暂无保存的视图</div>';
+    return;
+  }
+  root.innerHTML = views.map((v) => `<div class="adv-view-item ${v.id === activeViewId ? "active" : ""}" data-id="${escapeHtml(v.id)}">
+    <span class="adv-view-name" data-id="${escapeHtml(v.id)}">${escapeHtml(v.name)}</span>
+    <button class="adv-view-del btn-ghost btn-sm" data-id="${escapeHtml(v.id)}" title="删除视图">✕</button>
+  </div>`).join("");
+  root.querySelectorAll(".adv-view-name").forEach((el) => el.addEventListener("click", () => applyView(el.dataset.id)));
+  root.querySelectorAll(".adv-view-del").forEach((b) => b.addEventListener("click", (e) => {
+    e.stopPropagation();
+    deleteView(b.dataset.id);
+  }));
+}
+
+function renderAdvLists() {
+  const root = $("advLists");
+  const lists = window.__lists || [];
+  if (!lists.length) {
+    root.innerHTML = '<div class="adv-empty">暂无名单</div>';
+    return;
+  }
+  root.innerHTML = lists.map((l) => `<div class="adv-list-item" data-id="${escapeHtml(l.id)}">
+    <span class="adv-list-name">${escapeHtml(l.name)}</span>
+    <span class="adv-list-kind">${l.kind === "whitelist" ? "白名单" : "黑名单"}</span>
+    <span class="adv-list-count">${l.values.length} 项</span>
+    <button class="adv-list-del btn-ghost btn-sm" data-id="${escapeHtml(l.id)}" title="删除名单">✕</button>
+  </div>`).join("");
+  root.querySelectorAll(".adv-list-del").forEach((b) => b.addEventListener("click", () => deleteList(b.dataset.id)));
+}
+
+/* ====== 高级筛选：数据加载与持久化 ====== */
+async function loadViews() {
+  try {
+    const d = await (await fetch("/api/views")).json();
+    window.__views = d.views || [];
+    renderAdvViews();
+  } catch (e) { /* 忽略 */ }
+}
+async function loadLists() {
+  try {
+    const d = await (await fetch("/api/lists")).json();
+    window.__lists = d.lists || [];
+    renderAdvLists();
+  } catch (e) { /* 忽略 */ }
+}
+async function saveViewCall(name) {
+  const spec = JSON.parse(JSON.stringify(advFilter));
+  const res = await fetch("/api/views", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: name, spec: spec }),
+  });
+  const d = await res.json();
+  if (d.ok) { window.__views = d.views; renderAdvViews(); }
+  return d;
+}
+async function deleteView(id) {
+  const res = await fetch("/api/views", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "delete", id: id }),
+  });
+  const d = await res.json();
+  if (d.ok) { window.__views = d.views; renderAdvViews(); if (activeViewId === id) { activeViewId = null; advFilter.enabled = false; } }
+}
+async function saveListCall(name, kind, values) {
+  const res = await fetch("/api/lists", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: name, kind: kind, values: values }),
+  });
+  const d = await res.json();
+  if (d.ok) { window.__lists = d.lists; renderAdvLists(); }
+  return d;
+}
+async function deleteList(id) {
+  const res = await fetch("/api/lists", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "delete", id: id }),
+  });
+  const d = await res.json();
+  if (d.ok) { window.__lists = d.lists; renderAdvLists(); }
+}
+
+function applyView(id) {
+  const v = (window.__views || []).find((x) => x.id === id);
+  if (!v) return;
+  activeViewId = id;
+  // 深拷贝 spec 到 advFilter
+  const spec = JSON.parse(JSON.stringify(v.spec));
+  advFilter.enabled = true;
+  advFilter.logic = spec.logic || "AND";
+  advFilter.negate = !!spec.negate;
+  advFilter.groups = spec.groups || [];
+  advFilter.having = spec.having || null;
+  $("advLogic").value = advFilter.logic;
+  $("advNegate").checked = advFilter.negate;
+  sortFields = spec.sort || [];
+  renderAdvGroups(); renderAdvHaving(); renderAdvSort(); renderAdvViews();
+  load(true);
+  toast("已应用视图：" + v.name);
+}
+
+/* ====== 高级筛选：抽屉开关 ====== */
+function openAdvDrawer() {
+  if (advDrawerOpen) return;
+  advDrawerOpen = true;
+  loadViews(); loadLists();
+  renderAdvGroups(); renderAdvHaving(); renderAdvSort(); renderAdvViews(); renderAdvLists();
+  $("advOverlay").classList.remove("hidden");
+  const d = $("advDrawer");
+  d.classList.remove("hidden");
+  d.setAttribute("aria-hidden", "false");
+  requestAnimationFrame(() => d.classList.add("open"));
+}
+function closeAdvDrawer() {
+  if (!advDrawerOpen) return;
+  advDrawerOpen = false;
+  const d = $("advDrawer");
+  d.classList.remove("open");
+  d.setAttribute("aria-hidden", "true");
+  $("advOverlay").classList.add("hidden");
+  setTimeout(() => d.classList.add("hidden"), 220);
+}
+
+$("advToggle").addEventListener("click", openAdvDrawer);
+$("advClose").addEventListener("click", closeAdvDrawer);
+$("advOverlay").addEventListener("click", closeAdvDrawer);
+$("advLogic").addEventListener("change", (e) => { advFilter.logic = e.target.value; });
+$("advNegate").addEventListener("change", (e) => { advFilter.negate = e.target.checked; });
+$("advAddGroup").addEventListener("click", () => {
+  advFilter.groups.push({ logic: "AND", conditions: [{ field: "progress_pct", op: ">=", value: 0.95 }] });
+  renderAdvGroups();
+});
+$("advAddHaving").addEventListener("click", () => {
+  advFilter.having = { groupBy: "author_mid", op: ">", value: 3 };
+  renderAdvHaving();
+});
+$("advAddSort").addEventListener("click", () => {
+  sortFields.push({ field: "view_at", dir: "desc" });
+  renderAdvSort();
+});
+$("advSaveView").addEventListener("click", async () => {
+  const name = prompt("视图名称：", "我的筛选 " + new Date().toLocaleString());
+  if (!name) return;
+  const d = await saveViewCall(name);
+  if (d.ok) toast("已保存视图：" + name);
+  else toast("保存失败");
+});
+$("advClearView").addEventListener("click", () => {
+  activeViewId = null;
+  advFilter.enabled = false;
+  advFilter.groups = [];
+  advFilter.having = null;
+  advFilter.negate = false;
+  sortFields = [];
+  renderAdvGroups(); renderAdvHaving(); renderAdvSort(); renderAdvViews();
+  load(true);
+});
+$("advAddList").addEventListener("click", async () => {
+  const name = prompt("名单名称：", "我的UP主名单");
+  if (!name) return;
+  const kind = confirm("点击「确定」= 白名单（in_list 引用时保留）；「取消」= 黑名单（not_in_list 引用时排除）")
+    ? "whitelist" : "blacklist";
+  const raw = prompt("输入值（逗号分隔，如 UP主ID 或 类型）：", "");
+  if (raw == null) return;
+  const values = raw.split(",").map((x) => x.trim()).filter(Boolean);
+  const d = await saveListCall(name, kind, values);
+  if (d.ok) toast("已保存名单：" + name);
+  else toast("保存失败");
+});
+$("advEnable").addEventListener("click", () => {
+  advFilter.enabled = true;
+  activeViewId = null;
+  closeAdvDrawer();
+  load(true);
+  toast("高级筛选已应用");
+});
+$("advDisable").addEventListener("click", () => {
+  advFilter.enabled = false;
+  activeViewId = null;
+  closeAdvDrawer();
+  load(true);
+  toast("已仅用快捷筛选");
+});
+
+/* ====== 批量：新增「归档」动作 ====== */
+// 在批量动作下拉中追加归档选项（随视图显示）
+function syncBatchKindToViewExt() {
+  const sel = $("batchActionSel");
+  if (state.view === "all") {
+    if (!sel.querySelector('option[value="archive"]')) {
+      const opt = document.createElement("option");
+      opt.value = "archive"; opt.textContent = "归档选中";
+      sel.appendChild(opt);
+    }
+  }
+}
+// 拦截批量应用，增加 archive 处理
+const _batchApplyOrig = $("batchApply").onclick;
+$("batchApply").addEventListener("click", async (e) => {
+  if (batchAction !== "archive") return;  // 其他动作由原有逻辑处理
+  e.stopImmediatePropagation();
+  const cbs = [...listEl.querySelectorAll(".batch-cb:not([disabled]):checked")];
+  if (cbs.length === 0) { toast("请先勾选视频"); return; }
+  $("batchApply").disabled = true;
+  const kids = cbs.map((cb) => cb.dataset.kid);
+  try {
+    const r = await fetch("/api/batch", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kids: kids, action: "archive" }),
+    });
+    const d = await r.json();
+    if (d.ok) toast(`已归档 ${d.affected} 条`);
+    else toast("归档失败");
+  } catch (err) { toast("归档失败：" + err.message); }
+  $("batchApply").disabled = false;
+  load(true);
+}, true);
+
+// 在进入批量模式时补充 archive 选项
+const _batchBtnClick = $("batchBtn").onclick;
+$("batchBtn").addEventListener("click", () => {
+  setTimeout(syncBatchKindToViewExt, 0);
+});

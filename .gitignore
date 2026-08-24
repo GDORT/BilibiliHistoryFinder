@@ -18,3 +18,7 @@ venv/
 .DS_Store
 *.swp
 Thumbs.db
+
+# ===== 参考工程 =====
+doc/BilibiliHistoryFetcher-master
+doc/BiliHistoryFrontend-master

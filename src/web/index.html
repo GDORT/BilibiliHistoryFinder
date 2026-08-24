@@ -27,6 +27,7 @@
 
       <!-- 临时浏览筛选（时长/时间/设备/含存档，不落库） -->
       <button class="btn-sm btn-ghost" id="browseToggle" title="浏览筛选（时长 / 时间 / 设备 / 含存档）">筛选 ▾</button>
+      <button class="btn-sm btn-ghost" id="advToggle" title="高级筛选（组合条件 / 黑白名单 / 排序 / 保存视图）">高级筛选 ⚙</button>
 
       <div class="search">
         <input id="q" type="text" placeholder="搜索视频UP主或标题" autocomplete="off" />
@@ -85,6 +86,64 @@
       <label class="chk"><input type="checkbox" id="archChk" /> 含存档（仅本地留存）</label>
     </div>
   </section>
+
+  <!-- 高级筛选：右侧抽屉（点击「高级筛选」按钮展开；可保存为视图） -->
+  <div id="advOverlay" class="drawer-overlay hidden"></div>
+  <aside id="advDrawer" class="adv-drawer hidden" aria-hidden="true" aria-label="高级筛选">
+    <div class="drawer-head">
+      <h2 class="drawer-title">高级筛选</h2>
+      <button id="advClose" class="drawer-close" title="关闭">✕</button>
+    </div>
+    <div class="adv-body">
+      <!-- 已保存视图 -->
+      <div class="adv-section">
+        <div class="adv-sec-title">已保存视图</div>
+        <div id="advViews" class="adv-views"></div>
+        <div class="adv-views-actions">
+          <button id="advSaveView" class="btn-ghost btn-sm">保存当前为视图</button>
+          <button id="advClearView" class="btn-ghost btn-sm" title="清除当前高级筛选条件">清除条件</button>
+        </div>
+      </div>
+      <!-- 黑白名单 -->
+      <div class="adv-section">
+        <div class="adv-sec-title">黑白名单</div>
+        <div id="advLists" class="adv-lists"></div>
+        <button id="advAddList" class="btn-ghost btn-sm">＋ 新建名单</button>
+      </div>
+      <!-- 分组间布尔 -->
+      <div class="adv-section">
+        <div class="adv-sec-title">分组间逻辑</div>
+        <select id="advLogic" class="btn-sm">
+          <option value="AND">所有分组都满足 (AND)</option>
+          <option value="OR">任一分组满足 (OR)</option>
+          <option value="NOR">所有分组都不满足 (NOR)</option>
+        </select>
+        <label class="chk adv-negate"><input type="checkbox" id="advNegate" /> 整体取反 (NOT)</label>
+      </div>
+      <!-- 条件分组 -->
+      <div class="adv-section">
+        <div class="adv-sec-title">条件分组</div>
+        <div id="advGroups" class="adv-groups"></div>
+        <button id="advAddGroup" class="btn-ghost btn-sm">＋ 条件分组</button>
+      </div>
+      <!-- 聚合 HAVING -->
+      <div class="adv-section">
+        <div class="adv-sec-title">聚合条件 (HAVING)</div>
+        <div id="advHaving" class="adv-having"></div>
+        <button id="advAddHaving" class="btn-ghost btn-sm">＋ 聚合条件</button>
+      </div>
+      <!-- 排序 -->
+      <div class="adv-section">
+        <div class="adv-sec-title">排序</div>
+        <div id="advSort" class="adv-sort"></div>
+        <button id="advAddSort" class="btn-ghost btn-sm">＋ 排序字段</button>
+      </div>
+    </div>
+    <div class="drawer-foot">
+      <button id="advEnable" class="btn-sm">应用筛选</button>
+      <button id="advDisable" class="btn-ghost btn-sm">仅用快捷筛选</button>
+    </div>
+  </aside>
 
   <!-- 续看规则：右侧抽屉（默认隐藏；打开时屏蔽同步 / 全量） -->
   <div id="ruleOverlay" class="drawer-overlay hidden"></div>
