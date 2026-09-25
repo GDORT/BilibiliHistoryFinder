@@ -10,29 +10,33 @@
   <!-- 顶部工具栏 -->
   <header class="topbar">
     <div class="topbar-inner">
-      <nav class="tabs">
-        <button class="tab active" data-biz="">综合</button>
-        <button class="tab" data-biz="archive">视频</button>
-        <button class="tab" data-biz="live">直播</button>
-        <button class="tab" data-biz="article">专栏</button>
-      </nav>
-
-      <!-- 生命周期视图：全部 / 需要观看 / 已跳过 / 已搁置 -->
-      <div class="view-tabs">
-        <button class="vtab active" data-view="all">全部</button>
-        <button class="vtab" data-view="needs">需要观看</button>
-        <button class="vtab" data-view="skipped">已跳过</button>
-        <button class="vtab" data-view="stale">已搁置</button>
+      <!-- 分组 A：分类与生命周期视图（主导航） -->
+      <div class="tb-group tb-nav">
+        <nav class="tabs">
+          <button class="tab active" data-biz="">综合</button>
+          <button class="tab" data-biz="archive">视频</button>
+          <button class="tab" data-biz="live">直播</button>
+          <button class="tab" data-biz="article">专栏</button>
+        </nav>
+        <div class="view-tabs">
+          <button class="vtab active" data-view="all">全部</button>
+          <button class="vtab" data-view="needs">需要观看</button>
+          <button class="vtab" data-view="skipped">已跳过</button>
+          <button class="vtab" data-view="stale">已搁置</button>
+        </div>
       </div>
 
-      <!-- 临时浏览筛选（时长/时间/设备/含存档，不落库） -->
-      <button class="btn-sm btn-ghost" id="browseToggle" title="浏览筛选（时长 / 时间 / 设备 / 含存档）">筛选 ▾</button>
-      <button class="btn-sm btn-ghost" id="advToggle" title="高级筛选（组合条件 / 黑白名单 / 排序 / 保存视图）">高级筛选 ⚙</button>
-
-      <div class="search">
-        <input id="q" type="text" placeholder="搜索视频UP主或标题" autocomplete="off" />
+      <!-- 分组 B：检索（搜索 + 快捷筛选 + 高级筛选） -->
+      <div class="tb-group tb-find">
+        <div class="search">
+          <input id="q" type="text" placeholder="搜索视频UP主或标题" autocomplete="off" />
+        </div>
+        <button class="btn-sm btn-ghost" id="browseToggle" title="浏览筛选（时长 / 时间 / 设备 / 含存档）">筛选 ▾</button>
+        <button class="btn-sm btn-ghost" id="advToggle" title="高级筛选（组合条件 / 黑白名单 / 排序 / 保存视图）">高级筛选 ⚙</button>
       </div>
-      <div class="top-actions">
+
+      <!-- 分组 C：操作（规则 / 批量 / 同步 / 实时更新 / 设置） -->
+      <div class="tb-group tb-actions">
         <button id="ruleBtn" class="btn-sm btn-ghost btn-gear" title="续看规则（编辑中同步 / 全量暂停）">
           <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="12" cy="12" r="3"></circle>
@@ -42,8 +46,24 @@
           <span id="ruleDirty" class="badge-num hidden" title="自上次应用以来可能命中规则却未标记的新记录"></span>
         </button>
         <button id="batchBtn" class="btn-sm btn-ghost" title="进入批量勾选模式：可批量跳过或恢复视频">批量</button>
-        <button id="syncBtn" class="btn-sm">同步数据</button>
+        <button id="syncBtn" class="btn-sm" title="同步数据（增量拉取最新历史）">同步数据</button>
         <button id="fullBtn" class="btn-sm btn-ghost" title="强制全量重新拉取：重新校准“仅本地存档”标记并刷新封面（增量同步不捕获删除，需偶尔全量）">全量重建</button>
+        <span id="fetcherDot" class="conn-dot off" title="Analyzer 连接状态"></span>
+        <button id="fetcherBtn" class="btn-sm btn-ghost" title="触发 Analyzer 重新拉取/分析（需本机 Analyzer 后台运行；未运行则提示不可达）">实时更新</button>
+        <button id="settingsBtn" class="btn-icon" title="设置" aria-label="设置">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+      </div>
+
+      <!-- 分组 D：Analyzer 联调（逐一测试 Analyzer 接口；需本机 Analyzer 后台运行） -->
+      <div class="tb-group tb-analyzer">
+        <button id="anHealthBtn" class="btn-sm btn-test" title="GET /health：探测 Analyzer/Fetcher 后端是否可达">① 健康探测</button>
+        <button id="anRealtimeBtn" class="btn-sm btn-test" title="GET /fetch/bili-history-realtime：触发 Analyzer 增量重新拉取/分析">② 增量拉取</button>
+        <button id="anFullBtn" class="btn-sm btn-test" title="GET /fetch/bili-history：触发 Analyzer 全量重新拉取/分析">③ 全量拉取</button>
+        <button id="anDataBtn" class="btn-sm btn-test" title="GET /api/fetcher-check：真正调用 Analyzer 完整性校验（POST /data_sync/check）+ 报告，检测 JSON↔DB 是否一致">④ 数据自检</button>
+        <button id="anBackupBtn" class="btn-sm btn-test" title="POST /api/backup：对 Finder 依赖的 Analyzer 主源 + 本地库做一致快照，作为轻量自主备份">⑤ 本地备份</button>
+        <button id="anBackupListBtn" class="btn-sm btn-ghost" title="GET /api/backups：列出已生成的本地备份快照">查看备份</button>
+        <button id="anApplyBtn" class="btn-sm btn-test" title="POST /api/apply：唯一入口——自动比对启动快照与磁盘：改了数据层就热重载（~0.1s 不重启），改了 server.py 就自动重启（~1-2s，由 start.bat 拉起），只改前端则提示刷新即可。无需你判断改了哪些文件">⑥ 应用变更<span id="codeBadge" class="code-badge hidden">0</span></button>
       </div>
     </div>
     <div class="topbar-status">
@@ -152,13 +172,15 @@
       <h2 class="drawer-title">续看规则</h2>
       <button id="ruleClose" class="drawer-close" title="退出（不应用当前改动）">✕</button>
     </div>
-    <div class="drawer-paused">● 编辑中 · 同步 / 全量已暂停</div>
-    <div id="ruleList" class="rule-list"></div>
-    <div class="rule-addbar">
-      <button id="addBlank" class="btn-ghost btn-sm" title="新建一条空白规则，自行添加分组与条件">＋ 新建空白规则</button>
-      <button id="addPreset" class="btn-ghost btn-sm" title="把当前规则未覆盖的类别（类型）打包成一套预设规则直接加入">＋ 新建预设</button>
+    <div class="drawer-body">
+      <div class="drawer-paused">● 编辑中 · 同步 / 全量已暂停</div>
+      <div id="ruleList" class="rule-list"></div>
+      <div class="rule-addbar">
+        <button id="addBlank" class="btn-ghost btn-sm" title="新建一条空白规则，自行添加分组与条件">＋ 新建空白规则</button>
+        <button id="addPreset" class="btn-ghost btn-sm" title="把当前规则未覆盖的类别（类型）打包成一套预设规则直接加入">＋ 新建预设</button>
+      </div>
+      <div id="ruleConflicts" class="rule-conflicts hidden"></div>
     </div>
-    <div id="ruleConflicts" class="rule-conflicts hidden"></div>
     <div class="drawer-foot">
       <button id="saveRules" class="btn-ghost btn-sm" title="保存规则配置（不重算 auto_skip；会显示『待应用』角标）">保存配置</button>
       <button id="applyRules" class="btn-sm" title="按当前 active 规则全量重扫 auto_skip">应用规则</button>
@@ -205,6 +227,42 @@
   </main>
 
   <div id="toast" class="toast hidden"></div>
+
+  <!-- 设置：Analyzer / Fetcher 连接（低调入口，非常用触发） -->
+  <div id="settingsModal" class="modal-backdrop hidden">
+    <div class="modal" role="dialog" aria-label="Analyzer 连接设置">
+      <div class="modal-head">
+        <span>Analyzer / Fetcher 连接</span>
+        <button id="settingsClose" class="modal-x" aria-label="关闭">&times;</button>
+      </div>
+      <div class="modal-body">
+        <label class="fld-label" for="fetcherBase">后端地址</label>
+        <input id="fetcherBase" class="fld-input" placeholder="http://localhost:8899" autocomplete="off" />
+        <label class="fld-label" for="fetcherKey">X-API-Key（留空则用服务端配置）</label>
+        <input id="fetcherKey" class="fld-input" type="password" placeholder="可选" autocomplete="off" />
+        <p class="fld-hint">密钥经 server.py 代理转发，不暴露到浏览器。保存后即时生效并持久化到本地。</p>
+        <div class="modal-actions">
+          <button id="fetcherTest" class="btn-sm btn-ghost">测试连接</button>
+          <button id="fetcherSave" class="btn-sm btn-primary">保存</button>
+        </div>
+        <div id="fetcherCfgStatus" class="fld-status"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Analyzer 联调结果弹窗 -->
+  <div id="diagModal" class="modal-backdrop hidden">
+    <div class="modal" role="dialog" aria-label="Analyzer 联调结果">
+      <div class="modal-head">
+        <span id="diagTitle">Analyzer 联调结果</span>
+        <button id="diagClose" class="modal-x" aria-label="关闭">&times;</button>
+      </div>
+      <div class="modal-body">
+        <pre id="diagBody" class="diag-pre"></pre>
+      </div>
+    </div>
+  </div>
+
   <script src="/static/app.js"></script>
 </body>
 </html>

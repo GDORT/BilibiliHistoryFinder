@@ -138,6 +138,18 @@ function buildQueryBody(reset) {
   if (advFilter.enabled) {
     body.lists = loadListValuesForFilter();
   }
+  // 时间范围筛选：把 state 里的时间条件塞进请求体（修复此前死代码——设置了 state 却从不发出）
+  let tf = null, tt = null;
+  if (state.timeRange) {
+    const r = timeRangeToTs(state.timeRange);
+    if (r) { tf = r.from; tt = r.to; }
+  }
+  if (state.dateFrom) tf = Number(state.dateFrom);
+  if (state.dateTo)   tt = Number(state.dateTo);
+  if (tf != null || tt != null) {
+    body.time_from = tf;
+    body.time_to = tt;
+  }
   return body;
 }
 
@@ -399,6 +411,22 @@ const OP_BY_FIELD = {
 };
 const TYPE_OPTIONS = ["archive", "live", "article", "pgc"];
 
+// 数值条件滑块配置：返回 {min,max,step,fmt}；非数值/无需滑块字段返回 null
+function sliderSpec(field) {
+  switch (field) {
+    case "progress_pct": return { min: 0, max: 1, step: 0.01, fmt: (v) => Math.round(v * 100) + "%" };
+    case "progress_sec":
+    case "progress": return { min: 0, max: 7200, step: 5, fmt: (v) => fmtDur(v) };
+    case "duration": return { min: 0, max: 7200, step: 5, fmt: (v) => fmtDur(v) };
+    case "view_at_age_days": return { min: 0, max: 365, step: 1, fmt: (v) => (v <= 0 ? "0" : v + " 天") };
+    case "videos": return { min: 0, max: 200, step: 1, fmt: (v) => v + " P" };
+    case "is_fav":
+    case "live_status": return { min: 0, max: 1, step: 1, fmt: (v) => (v ? "1" : "0") };
+    case "dt": return { min: 0, max: 10, step: 1, fmt: (v) => "dt=" + v };
+    default: return null;
+  }
+}
+
 function genFieldOptions(sel) {
   return Object.keys(FIELD_LABELS).map(
     (f) => `<option value="${f}" ${f === sel ? "selected" : ""}>${FIELD_LABELS[f]}</option>`
@@ -423,8 +451,14 @@ function genValueWidget(field, cond, ri, gi, ci) {
     return `<span class="val-types">${cbs}</span>`;
   }
   if (t === "num") {
-    const num = (typeof v === "number") ? v : (v != null ? v : "");
-    return `<input type="number" class="val-num" data-ri="${ri}" data-g="${gi}" data-c="${ci}" data-k="value" value="${escapeHtml(String(num))}" step="any" />`;
+    const spec = sliderSpec(field);
+    const num = (typeof v === "number") ? v : (v != null ? v : 0);
+    let slide = "", label = "";
+    if (spec) {
+      slide = `<input type="range" class="val-slide" data-ri="${ri}" data-g="${gi}" data-c="${ci}" min="${spec.min}" max="${spec.max}" step="${spec.step}" value="${num}" />`;
+      label = `<span class="val-slide-label" data-ri="${ri}" data-g="${gi}" data-c="${ci}">${spec.fmt(num)}</span>`;
+    }
+    return `<span class="val-num-wrap">${slide}<input type="number" class="val-num" data-ri="${ri}" data-g="${gi}" data-c="${ci}" data-k="value" value="${escapeHtml(String(num))}" step="any" />${label}</span>`;
   }
   const txt = (typeof v === "string") ? v : (Array.isArray(v) ? v.join(",") : "");
   return `<input type="text" class="val-text" data-ri="${ri}" data-g="${gi}" data-c="${ci}" data-k="value" value="${escapeHtml(txt)}" placeholder="逗号分隔多值" />`;
@@ -572,6 +606,24 @@ function attachRuleListEvents() {
     let val = e.target.value;
     if (el.classList.contains("val-num")) val = (val === "" ? 0 : parseFloat(val));
     rulesData.rules[ri].groups[gi].conditions[ci].value = val; rulesDirty = true;
+    if (el.classList.contains("val-num")) {
+      const slide = root.querySelector(`.val-slide[data-ri="${ri}"][data-g="${gi}"][data-c="${ci}"]`);
+      if (slide) slide.value = (typeof val === "number" ? val : 0);
+      const lab = root.querySelector(`.val-slide-label[data-ri="${ri}"][data-g="${gi}"][data-c="${ci}"]`);
+      const spec = sliderSpec(rulesData.rules[ri].groups[gi].conditions[ci].field);
+      if (lab && spec) lab.textContent = spec.fmt(val);
+    }
+  }));
+  // 数值滑块：拖动时同步数字框与标签
+  root.querySelectorAll(".val-slide").forEach((el) => el.addEventListener("input", (e) => {
+    const ri = +el.dataset.ri, gi = +el.dataset.g, ci = +el.dataset.c;
+    const val = parseFloat(el.value);
+    const numEl = root.querySelector(`.val-num[data-ri="${ri}"][data-g="${gi}"][data-c="${ci}"]`);
+    if (numEl) numEl.value = val;
+    const lab = root.querySelector(`.val-slide-label[data-ri="${ri}"][data-g="${gi}"][data-c="${ci}"]`);
+    const spec = sliderSpec(rulesData.rules[ri].groups[gi].conditions[ci].field);
+    if (lab && spec) lab.textContent = spec.fmt(val);
+    rulesData.rules[ri].groups[gi].conditions[ci].value = val; rulesDirty = true;
   }));
   // 类型多选
   root.querySelectorAll(".val-types input[type=checkbox]").forEach((cb) => cb.addEventListener("change", () => {
@@ -690,6 +742,7 @@ function openRuleDrawer() {
   d.classList.remove("hidden");
   d.setAttribute("aria-hidden", "false");
   requestAnimationFrame(() => d.classList.add("open"));
+  document.body.classList.add("lock-scroll");
   // 编辑中：屏蔽同步 / 全量
   $("syncBtn").disabled = true; $("syncBtn").title = "规则编辑中不可用";
   $("fullBtn").disabled = true; $("fullBtn").title = "规则编辑中不可用";
@@ -712,6 +765,7 @@ function closeRuleDrawer() {
   d.classList.remove("open");
   d.setAttribute("aria-hidden", "true");
   $("ruleOverlay").classList.add("hidden");
+  document.body.classList.remove("lock-scroll");
   setTimeout(() => d.classList.add("hidden"), 220);
   $("syncBtn").disabled = false; $("syncBtn").title = "同步数据";
   $("fullBtn").disabled = false; $("fullBtn").title = "强制全量重新拉取";
@@ -899,13 +953,22 @@ document.querySelectorAll(".side-item").forEach((el) => {
     const range = el.dataset.range;
     if (range === "today" || range === "yesterday" || range === "week") {
       state.timeRange = range;
+      // 关键修复：清除上一次 older/month 留下的 dateTo/dateFrom，
+      // 否则 buildQueryBody 里 dateTo 会覆盖 time_to，形成 [today_start, 几周前] 的非法区间 → 全空
+      state.dateFrom = ""; state.dateTo = "";
+      $("panelDateFrom").value = "";
+      $("panelDateTo").value = "";
     } else if (range === "older") {
+      // 一周前 = 比 7 天更早（到历史起点）：设 dateTo 上限，清空 dateFrom
       const w = new Date(); w.setDate(w.getDate() - 7);
-      state.dateFrom = String(Math.floor(new Date(w.getFullYear(), w.getMonth(), w.getDate()).getTime() / 1000));
+      state.dateTo = String(Math.floor(new Date(w.getFullYear(), w.getMonth(), w.getDate()).getTime() / 1000));
+      state.dateFrom = "";
       state.timeRange = "";
     } else if (range === "month") {
+      // 一个月前 = 比 30 天更早（到历史起点）：设 dateTo 上限，清空 dateFrom
       const m = new Date(); m.setDate(m.getDate() - 30);
-      state.dateFrom = String(Math.floor(new Date(m.getFullYear(), m.getMonth(), m.getDate()).getTime() / 1000));
+      state.dateTo = String(Math.floor(new Date(m.getFullYear(), m.getMonth(), m.getDate()).getTime() / 1000));
+      state.dateFrom = "";
       state.timeRange = "";
     }
     document.querySelectorAll("[data-time]").forEach((e) => {
@@ -1218,6 +1281,312 @@ $("fullBtn").addEventListener("click", () => {
     .then(() => toast("已触发全量重建：将重新校准存档标记并刷新封面"))
     .then(() => pollSync());
 });
+
+/* ====== Analyzer 实时更新（Phase 1.5：经 server.py 转发到 Fetcher 8899） ====== */
+function applyFetcherHealth(s) {
+  const dot = $("fetcherDot");
+  if (!dot) return;
+  const ok = !!(s && s.ok && s.reachable);
+  dot.classList.toggle("on", ok);
+  dot.classList.toggle("off", !ok);
+  dot.title = ok ? "Analyzer 已连接" : ("Analyzer 未连接：" + ((s && s.error) || "8899 不可达"));
+}
+function checkFetcher() {
+  fetch("/api/fetcher-health").then((r) => r.json()).then(applyFetcherHealth).catch(() => {});
+}
+$("fetcherBtn").addEventListener("click", () => {
+  const btn = $("fetcherBtn");
+  btn.disabled = true;
+  toast("正在触发 Analyzer 重新分析…");
+  fetch("/api/fetcher-trigger")
+    .then((r) => r.json())
+    .then((s) => {
+      if (s && s.ok) {
+        toast("已触发 Analyzer 重新分析，稍后自动刷新数据");
+        // Analyzer 重新拉取需要时间，3 秒后刷新列表（桩/真实后端均适用）
+        setTimeout(() => load(true), 3000);
+      } else {
+        toast("实时更新失败：" + ((s && s.error) || "未知错误"));
+      }
+    })
+    .catch((e) => toast("实时更新失败：" + e.message))
+    .finally(() => {
+      btn.disabled = false;
+      checkFetcher();
+    });
+});
+// 初始检测 Analyzer 连接状态（不阻塞页面）
+checkFetcher();
+
+/* ====== Analyzer 联调：逐一测试 Analyzer 接口（需本机 Analyzer 后台运行） ====== */
+function showDiag(title, payload) {
+  $("diagTitle").textContent = title;
+  const el = $("diagBody");
+  if (typeof payload === "string") el.textContent = payload;
+  else { try { el.textContent = JSON.stringify(payload, null, 2); } catch (e) { el.textContent = String(payload); } }
+  $("diagModal").classList.remove("hidden");
+}
+$("diagClose").addEventListener("click", () => $("diagModal").classList.add("hidden"));
+$("diagModal").addEventListener("click", (e) => { if (e.target === $("diagModal")) $("diagModal").classList.add("hidden"); });
+
+function anCall(btn, url, title) {
+  if (btn) btn.disabled = true;
+  toast("请求 Analyzer：" + title + " …");
+  fetch(url)
+    .then((r) => r.json())
+    .then((s) => {
+      showDiag(title + " — 响应", s);
+      checkFetcher();
+      if (title.indexOf("拉取") >= 0) setTimeout(() => load(true), 3000);
+    })
+    .catch((e) => showDiag(title + " — 错误", { error: e.message }))
+    .finally(() => { if (btn) btn.disabled = false; });
+}
+$("anHealthBtn").addEventListener("click", () => anCall($("anHealthBtn"), "/api/fetcher-health", "① 健康探测 (/health)"));
+$("anRealtimeBtn").addEventListener("click", () => anCall($("anRealtimeBtn"), "/api/fetcher-trigger", "② 增量拉取 (/fetch/bili-history-realtime)"));
+$("anFullBtn").addEventListener("click", () => anCall($("anFullBtn"), "/api/fetcher-trigger?mode=full", "③ 全量拉取 (/fetch/bili-history)"));
+$("anDataBtn").addEventListener("click", () => {
+  const btn = $("anDataBtn");
+  btn.disabled = true;
+  toast("正在执行数据自检（调用 Analyzer 完整性校验）…");
+  fetch("/api/fetcher-check")
+    .then((r) => r.json())
+    .then(showSelfCheck)
+    .catch((e) => showDiag("④ 数据自检 — 错误", { error: e.message }))
+    .finally(() => { btn.disabled = false; });
+});
+
+function showSelfCheck(s) {
+  if (!s || s.ok === false) {
+    showDiag("④ 数据自检 — 失败", s || { error: "空响应" });
+    return;
+  }
+  const c = s.check || {};
+  const f = (x) => (x === undefined || x === null ? "-" : x);
+  let t = "";
+  t += "④ 数据自检结果\n";
+  t += "────────────────────────\n";
+  t += "Analyzer 可达: 是 (health_status=" + s.health_status + ")\n";
+  t += "Analyzer 主源条数: " + s.records_read + "\n";
+  t += "Finder 本地备份源: " + s.local_backup + " 条\n\n";
+  if (c.check_error) {
+    t += "完整性校验调用失败: " + c.check_error + "\n";
+  } else {
+    t += "完整性校验 (POST /data_sync/check → Analyzer):\n";
+    t += "  JSON 文件数:      " + f(c.total_json_files) + "\n";
+    t += "  JSON 记录数:      " + f(c.total_json_records) + "\n";
+    t += "  DB 记录数:        " + f(c.total_db_records) + "\n";
+    t += "  缺失 (missing):   " + f(c.missing_records_count) + "\n";
+    t += "  多余 (extra):     " + f(c.extra_records_count) + "\n";
+    t += "  差异 (difference): " + f(c.difference) + "\n";
+    t += "  结果文件: " + (c.result_file || "-") + "\n";
+    t += "  报告文件: " + (c.report_file || "-") + "\n";
+    if (c.report) {
+      t += "\n──────── 完整性报告 (markdown) ────────\n";
+      t += c.report + "\n";
+    }
+  }
+  showDiag("④ 数据自检", t);
+}
+
+$("anBackupBtn").addEventListener("click", () => {
+  const btn = $("anBackupBtn");
+  btn.disabled = true;
+  toast("正在生成本地备份快照…");
+  fetch("/api/backup", { method: "POST" })
+    .then((r) => r.json())
+    .then((s) => {
+      showDiag("⑤ 本地备份 — 结果", s && s.manifest ? s.manifest : s);
+      checkFetcher();
+    })
+    .catch((e) => showDiag("⑤ 本地备份 — 错误", { error: e.message }))
+    .finally(() => { btn.disabled = false; });
+});
+
+$("anBackupListBtn").addEventListener("click", () => {
+  fetch("/api/backups")
+    .then((r) => r.json())
+    .then((s) => showDiag("本地备份列表 (" + (s.backups ? s.backups.length : 0) + ")", s && s.backups ? s.backups : s))
+    .catch((e) => showDiag("查看备份 — 错误", { error: e.message }));
+});
+
+/* ====== ⑥ 应用变更：唯一入口，软件自动判定 热重载 / 重启 / 只需刷新 ====== */
+const CODE_POLL_MS = 15000;
+
+function fmtChanges(ch) {
+  ch = ch || {};
+  const f = (k, lab) => ((ch[k] || []).length ? lab + "：" + ch[k].join("、") : "");
+  return [f("restart", "需重启"), f("reload", "可热重载"), f("static", "前端静态")]
+    .filter(Boolean).join("\n") || "（无）";
+}
+
+function codeBadgeSet(n, action) {
+  const b = $("codeBadge");
+  if (!b) return;
+  b.dataset.action = action || "";
+  if (!n) { b.classList.add("hidden"); b.textContent = "0"; b.title = ""; return; }
+  b.classList.remove("hidden");
+  b.textContent = n;
+  b.title = "有 " + n + " 处变更待应用 · 建议动作：" + (action || "-");
+}
+
+async function refreshCodeStatus() {
+  try {
+    const s = await fetch("/api/code-status", { cache: "no-store" }).then((r) => r.json());
+    codeBadgeSet(s.pending || 0, s.next_action);
+    const btn = $("anApplyBtn");
+    if (btn) {
+      btn.title = "POST /api/apply：唯一入口，自动判定热重载 / 重启 / 只需刷新。\n"
+        + "当前待应用 " + (s.pending || 0) + " 处（建议：" + s.next_action + "）\n"
+        + "boot_id=" + s.boot_id + "  version=" + s.version + "  pid=" + s.pid
+        + "  supervised=" + (s.supervised ? "yes" : "NO")
+        + "\n护栏：" + s.restart_guard.recent + "/" + s.restart_guard.limit
+        + " 次（" + s.restart_guard.window_s + "s 窗口）";
+    }
+    return s;
+  } catch (e) { return null; }
+}
+
+$("anApplyBtn").addEventListener("click", async () => {
+  const btn = $("anApplyBtn");
+  btn.disabled = true;
+  try {
+    const pre = await refreshCodeStatus();
+    const st = await fetch("/api/apply", { method: "POST" }).then((r) => r.json());
+    const a = st.action;
+
+    if (a === "none") {
+      showDiag("⑥ 应用变更", "未检测到任何变更，无需操作。\n\n"
+        + "boot_id=" + st.boot_id + "   version=" + st.version + "   pid=" + st.pid);
+      return;
+    }
+
+    if (a === "blocked") {
+      showDiag("⑥ 应用变更 — 已拒绝重启",
+        (st.blocked_reason || "") + "\n\n变更清单：\n" + fmtChanges(st.changes));
+      return;
+    }
+
+    if (a === "manual") {
+      showDiag("⑥ 应用变更 — 需手动重启",
+        (st.warning || "") + "\n\n变更清单：\n" + fmtChanges(st.changes)
+        + (st.partial_reload ? "\n\n已热重载部分：" + JSON.stringify(st.partial_reload) : ""));
+      return;
+    }
+
+    if (a === "static") {
+      showDiag("⑥ 应用变更 — 只需刷新浏览器",
+        (st.hint || "") + "\n\n变更文件：\n" + fmtChanges(st.changes));
+      return;
+    }
+
+    if (a === "restart") {
+      toast("正在重启服务…");
+      const oldBoot = pre && pre.boot_id;
+      showDiag("⑥ 应用变更 — 已自动重启",
+        "检测到需重启进程的改动：\n" + (st.changes.restart || []).join("、")
+        + "\n\n已发出重启请求，start.bat 的 supervisor 将在约 2 秒后重新拉起；"
+        + "服务恢复后本页会自动刷新。");
+      let newBoot = null;
+      for (let i = 0; i < 40; i++) {
+        await new Promise((r) => setTimeout(r, 500));
+        try {
+          const s = await fetch("/api/code-status", { cache: "no-store" }).then((r) => r.json());
+          if (s && s.boot_id && s.boot_id !== oldBoot) { newBoot = s; break; }
+        } catch (e) { /* 重启间隙，继续等待 */ }
+      }
+      if (newBoot) { location.reload(); return; }
+      showDiag("⑥ 应用变更 — 等待超时",
+        "20 秒内未等到新进程（boot_id 未变化）。\n\n"
+        + "· 若通过 start.bat 启动：请看那个窗口里打印的报错（启动失败信息会留在窗口内）。\n"
+        + "· 若未托管（BHF_SUPERVISED=1 未设置）：请手动运行 start.bat。\n"
+        + "· 若 120 秒内重启已达 3 次，护栏会拒绝后续重启（见按钮提示）。");
+      btn.disabled = false;
+      return;
+    }
+
+    /* a === "reload"：已热重载数据层 / 规则 */
+    const r = st.reload || {};
+    let t = "";
+    t += "⑥ 应用变更 → 自动热重载" + (r.ok ? "成功" : "失败")
+      + "   耗时 " + (r.elapsed_ms === undefined ? "-" : r.elapsed_ms) + " ms\n";
+    t += "────────────────────────\n";
+    t += "变更文件：\n" + fmtChanges(st.changes) + "\n";
+    t += "重载后记录数: " + (r.records === undefined ? "-" : r.records) + "\n";
+    if (st.warning) t += "\n⚠️ " + st.warning + "\n";
+    t += "\n" + (st.hint || "");
+    showDiag("⑥ 应用变更", t);
+    load(true);
+    checkFetcher();
+    refreshCodeStatus();
+  } catch (e) {
+    showDiag("⑥ 应用变更 — 错误", { error: e.message });
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+/* 徽章：页面加载 / 窗口获得焦点 / 每 15s 轮询一次（只提示，绝不自动执行） */
+refreshCodeStatus();
+setInterval(() => { if (!document.hidden) refreshCodeStatus(); }, CODE_POLL_MS);
+window.addEventListener("focus", () => refreshCodeStatus());
+
+/* ====== 设置：Analyzer / Fetcher 连接（低调入口，非常用触发） ====== */
+function openSettings() {
+  fetch("/api/fetcher-config").then((r) => r.json()).then((c) => {
+    $("fetcherBase").value = c.base || "http://localhost:8899";
+    $("fetcherKey").value = c.has_key ? "************" : "";
+    $("fetcherCfgStatus").textContent = "";
+    $("fetcherCfgStatus").className = "fld-status";
+    $("settingsModal").classList.remove("hidden");
+  }).catch(() => $("settingsModal").classList.remove("hidden"));
+}
+function closeSettings() {
+  $("settingsModal").classList.add("hidden");
+}
+$("settingsBtn").addEventListener("click", openSettings);
+$("settingsClose").addEventListener("click", closeSettings);
+$("settingsModal").addEventListener("click", (e) => {
+  if (e.target === $("settingsModal")) closeSettings();
+});
+$("fetcherTest").addEventListener("click", () => {
+  const st = $("fetcherCfgStatus");
+  st.textContent = "正在测试连接…";
+  st.className = "fld-status";
+  fetch("/api/fetcher-health").then((r) => r.json()).then((s) => {
+    if (s && s.ok && s.reachable) {
+      st.textContent = "● 连接正常";
+      st.className = "fld-status ok";
+    } else {
+      st.textContent = "● 不可达：" + ((s && s.error) || "8899 未运行");
+      st.className = "fld-status bad";
+    }
+  }).catch((e) => { st.textContent = "● 测试失败：" + e.message; st.className = "fld-status bad"; });
+});
+$("fetcherSave").addEventListener("click", () => {
+  const base = $("fetcherBase").value.trim();
+  // 若输入框是被占位成 ************，说明用户未改 key，发送空串让服务端保留原值
+  const keyRaw = $("fetcherKey").value;
+  const key = keyRaw === "************" ? "" : keyRaw;
+  const st = $("fetcherCfgStatus");
+  st.textContent = "正在保存…";
+  st.className = "fld-status";
+  fetch("/api/fetcher-config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ base, key }),
+  }).then((r) => r.json()).then((s) => {
+    if (s && s.ok) {
+      st.textContent = "● 已保存" + (s.health && s.health.ok ? "，连接正常" : "，但当前不可达");
+      st.className = "fld-status ok";
+      checkFetcher();
+    } else {
+      st.textContent = "● " + ((s && s.error) || "保存失败");
+      st.className = "fld-status bad";
+    }
+  }).catch((e) => { st.textContent = "● 保存失败：" + e.message; st.className = "fld-status bad"; });
+});
+
 setInterval(pollSync, 3000);
 pollSync();
 
@@ -1266,8 +1635,14 @@ function advGenValueWidget(field, cond, gi, ci) {
     return `<span class="val-types">${cbs}</span>`;
   }
   if (t === "num") {
-    const num = (typeof v === "number") ? v : (v != null ? v : "");
-    return `<input type="number" class="adv-val-num" data-g="${gi}" data-c="${ci}" value="${escapeHtml(String(num))}" step="any" />`;
+    const spec = sliderSpec(field);
+    const num = (typeof v === "number") ? v : (v != null ? v : 0);
+    let slide = "", label = "";
+    if (spec) {
+      slide = `<input type="range" class="adv-val-slide" data-g="${gi}" data-c="${ci}" min="${spec.min}" max="${spec.max}" step="${spec.step}" value="${num}" />`;
+      label = `<span class="adv-val-slide-label" data-g="${gi}" data-c="${ci}">${spec.fmt(num)}</span>`;
+    }
+    return `<span class="adv-val-num-wrap">${slide}<input type="number" class="adv-val-num" data-g="${gi}" data-c="${ci}" value="${escapeHtml(String(num))}" step="any" />${label}</span>`;
   }
   const txt = (typeof v === "string") ? v : (Array.isArray(v) ? v.join(",") : "");
   return `<input type="text" class="adv-val-text" data-g="${gi}" data-c="${ci}" value="${escapeHtml(txt)}" placeholder="文本/正则" />`;
@@ -1343,6 +1718,23 @@ function attachAdvGroupEvents() {
     const gi = +el.dataset.g, ci = +el.dataset.c;
     let val = e.target.value;
     if (el.classList.contains("adv-val-num")) val = (val === "" ? 0 : parseFloat(val));
+    advFilter.groups[gi].conditions[ci].value = val;
+    if (el.classList.contains("adv-val-num")) {
+      const slide = root.querySelector(`.adv-val-slide[data-g="${gi}"][data-c="${ci}"]`);
+      if (slide) slide.value = (typeof val === "number" ? val : 0);
+      const lab = root.querySelector(`.adv-val-slide-label[data-g="${gi}"][data-c="${ci}"]`);
+      const spec = sliderSpec(advFilter.groups[gi].conditions[ci].field);
+      if (lab && spec) lab.textContent = spec.fmt(val);
+    }
+  }));
+  root.querySelectorAll(".adv-val-slide").forEach((el) => el.addEventListener("input", (e) => {
+    const gi = +el.dataset.g, ci = +el.dataset.c;
+    const val = parseFloat(el.value);
+    const numEl = root.querySelector(`.adv-val-num[data-g="${gi}"][data-c="${ci}"]`);
+    if (numEl) numEl.value = val;
+    const lab = root.querySelector(`.adv-val-slide-label[data-g="${gi}"][data-c="${ci}"]`);
+    const spec = sliderSpec(advFilter.groups[gi].conditions[ci].field);
+    if (lab && spec) lab.textContent = spec.fmt(val);
     advFilter.groups[gi].conditions[ci].value = val;
   }));
   root.querySelectorAll(".adv-val-list").forEach((el) => el.addEventListener("change", (e) => {
@@ -1530,6 +1922,7 @@ function openAdvDrawer() {
   d.classList.remove("hidden");
   d.setAttribute("aria-hidden", "false");
   requestAnimationFrame(() => d.classList.add("open"));
+  document.body.classList.add("lock-scroll");
 }
 function closeAdvDrawer() {
   if (!advDrawerOpen) return;
@@ -1538,6 +1931,7 @@ function closeAdvDrawer() {
   d.classList.remove("open");
   d.setAttribute("aria-hidden", "true");
   $("advOverlay").classList.add("hidden");
+  document.body.classList.remove("lock-scroll");
   setTimeout(() => d.classList.add("hidden"), 220);
 }
 

@@ -20,35 +20,44 @@
 
 ## 2. 快速开始（Windows）
 
-### 2.1 准备登录态（SESSDATA）
+### 2.1 关于登录态（SESSDATA）──当前有两份，职责不同
+> 本仓库现阶段**读取的权威数据来自 Analyzer**（见 §4）。因此**主用凭证是 Analyzer 的 `config/config.yaml` 里的 SESSDATA**，**不是**本仓库根 `config.json`。
+
+1. **主用（权威）：Analyzer 的 `config.yaml`**。若已装 BilibiliHistoryAnalyzer 后台，SESSDATA 填在这里（服务端读取，网页/前端都不碰凭证）。过期后在 Analyzer 侧重填即可。
+2. **遗留（不推荐）：本仓库根 `config.json`**。仅供 `collector.py`（本地备份采集）使用，**当前该份已失效**（同步会报接口 `-101`）；按「计划 A」它将被停用（见 `doc/方案-后端与数据源.md` §7.4）。**新用户不必再填这份。**
+
+取值方式（两份通用）：
 1. 用浏览器登录 B站（bilibili.com）。
 2. 按 `F12` → **Application** → 左侧 **Cookies** → 选 `https://.bilibili.com` 域名。
 3. 找到名为 **`SESSDATA`** 的条目，复制它的 **Value**（一长串字符）。
-4. 打开仓库根 `config.json`，把值填进 `SESSDATA`：
-   ```json
-   {
-     "SESSDATA": "这里粘贴你的SESSDATA值",
-     "page_size": 30,
-     "request_interval": 0.3,
-     "db_path": "data/bilibili_history.db"
-   }
-   ```
-   > ⚠️ SESSDATA 是登录凭证，泄露等于别人能登录你的账号，**请勿分享、勿提交到公开仓库**。它会过期（几天到几十天不等），过期后同步失败需重新取值。
+
+> ⚠️ SESSDATA 是登录凭证，泄露等于别人能登录你的账号，**请勿分享、勿提交到公开仓库**。它会过期（几天到几十天不等），过期后同步失败需重新取值。
 
 ### 2.2 启动（推荐用 bat）
-仓库根目录已提供 `start.bat` / `stop.bat`（前端改动读盘即生效，无需重启即可刷新看效果）：
-- 双击 **`start.bat`**：自动探测本机 Python（兼容无系统级 Python 的情况）、前台启动服务并持续打印状态（含续看规则「待应用 / 脏计数」）。
-- 双击 **`stop.bat`**：关闭当前 8765 端口服务。
+仓库根目录已提供 `start.bat` / `stop.bat`：
+- 双击 **`start.bat`**：自动探测本机 Python（兼容无系统级 Python 的情况）、**以 supervised 模式**前台启动服务并持续打印状态（含续看规则「待应用 / 脏计数」）。
+  > "supervised"＝该窗口自己充当 supervisor：网页上点「⑥ 应用变更」触发重启时，服务会以退出码 42 退出，**窗口会自动把它重新拉起（≈3 秒）**，因此**改完代码无需关掉重开 bat**。
+- 双击 **`stop.bat`**：关闭当前 8765 端口服务（正常停止，不会触发自动重启）。
 - 浏览器打开 **http://127.0.0.1:8765** 即可使用。
+- 改代码后如何生效 → 网页上**只需点一个按钮「⑥ 应用变更」**，不用你判断改了哪些文件：
+  - 改了 `store.py` / `engine.py` / `rules.json` / 数据 → 自动**热重载**（约 0.1 s，不重启进程、不释放端口）；
+  - 改了 `server.py` / `start.bat` → 自动**重启**（≈3 秒，由 `start.bat` 窗口拉起）；
+  - 只改了 `src/web/*`（前端） → 自动提示**浏览器刷新**（Ctrl+F5），服务端零动作。
+  按钮上的徽章 `● N` 会显示"有几处变更待应用"（需重启时转红）；它**只提示、绝不自动执行**。
 
 ### 2.3 手动启动（等价命令）
 ```bash
-# 1) 拉取历史（首次全量建基线；之后可只跑 Web 服务，点界面"同步数据"增量拉取）
+# 0) 数据来源：主源是 Analyzer（read-only 直连），本仓库不负责拉取；仅当无 Analyzer 时才用 collector 兜底。
+#    （collector 为遗留路径，其 config.json 的 SESSDATA 当前已失效 → 计划 A 待停用，见 doc/方案-后端与数据源.md §7.4）
 python src/collector.py --config config.json
 
-# 2) 启动 Web 服务（默认端口 8765）
+# 启动 Web 服务（默认端口 8765）
 python src/server.py
+
+# 可选：换端口起第二个实例（不干扰在跑实例；用于测试）
+BHF_PORT=8799 python src/server.py        # Windows cmd 用: set BHF_PORT=8799 && python src/server.py
 ```
+> 注意：**手动 `python src/server.py` 启动时没有 supervisor**——点「⑥ 应用变更」若需要重启，接口会返回 `action: manual` 并**明确警告"重启后不会自动拉起"（且不会自杀）**，避免把服务点死。要用一键重启请走 `start.bat`。
 
 ---
 
@@ -61,7 +70,15 @@ python src/server.py
 - **筛选 ▾**：时长 / 时间 / 设备 / 含存档的**临时浏览条件**（不落库，刷新即还原）。
 - **搜索**：按标题或 UP主名实时搜索。
 - **⚙ 续看规则**：右侧抽屉编辑规则；橙色圆点＝待应用，数字＝脏计数（自上次应用以来未标记的新记录）。
-- **同步数据 / 全量重建**：增量同步 / 强制全量校准"仅本地存档"标记。
+- **同步数据 / 全量重建**：增量同步 / 强制全量校准"仅本地存档"标记（走本仓库遗留 collector；当前其 SESSDATA 已失效，见 §6）。
+- **Analyzer 联调（①–⑤）**：① 健康探测 ② 增量拉取 ③ 全量拉取 ④ 数据自检 ⑤ 本地备份 / 查看备份 —— 经本机 Analyzer（`:8899`）中继，详见 `doc/方案-前端.md` §6。
+- **⑥ 应用变更（唯一开发运维入口，不是数据功能）**：
+  - **一个按钮，零判断**：`POST /api/apply` 自动比对"启动基线 vs 磁盘"，自己决定 → 热重载 / 重启 / 只需刷新 / 无需动作。
+  - 徽章 `● N` = 待应用变更数（页面加载、窗口获得焦点、每 15 s 轮询 `GET /api/code-status`；`document.hidden` 时不请求）；**只提示、不自动执行**，建议动作为重启时徽章转红。
+  - 需重启时前端会轮询 `boot_id` 直到**新进程**出现（避免旧进程在重启窗口内"假在线"）再自动刷新页面。
+  - 防重启风暴：120 s 内重启 ≥3 次会被拒绝（返回 `blocked` + 剩余等待秒数）。
+  - 手动 `python` 启动（无 supervisor）时若需重启，返回 `action: manual` 并**不自杀**，只尽力热重载可覆盖部分。
+  - 底层端点 `POST /api/reload`、`POST /api/restart` 仍保留（API 层逃生口，`POST /api/apply?force=reload|restart` 可强制指定方式）。详见 `doc/方案-后端与数据源.md` §7.10。
 
 ### 续看规则引擎
 - 规则存于 `data/rules.json`，同一时刻仅一条 `active` 生效；可在抽屉内增删改分组与条件。
@@ -76,22 +93,29 @@ python src/server.py
 
 ```
 BilibiliHistoryFinder/
-├── collector.py          # 采集器：SESSDATA + history/cursor 分页，按 kid 去重落 SQLite
-├── server.py             # 本地 Web 服务（标准库 http.server）：/api/* 提供历史/规则/应用/跳过/同步
-├── src/web/              # 前端单页：index.html / app.js / style.css（零框架、零 npm）
+├── src/
+│   ├── server.py         # 本地 Web 服务（http.server）：/api/* 历史/规则/跳过/查询 + Analyzer 中继/自检/备份
+│   ├── store.py          # 只读数据层：读 Analyzer(主) + 本地库(备份) 合并 → canonical；按 bvid 折叠
+│   ├── engine.py         # 续看规则引擎（纯逻辑，无 I/O）
+│   ├── collector.py      # 采集器（遗留/备用）：SESSDATA + cursor 分页落 SQLite；按需调用，计划 A 待停用
+│   ├── adapter_analyzer.py
+│   └── web/              # 前端单页：index.html / app.js / style.css（零框架、零 npm）
 ├── data/
-│   ├── bilibili_history.db   # 主数据库（全部历史 + 跳过标记）
+│   ├── canonical_state.db    # 侧状态库（skip/视图/名单；唯一可写）
+│   ├── bilibili_history.db   # 本地备份库（collector 写入；**非主源**）
 │   ├── rules.json            # 续看规则
-│   ├── config.json           # 配置（含 SESSDATA）
+│   ├── config.json           # 遗留配置（含 collector 用 SESSDATA，当前已失效）
+│   ├── backup/               # ⑤ 本地备份快照（POST /api/backup 生成）
 │   └── covers/               # 封面图片缓存
-├── start.bat / stop.bat  # 启动 / 关闭（自动探测 Python）
-└── doc/                  # 文档（归档评估 + 方案三轴：后端/前端/油猴）
+├── start.bat / stop.bat  # 启动 / 关闭（自动探测 Python；start.bat 为 supervised 模式，可被网页「⑥ 应用变更」自动拉起）
+└── doc/                  # 文档（方案三轴 + 归档评估 + Fetcher/Frontend 源码副本）
 ```
 
-- **采集**：`collector.py` 仅用 Python 标准库（`urllib.request` / `sqlite3` / `json` / `datetime` / `argparse`），**无第三方依赖**。
+- **主数据源**：Analyzer SQLite（`D:\Program Files (x86)\BilibiliHistoryAnalyzer\output\bilibili_history.db`，read-only 直连）；本地 `data/bilibili_history.db` 仅为**备份源**。
+- **采集**：`collector.py` 仅用 Python 标准库（`urllib.request` / `sqlite3` / `json` / `datetime` / `argparse`），**无第三方依赖**；当前仅作遗留兜底。
 - **服务**：`server.py` 用标准库 `http.server` 起本地静态服务，**零依赖、零构建**。
 - **前端**：原生 HTML/CSS/JS 单页，可完全离线运行。
-- **数据通路**：`SESSDATA + cursor 分页接口 + 本地 SQLite`；`progress` 覆盖更新（同一 kid 二次观看进度变大时覆盖，而非简单跳过）。
+- **数据通路**：主源 read-only 直读 Analyzer；`progress` 覆盖更新（同一 kid 二次观看进度变大时覆盖，而非简单跳过）。
 
 ---
 
@@ -99,14 +123,17 @@ BilibiliHistoryFinder/
 
 | 文件 | 作用 |
 |---|---|
-| `data/bilibili_history.db` | 主数据库（全部历史记录 + 跳过标记） |
-| `data/config.json` | 配置，含 `SESSDATA` 登录态 |
+| `…\BilibiliHistoryAnalyzer\output\bilibili_history.db` | **主数据源**（Analyzer 写入；本仓库 read-only 直读） |
+| `data/canonical_state.db` | 侧状态库：跳过状态 / 视图 / 名单（本仓库唯一可写） |
+| `data/bilibili_history.db` | 本地**备份库**（collector 写入；非主源） |
+| `data/backup/<时间戳>/` | ⑤ 本地备份快照（`POST /api/backup` 生成） |
+| `data/config.json` | 遗留配置，含 collector 用 `SESSDATA`（当前已失效） |
 | `data/rules.json` | 续看规则（由 ⚙ 抽屉编辑，不直接手改） |
 | `data/sync_progress.json` / `sync_result.json` | 同步进度与完成判定 |
 | `data/auto_skip_progress.json` | 规则应用进度（运行时产生） |
 | `data/covers/` | 封面图片缓存 |
 
-> 💡 **备份建议**：`bilibili_history.db` 是全部留存数据的唯一载体，重要前请复制（如 `bilibili_history.db.2026-08-24.bak`）。`config.json` 含凭证，备份时注意保密。
+> 💡 **备份建议**：真正的主数据在 **Analyzer 库**（上表第 1 行）；本仓库的 `canonical_state.db`（跳过状态）与 `data/bilibili_history.db`（本地备份）也建议一并复制，或直接用网页「⑤ 本地备份」按钮快照到 `data/backup/`。`config.json` / Analyzer `config.yaml` 含凭证，备份时注意保密。
 
 ---
 
@@ -114,8 +141,8 @@ BilibiliHistoryFinder/
 
 - **只能"从现在起"留存**：B站端已被上限顶掉的过去历史无法恢复（服务端限制，任何方案都救不回）；原型价值是"以后一条不漏"。
 - 单账号；多账号为后续阶段。
-- SESSDATA 过期需手动更新，暂无前端提示/重填 UI。
-- 无一键备份/导出（计划后续实现）。
+- SESSDATA 过期需手动更新，暂无前端提示/重填 UI。当前存在**两份**凭证（Analyzer `config.yaml`＝主用、根 `config.json`＝collector 遗留且已失效）；「同步数据」按钮走后者会报 `-101`，**计划 A 将停用该遗留路径**（见 `doc/方案-后端与数据源.md` §7.4）。
+- 一键**本地备份**已实现（「⑤ 本地备份」按钮：`POST /api/backup` 对 Analyzer 主源 + 本地库做 sqlite3 在线快照至 `data/backup/<时间戳>/`，详见 `doc/方案-后端与数据源.md` §7.5）；**导出为独立文件（如 JSON/CSV 便携备份）仍待做**。
 - 设备类型（`dt`）仅为占位标签（B站未公开真实设备映射）。
 - 同步内自动套用规则暂缓，当前以"应用规则"为统一重校准入口。
 
@@ -123,14 +150,17 @@ BilibiliHistoryFinder/
 
 ## 7. 文档索引
 
-> **方案文档（当前唯一在 `doc/` 根的三份，按后端/前端/油猴三轴拆分，各带总览+阶段）**：
+> **方案文档（`doc/` 根：三份方案，按后端/前端/油猴三轴拆分，各带总览+阶段；另有一份当前阶段待办清单）**：
 > 早期评估稿、架构分析、规则分析、源码评估报告等已**吸收进这三份方案并归档至 `doc/archive/`**，不再单独维护。
 
 | 文档 | 内容 |
 |---|---|
-| `doc/方案-后端与数据源.md` | 方案·后端轴：目标运行状态（Analyzer+Finder+网页三方并存）、数据源选型、Frontend/Fetcher 替代评估、架构现状、Phase1 验证、规则引擎核心、统一契约、**控制 Analyzer 变更量（≈185 行）** |
+| `doc/方案-后端与数据源.md` | 方案·后端轴：目标运行状态（Analyzer+Finder+网页三方并存）、数据源选型、Frontend/Fetcher 替代评估、架构现状、Phase1 验证、规则引擎核心、统一契约、控制 Analyzer 变更量、**联调四步 + 轻量备份实际落地（§7）**、网页可控重启机制（§7.9）、**单入口「⑥ 应用变更」+ 自动判定 + 护栏 + 指纹 + 资源实测（§7.10）** |
 | `doc/方案-前端.md` | 方案·前端轴：现有网页能力、历史展示页、高级筛选器超集（已落地）、控制触发 UI 变更量、独立前端全量设计评估 |
 | `doc/方案-油猴D.md` | 方案·油猴轴：最终轻量形态（Phase 2 规划，尚未动手）、IndexedDB 双存储、引擎 JS 移植 |
+| `doc/待办-当前阶段.md` | 当前阶段待办清单（不含 Phase 2 油猴 D）；供逐项标注「怎么做 / 是否做」 |
+
+**源码副本（只读参考，非文档）**：`doc/BilibiliHistoryFetcher-master/`（Analyzer/Fetcher 后端源码）、`doc/BiliHistoryFrontend-master/`（开源前端，Tauri/Vue3）。二者为整份源码副本，供评估与字段/接口核对用。
 
 **归档溯源（`doc/archive/`，仅作历史参考，内容已并入上述三方案）**：
 - `方案定稿-前后端分离前-2026-08-24.md`（拆分前单文件定稿）

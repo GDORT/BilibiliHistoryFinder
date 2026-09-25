@@ -134,6 +134,33 @@ def _read_local(db_path):
         con.close()
 
 
+def _fold_latest_by_bvid(records):
+    """Plan A：同一 bvid 只保留 view_at 最大的一条，对齐 B站官网历史页行为。
+
+    背景：B站历史接口每次「观看会话」记一条独立记录（各自 view_at），同一视频
+    当天多次打开 → 多条。Analyzer 与开源 Frontend 均保留全部会话、展示层不折叠；
+    本函数让 Finder 网页与「B站官网历史页」一致（每视频只显示最近一次观看）。
+
+    规则：
+    - 无 bvid 的记录（直播/专栏等）不参与折叠，原样保留；
+    - 折叠后**保留原始记录 dict（含其 kid=(bvid,view_at)）**，不重算键，
+      故既有 manual_skip / auto_exempt 等跳过状态对「最新一条」继续有效，
+      canonical_state.db 无需迁移。
+    """
+    best = {}
+    rest = []
+    for r in records:
+        bvid = r.get("bvid")
+        if not bvid:
+            rest.append(r)
+            continue
+        va = int(r.get("view_at") or 0)
+        cur = best.get(bvid)
+        if cur is None or va > int(cur.get("view_at") or 0):
+            best[bvid] = r
+    return rest + list(best.values())
+
+
 def load_raw_records():
     """读取 Analyzer（主源）+ 本地 Finder（备份）合并为 canonical derived 列表。
 
@@ -146,7 +173,9 @@ def load_raw_records():
     for kid, d in local.items():
         if kid not in merged:
             merged[kid] = d
-    return list(merged.values())
+    records = list(merged.values())
+    # Plan A：对齐官网——同一视频只显示最近一次观看
+    return _fold_latest_by_bvid(records)
 
 
 # 模块级缓存：避免每请求重读 7 张年表
@@ -387,6 +416,14 @@ def _filter(classified, params, now):
             hay = " ".join(str(r.get(k) or "") for k in
                           ("title", "author_name", "bvid", "kid", "remark", "tag_name"))
             if q.lower() not in hay.lower():
+                continue
+        # 时间窗筛选（按 view_at 秒级时间戳）
+        tf = params.get("time_from"); tt = params.get("time_to")
+        if tf is not None or tt is not None:
+            va = int(r.get("view_at") or 0)
+            if tf is not None and va < int(tf):
+                continue
+            if tt is not None and va > int(tt):
                 continue
         if spec:
             if not engine.evaluate_filter(r, spec, now, ctx):

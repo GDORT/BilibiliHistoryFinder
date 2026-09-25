@@ -36,13 +36,24 @@ for /f "tokens=5" %%a in ('netstat -ano 2^>nul ^| findstr "LISTENING" ^| findstr
 if defined PID goto MONITOR
 
 echo [Python] %PYEXE%
-echo [Status] Starting server in THIS window.
+echo [Status] Starting server in THIS window (supervised mode).
 echo          Keep this window OPEN - closing it stops the server.
-echo          URL   : http://127.0.0.1:8765
-echo          Stop  : press Ctrl+C here, or run stop.bat
+echo          URL    : http://127.0.0.1:8765
+echo          Restart: use the "Restart service" button in the web UI
+echo                   (no need to reopen this window; the supervisor relaunches it)
+echo          Stop   : press Ctrl+C here, or run stop.bat
 echo ---------------------------------------------------
+
+rem Tell the server it is supervised, so the web UI can offer one-click restart.
+set "BHF_SUPERVISED=1"
+
+:RUN
 "%PYEXE%" "%~dp0src\server.py"
 set "RC=%errorlevel%"
+
+rem Exit code 42 = restart requested from the web UI -> relaunch automatically.
+if "%RC%"=="42" goto RESTART
+
 echo ---------------------------------------------------
 echo [Status] Server process ended. Exit code = %RC%
 if "%RC%"=="9009" echo          9009 = python could not be executed - see message above.
@@ -51,6 +62,14 @@ echo This window stays open so you can read any error above.
 echo.
 pause
 goto END
+
+:RESTART
+echo ---------------------------------------------------
+echo [Supervisor] Restart requested from the web UI (exit code 42).
+echo [Supervisor] Relaunching server in 2 seconds...
+echo ---------------------------------------------------
+timeout /t 2 /nobreak >nul
+goto RUN
 
 :MONITOR
 echo [Python] %PYEXE%
