@@ -64,6 +64,11 @@
         <button id="anBackupBtn" class="btn-sm btn-test" title="POST /api/backup：对 Finder 依赖的 Analyzer 主源 + 本地库做一致快照，作为轻量自主备份">⑤ 本地备份</button>
         <button id="anBackupListBtn" class="btn-sm btn-ghost" title="GET /api/backups：列出已生成的本地备份快照">查看备份</button>
         <button id="anApplyBtn" class="btn-sm btn-test" title="POST /api/apply：唯一入口——自动比对启动快照与磁盘：改了数据层就热重载（~0.1s 不重启），改了 server.py 就自动重启（~1-2s，由 start.bat 拉起），只改前端则提示刷新即可。无需你判断改了哪些文件">⑥ 应用变更<span id="codeBadge" class="code-badge hidden">0</span></button>
+        <button id="anExportBtn" class="btn-sm btn-test" title="POST /api/export/excel → 转发 Analyzer /export/export_history 生成 Excel，再经 /api/export/excel/{file} 下载。Finder 自己不写 xlsx，保证与 Analyzer 同一口径">⑧ 导出 Excel</button>
+        <button id="anDbBtn" class="btn-sm btn-test" title="GET /api/export/db → 转发 Analyzer /export/download_db 下载整库 .db（与 Frontend「下载数据库」同源）">⑨ 下载整库</button>
+        <button id="anImgBtn" class="btn-sm btn-test" title="GET /api/images/status → 转发 Analyzer /images/status，查看封面/头像的批量下载进度（只读，不触发下载）">⑩ 图片状态</button>
+        <button id="anImgStartBtn" class="btn-sm btn-ghost" title="POST /api/images/start：触发 Analyzer 批量下载封面+头像。默认 use_sessdata=false（公开内容无需凭证）并限定当前年，属写盘操作，会先二次确认">⑪ 下载图片</button>
+        <button id="anImgStopBtn" class="btn-sm btn-ghost" title="POST /api/images/stop：停止正在进行的图片下载任务">停止</button>
       </div>
     </div>
     <div class="topbar-status">
@@ -77,6 +82,15 @@
       </div>
     </div>
   </header>
+
+  <!-- 数据源健康横幅（#27）：3 态（正常已隐 / 已降级或自身模式 / 凭证失效或不可达）
+       由 /api/fetcher-health 驱动；只在"非正常"时出现，收起后同状态不再打扰 -->
+  <div id="srcBanner" class="src-banner hidden" role="status" aria-live="polite">
+    <span class="src-dot" id="srcDot"></span>
+    <span class="src-text" id="srcText"></span>
+    <button class="btn-sm btn-ghost src-act hidden" id="srcAct">打开设置</button>
+    <button class="src-x" id="srcClose" title="收起（状态变化后会再次提示）" aria-label="收起">&times;</button>
+  </div>
 
   <!-- 浏览筛选 popover（点击「筛选 ▾」展开；仅影响当前列表，不落库） -->
   <section id="browsePanel" class="browse-pop hidden">
@@ -241,6 +255,20 @@
         <label class="fld-label" for="fetcherKey">X-API-Key（留空则用服务端配置）</label>
         <input id="fetcherKey" class="fld-input" type="password" placeholder="可选" autocomplete="off" />
         <p class="fld-hint">密钥经 server.py 代理转发，不暴露到浏览器。保存后即时生效并持久化到本地。</p>
+        <hr class="fld-sep" />
+        <label class="fld-label" for="srcMode">数据源模式（主开关，切换即时生效）</label>
+        <select id="srcMode" class="fld-input">
+          <option value="auto">auto — 自动：Analyzer 优先，读不到时降级本地库</option>
+          <option value="analyzer">analyzer — 强制 Analyzer 为主源（推荐 / 计划A）</option>
+          <option value="local">local — 强制只用本地 Finder 库（模式B：自身抓取）</option>
+        </select>
+        <label class="fld-label" for="srcAnalyzerDb">Analyzer 主库路径（留空则用当前值）</label>
+        <input id="srcAnalyzerDb" class="fld-input" placeholder="…\BilibiliHistoryAnalyzer\output\bilibili_history.db" autocomplete="off" />
+        <p class="fld-hint">凭证统一由 Analyzer 的 <code>config/config.yaml</code> 持有；只有 local 模式才需要 Finder <code>config.json</code> 的有效 SESSDATA。</p>
+        <div class="modal-actions">
+          <button id="srcSave" class="btn-sm btn-primary">保存数据源设置</button>
+        </div>
+        <div id="srcStatus" class="fld-status"></div>
         <div class="modal-actions">
           <button id="fetcherTest" class="btn-sm btn-ghost">测试连接</button>
           <button id="fetcherSave" class="btn-sm btn-primary">保存</button>

@@ -23,6 +23,7 @@ Phase 1 关键变化（对应正式版方案 §3.3）：
 import importlib
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -122,13 +123,12 @@ def get_db_path():
 
 
 def get_web_port():
-    # 环境变量优先：便于在不干扰在跑实例的前提下另起一个测试实例（BHF_PORT=8799）
-    _env = os.environ.get("BHF_PORT")
-    if _env:
-        try:
-            return int(_env)
-        except ValueError:
-            pass
+    """监听端口：只读 config.json 的 web_port，缺省 8765。
+
+    历史上曾支持 `BHF_PORT` 环境变量覆盖（当初为「在不干扰在跑实例的前提下
+    另起一个测试实例」而加），**2026-09-25 深夜已回退移除** —— 端口只由配置
+    文件决定，不再受环境变量影响，避免环境里残留的值把服务引到别的端口。
+    """
     try:
         cfg = collector.load_config(collector.DEFAULT_CONFIG)
         return int(cfg.get("web_port", 8765))
@@ -164,6 +164,12 @@ BOOT_TS = int(time.time())
 # ② 防重启风暴：重启时间戳记账（data/ 已被 .gitignore 忽略）
 RUN_DIR = os.path.join(PROJECT_ROOT, "data", "run")
 RESTARTS_FILE = os.path.join(RUN_DIR, "restarts.json")
+# 与 start.bat 的「文件握手」：进程退出前若留下它，supervisor 就无条件重新拉起，
+# 不再依赖 %errorlevel%（退出码在 Windows 上会被若干因素吞掉，见下方注释）。
+RELAUNCH_FLAG = os.path.join(RUN_DIR, "relaunch.flag")
+# 重启请求挂起标记 —— **由主线程**在 serve_forever 返回后据此决定退出码。
+RESTART_PENDING = {"requested": False, "at": 0.0, "reason": ""}
+RESTART_LOG = os.path.join(RUN_DIR, "restart.log")   # 重启链路留痕（只写文件，不写控制台）
 RESTART_WINDOW_S = 120      # 统计窗口
 RESTART_LIMIT = 3           # 窗口内允许的重启次数上限
 
@@ -216,22 +222,192 @@ def hot_reload():
         }
 
 
+# ============ 控制台健壮性：为什么"打日志"会把重启卡死（2026-09-25 实测根因）============
+# Windows 控制台处于 QuickEdit「快速编辑」**选中**状态时，任何进程向该控制台写
+# stdout/stderr 都会**阻塞**，直到用户按 Esc / 回车取消选中。
+#
+# 原实现在「⑥ 应用变更 → 重启」的关键路径上有一句 print 提示：
+#     用户光标停在控制台里（选中/点了一下） → 该 print 永久阻塞 → _restart_after_response
+#     卡死 → 进程不退出 → 退出码 42 发不出去 → start.bat supervisor 永远等不到
+#     → 网页表现就是「点了 ⑥ 没反应，只能手动重开 bat」。
+#
+# 证据：`data/run/restarts.json` 记账在 **22:46:48**，而重启后的新进程启动于 **22:47:44**
+#       —— 相隔 56 秒（正常重启链只需约 3 秒）→ 中间确实卡住了。
+#
+# 三层防御（都不依赖"让用户小心别点控制台"）：
+#   ① `_safe_print()`：所有输出改到**守护线程**里执行 —— 即使写操作被冻结，也不会挡住主流程；
+#   ② 重启关键路径**只写文件**（`data/run/restart.log`），不写控制台；文件写入不受控制台状态影响；
+#   ③ `_forced_exit()` 看门狗：3 秒内无论 shutdown/server_close 出什么问题，都保证按 42 退出。
+#
+# ⚠️ 第二个坑（2026-09-25 深夜实测，与上面完全独立）：**退出码被吞成 0**
+#   `httpd.shutdown()` 一返回，主线程的 `serve_forever()` 立刻返回 → `main()` 走完 →
+#   解释器开始收尾 → **守护线程被回收**。而原来的 `os._exit(42)` 恰好跑在一个
+#   `daemon=True` 的工作线程里（且中间还要写日志、关套接字，会把 GIL 让出去），
+#   于是它常常**还没执行到就被收尾杀掉** → 进程以 0 退出 → start.bat 的
+#   `if "%RC%"=="42"` 不成立 → 落到 pause 分支（服务停住、窗口停在"按任意键"）。
+#   现象证据：控制台打出 "Server process ended. Exit code = 0"。
+#
+#   → 修法（四层里的第 ④ 层）：**退出码必须由主线程决定**。
+#     工作线程只负责"慢慢关监听"，绝不 `os._exit`；`main()` 在 `serve_forever()` 返回后
+#     检查 `RESTART_PENDING`，由主线程 `os._exit(42)` —— 消除竞态，退出码稳定。
+#   → 另加第 ⑤ 层兜底：**文件握手** `data/run/relaunch.flag`。进程退出前落下它，
+#     start.bat 只看"文件在不在"就决定是否重新拉起，**完全不依赖退出码**。
+#
+#   教训（方法论）：上一轮的回归脚本是**直接在主线程**调用 `_restart_after_response()`，
+#   因此天然拿得到 42、把真 bug 放过去了。现已补 `serve` 模式 —— 用**真实
+#   ThreadingHTTPServer + 主线程 serve_forever + 工作线程发起重启**复现生产拓扑。
+# 另：`start.bat` 的 `:RESTART` 块同样改为**零控制台输出**（ping 延时 + 静默 goto），
+#      否则 cmd 自己的 echo 也会在冻结时卡住接力。
+#
+# 说明：本方案**不修改**控制台的 QuickEdit 设置（不改注册表、不改窗口属性），
+#      因此不影响你鼠标选中/复制控制台文字的能力——只是输出可能被"延迟"到解冻后。
+
+CONSOLE_INFO = {"attached": False, "quick_edit": None, "note": "未探测"}
+
+
+def _console_probe():
+    """只读探测当前控制台的 QuickEdit 状态（供 `/api/code-status` 显示，便于定位冻结）。"""
+    if os.name != "nt":
+        CONSOLE_INFO["note"] = "非 Windows，跳过"
+        return CONSOLE_INFO
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = k32.GetStdHandle(-10)                     # STD_INPUT_HANDLE
+        if not h or h == -1:
+            CONSOLE_INFO["note"] = "无控制台输入句柄（已重定向），跳过"
+            return CONSOLE_INFO
+        mode = wintypes.DWORD()
+        if not k32.GetConsoleMode(h, ctypes.byref(mode)):
+            CONSOLE_INFO["note"] = "非控制台，跳过"
+            return CONSOLE_INFO
+        CONSOLE_INFO["attached"] = True
+        CONSOLE_INFO["quick_edit"] = bool(mode.value & 0x0040)
+        CONSOLE_INFO["note"] = ("快速编辑已开启：选中该窗口会冻结其输出（不影响服务，但日志会延迟）"
+                                if CONSOLE_INFO["quick_edit"] else "快速编辑已关闭：窗口选中不会冻结输出")
+    except Exception as e:  # noqa
+        CONSOLE_INFO["note"] = f"探测失败（不影响运行）：{type(e).__name__}: {e}"
+    return CONSOLE_INFO
+
+
+def _safe_print(*parts):
+    """输出到控制台，但放到**守护线程**里执行，保证绝不会阻塞调用方。
+
+    正常情况与 print 无异（只是顺序上可能略晚于其它线程的后续输出）；
+    控制台被 QuickEdit 冻结时，写操作卡住的只是这个一次性线程，主流程照常。
+    """
+    text = " ".join(str(p) for p in parts)
+
+    def _w():
+        try:
+            print(text, flush=True)
+        except Exception:
+            pass
+
+    try:
+        threading.Thread(target=_w, daemon=True).start()
+    except Exception:
+        pass
+
+
+def _log_restart_file(msg):
+    """重启链路留痕：只写文件，绝不写控制台（控制台可能被冻结）。"""
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        with open(RESTART_LOG, "a", encoding="utf-8") as f:
+            f.write("%s pid=%d boot=%s %s\n"
+                    % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), BOOT_ID, msg))
+    except Exception:
+        pass
+
+
+def _tail_restart_log(n=6):
+    """最近 n 行重启留痕（只读；供 `/api/code-status` 与前端排障展示）。"""
+    try:
+        with open(RESTART_LOG, "r", encoding="utf-8", errors="replace") as f:
+            return [ln.rstrip("\n") for ln in f.readlines()[-n:]]
+    except Exception:
+        return []
+
+
+def _write_relaunch_flag(reason):
+    """落下「请重新拉起我」的标记文件（supervisor 只看它在不在，**不看退出码**）。"""
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        with open(RELAUNCH_FLAG, "w", encoding="utf-8") as f:
+            f.write("%s pid=%d boot=%s reason=%s\n"
+                    % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), BOOT_ID, reason))
+    except Exception:
+        pass
+
+
+def _clear_relaunch_flag():
+    """启动时清掉陈旧标记 —— 否则一次异常退出会让下次启动白白多拉一轮。"""
+    try:
+        if os.path.exists(RELAUNCH_FLAG):
+            os.remove(RELAUNCH_FLAG)
+    except Exception:
+        pass
+
+
+def _forced_exit(code=RESTART_EXIT_CODE):
+    """看门狗：无条件按哨兵码退出 —— 保证 supervisor 不会「永远等不到」。"""
+    _log_restart_file("watchdog fired -> forced exit(%d)" % code)
+    _write_relaunch_flag("watchdog forced exit(%d)" % code)
+    os._exit(code)
+
+
 def _restart_after_response(httpd, delay=0.6):
-    """先让 HTTP 响应发完，再关监听并按哨兵码退出；由 start.bat supervisor 重新拉起。"""
+    """让 HTTP 响应发完 → 落标记 → 关监听。**本函数绝不 os._exit**（见上方长注释）。
+
+    退出码由主线程在 `serve_forever()` 返回后决定（`_serve_forever_and_exit`）：
+    守护线程会在解释器收尾时被回收，从它那里 os._exit 抢不到，退出码会被吞成 0。
+    """
     time.sleep(delay)
-    print(f"[B站历史查看器] 收到网页重启请求 → 释放端口并以退出码 {RESTART_EXIT_CODE} 退出，"
-          f"等待 supervisor 拉起…", flush=True)
+    _log_restart_file("web UI requested restart -> closing listeners")
+    _write_relaunch_flag("web UI requested restart")     # ⑤ 文件握手：先落标记，再关监听
+    watchdog = threading.Timer(3.0, _forced_exit)
+    watchdog.daemon = False          # 主线程若卡住，这个计时器必须活着把 42 顶出去
+    watchdog.start()
+    _safe_print(f"[B站历史查看器] 收到网页重启请求 → 释放端口并以退出码 {RESTART_EXIT_CODE} 退出，"
+                f"等待 supervisor 拉起…")
     try:
         httpd.shutdown()        # 停止 serve_forever（须在非 serve_forever 线程调用）
         httpd.server_close()    # 释放监听套接字，避免与新实例双绑定
-    except Exception:
-        pass
-    for s in (sys.stdout, sys.stderr):
+    except Exception as e:  # noqa
+        _log_restart_file("shutdown/server_close 异常（忽略，主线程仍按 %d 退出）：%s: %s"
+                          % (RESTART_EXIT_CODE, type(e).__name__, e))
+    _log_restart_file("listeners closed -> 等主线程决定退出码")
+
+
+def _begin_restart(httpd, reason="web UI", delay=0.6):
+    """统一入口：**同步**置挂起标记（必须先于工作线程，否则主线程可能抢先退出）+ 起工作线程。"""
+    RESTART_PENDING["requested"] = True
+    RESTART_PENDING["at"] = time.time()
+    RESTART_PENDING["reason"] = reason
+    threading.Thread(target=_restart_after_response, args=(httpd, delay), daemon=True).start()
+
+
+def _serve_forever_and_exit(server):
+    """主线程跑 serve_forever；返回后**若收到过重启请求，由主线程按哨兵码退出**。
+
+    这是修「退出码被吞成 0」的关键：`os._exit` 必须发生在**非守护线程**里，
+    否则解释器收尾会把守护线程连同它将要执行的 os._exit 一起回收掉。
+    """
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        RESTART_PENDING["requested"] = False      # Ctrl+C = 用户想停，不当作重启请求
+        _safe_print("\n已停止。")
+        return
+    if RESTART_PENDING["requested"]:
+        _log_restart_file("main thread reached exit point -> exit(%d)" % RESTART_EXIT_CODE)
         try:
-            s.flush()
+            server.server_close()
         except Exception:
             pass
-    os._exit(RESTART_EXIT_CODE)
+        os._exit(RESTART_EXIT_CODE)
 
 
 def request_restart(httpd, dry=False):
@@ -251,7 +427,7 @@ def request_restart(httpd, dry=False):
     if dry:
         return info
     info["restarting"] = True
-    threading.Thread(target=_restart_after_response, args=(httpd,), daemon=True).start()
+    _begin_restart(httpd, "api/restart")
     return info
 
 
@@ -400,6 +576,12 @@ def code_status():
                         "static" if d["static"] else "none"),
         "restart_guard": {"window_s": RESTART_WINDOW_S, "limit": RESTART_LIMIT,
                           "recent": recent, "allowed": allowed, "retry_after_s": retry_after},
+        # 控制台冻结自检 + 重启链路留痕（只读；前端排障用）
+        "console": dict(CONSOLE_INFO),
+        "restart_log": _tail_restart_log(6),
+        # 重启请求是否挂起 / 文件握手标记是否已落下（只读；排障用）
+        "restart_pending": bool(RESTART_PENDING["requested"]),
+        "relaunch_flag": os.path.exists(RELAUNCH_FLAG),
     }
 
 
@@ -451,7 +633,7 @@ def apply_changes(httpd, force=None):
         _note_restart()
         info["action"] = "restart"
         info["restarting"] = True
-        threading.Thread(target=_restart_after_response, args=(httpd,), daemon=True).start()
+        _begin_restart(httpd, "api/apply")
         return info
 
     if not d["reload"] and d["static"]:
@@ -723,6 +905,48 @@ def _persist_fetcher_override(base, key):
 _load_fetcher_override()
 
 
+# ---------------- 数据源主开关（#21/#1/#2）：mode + Analyzer 库路径 ----------------
+# 持久化到 data/source_config.json；优先级：本文件（运行时）> store.py 默认 / 环境变量 ANALYZER_DB
+def _source_cfg_path():
+    return os.path.join(PROJECT_ROOT, "data", "source_config.json")
+
+
+def _load_source_config():
+    try:
+        with open(_source_cfg_path(), "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+    except Exception:
+        d = {}
+    m = (d.get("mode") or "auto").strip().lower()
+    if m in store.SOURCE_MODES:
+        try:
+            store.set_source_mode(m)
+        except Exception:
+            pass
+    db = (d.get("analyzer_db") or "").strip()
+    if db:
+        store.ANALYZER_DB = db
+    return d
+
+
+def _persist_source_config(mode=None, analyzer_db=None):
+    cur = {"mode": store.get_source_mode(), "analyzer_db": store.ANALYZER_DB}
+    if mode:
+        cur["mode"] = mode
+    if analyzer_db:
+        cur["analyzer_db"] = analyzer_db
+    try:
+        os.makedirs(os.path.dirname(_source_cfg_path()), exist_ok=True)
+        with open(_source_cfg_path(), "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return cur
+
+
+_load_source_config()
+
+
 def _forward_fetcher(rel_path, timeout=30, method="GET", params=None):
     """转发到 Fetcher 后端（Analyzer 控制层），优雅降级：
     连接失败返回 reachable=False 的结构化 dict，绝不抛 500 崩溃。
@@ -770,6 +994,115 @@ def _analyzer_interaction_status():
         "records_read": meta.get("analyzer", 0),      # 本服务只读读到的 Analyzer 主源条数
         "local_backup": meta.get("local_backup", 0),
     }
+
+
+def _forward_fetcher_json(rel_path, body_bytes, timeout=30, method="POST"):
+    """转发 **JSON body** 的写请求到 Analyzer（如 /history/update-remark）。
+
+    `_forward_fetcher` 只支持 query params；写类端点需要 body，故单独一条。
+    ⚠️ 这是**写操作**：会修改 Analyzer 主库，只在用户显式点击时调用。
+    """
+    base, key = _fetcher_cfg()
+    url = base + rel_path
+    try:
+        req = urllib.request.Request(url, data=body_bytes, method=method)
+        req.add_header("Content-Type", "application/json")
+        if key:
+            req.add_header("X-API-Key", key)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", "replace")
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = raw
+        return {"ok": True, "reachable": True, "status": r.status, "data": data}
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        return {"ok": False, "reachable": True, "status": e.code,
+                "error": "Analyzer 返回 %s: %s" % (e.code, body[:300])}
+    except (urllib.error.URLError, OSError) as e:
+        reason = getattr(e, "reason", None)
+        reason = reason if isinstance(reason, str) else str(e)
+        return {"ok": False, "reachable": False,
+                "error": "无法连接 Analyzer/Fetcher 后端（%s）：%s" % (base, reason)}
+
+
+def _fetch_binary(rel_path, timeout=180):
+    """取 Analyzer 的**二进制**响应（导出 xlsx / 整库 .db / 本地图片文件）。
+
+    `_forward_fetcher` 只做 text 解码，会破坏 zip/db 字节流，故单独走本条。
+    返回 (status, content_type, content_disposition, bytes, error)：error 非空即失败。
+    """
+    base, key = _fetcher_cfg()
+    url = base + rel_path
+    try:
+        req = urllib.request.Request(url, method="GET")
+        if key:
+            req.add_header("X-API-Key", key)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return (r.status, r.headers.get("Content-Type"),
+                    r.headers.get("Content-Disposition"), r.read(), None)
+    except urllib.error.HTTPError as e:
+        body = b""
+        try:
+            body = e.read()
+        except Exception:
+            pass
+        return (e.code, None, None, body,
+                "Analyzer 返回 %s：%s" % (e.code, body[:200].decode("utf-8", "replace")))
+    except (urllib.error.URLError, OSError) as e:
+        reason = getattr(e, "reason", None)
+        reason = reason if isinstance(reason, str) else str(e)
+        return (0, None, None, b"", "无法连接 Analyzer/Fetcher 后端（%s）：%s" % (base, reason))
+
+
+def _sessdata_status():
+    """凭证健康（#27）：只读探测 Analyzer 的 `/login/check`。
+
+    该端点用 **Analyzer `config/config.yaml` 里的 SESSDATA** 去调 B站 nav 接口，
+    因此它反映的是「主源凭证」的存活状态，与 Finder `config.json` 那份无关（且不需要）。
+    **纯只读**：只发 GET，不改任何数据、不触发拉取。
+
+    状态：ok（code=0 且 isLogin）/ invalid（-101 未登录）/ unknown（不可达或异常）
+    """
+    r = _forward_fetcher("/login/check", timeout=8)
+    if not r.get("reachable"):
+        return {"state": "unknown", "reason": "Analyzer 不可达", "detail": r.get("error"),
+                "owner": "Analyzer(config.yaml)"}
+    d = r.get("data") if isinstance(r.get("data"), dict) else {}
+    code = d.get("code")
+    payload = d.get("data") if isinstance(d.get("data"), dict) else {}
+    if code == 0 and payload.get("isLogin"):
+        return {"state": "ok", "code": 0, "uname": payload.get("uname"),
+                "vip": payload.get("vipStatus") == 1,
+                "owner": "Analyzer(config.yaml)"}
+    if code == -101:
+        return {"state": "invalid", "code": code,
+                "message": d.get("message") or "未登录",
+                "owner": "Analyzer(config.yaml)",
+                "hint": "请更新 Analyzer 的 config/config.yaml 中的 SESSDATA（Analyzer 自带邮件告警，已在跑）"}
+    return {"state": "unknown", "code": code, "message": d.get("message"),
+            "owner": "Analyzer(config.yaml)"}
+
+
+def _health_payload(with_sessdata=True):
+    """`/api/fetcher-health` 的响应体：可达性 + （可选）凭证健康 + 数据源实际生效模式。"""
+    res = _forward_fetcher("/health", timeout=5)
+    res = dict(res) if isinstance(res, dict) else {"ok": False, "reachable": False}
+    if with_sessdata and res.get("reachable"):
+        res["sessdata"] = _sessdata_status()
+    elif with_sessdata:
+        res["sessdata"] = {"state": "unknown", "reason": "Analyzer 不可达",
+                           "owner": "Analyzer(config.yaml)"}
+    try:
+        res["source"] = store.source_status()
+    except Exception as e:  # noqa
+        res["source"] = {"error": str(e)}
+    return res
 
 
 def _analyzer_integrity_check():
@@ -869,6 +1202,110 @@ def _create_backup():
     return manifest
 
 
+def _after_data_pull(payload):
+    """拉取成功后：① 刷新内存缓存（否则新数据不会显示）；② 按 #26 策略评估自动备份。
+
+    只做「重读 + 条件备份」，**不写任何历史数据**。
+    """
+    out = {"reloaded": False, "auto_backup": None}
+    try:
+        reload_all()
+        out["reloaded"] = True
+    except Exception as e:  # noqa
+        out["reload_error"] = str(e)
+    try:
+        out["auto_backup"] = _maybe_auto_backup(reason="拉取后新增达到阈值")
+    except Exception as e:  # noqa
+        out["auto_backup"] = {"triggered": False, "reason": str(e)}
+    return out
+
+
+def _backup_policy_path():
+    return os.path.join(PROJECT_ROOT, "data", "backup_policy.json")
+
+
+def _load_backup_policy():
+    """#26 备份策略（用户选定「走 b」的变体：**按新增视频条数触发**，而非定时）。
+
+    - auto            ：是否启用自动触发（默认 true）
+    - delta_threshold ：自上次备份以来 Analyzer 主源**新增条数**达到该值 → 自动备份一次
+    - keep            ：只保留最近 N 份快照，超出自动清理（防 data/backup/ 无限累积）
+    """
+    d = {"auto": True, "delta_threshold": 200, "keep": 5}
+    try:
+        with open(_backup_policy_path(), "r", encoding="utf-8") as f:
+            d.update(json.load(f) or {})
+    except Exception:
+        pass
+    return d
+
+
+def _prune_backups(keep):
+    """只保留最近 keep 份快照（目录名形如 YYYYmmdd-HHMMSS，可字符串倒序）。返回被删列表。"""
+    keep = max(0, int(keep or 0))
+    if not os.path.isdir(BACKUP_ROOT):
+        return []
+    names = sorted([n for n in os.listdir(BACKUP_ROOT)
+                    if os.path.isdir(os.path.join(BACKUP_ROOT, n))], reverse=True)
+    removed = []
+    for n in names[keep:]:
+        try:
+            shutil.rmtree(os.path.join(BACKUP_ROOT, n))
+            removed.append(n)
+        except Exception:
+            pass
+    return removed
+
+
+def _backup_policy_status():
+    """只读：回报策略、上次备份条数、当前条数、增量与"是否达到触发线"。**不触发备份。**"""
+    pol = _load_backup_policy()
+    backups = _list_backups()
+    latest = backups[0] if backups else None
+    last_records = None
+    if latest:
+        for it in latest.get("items", []):
+            if it.get("label") == "analyzer":
+                last_records = it.get("records")
+    cur = store.source_status().get("analyzer") or 0
+    delta = None if last_records is None else int(cur) - int(last_records)
+    thr = int(pol.get("delta_threshold") or 0)
+    return {
+        "policy": pol,
+        "backup_count": len(backups),
+        "latest_at": latest.get("created_at") if latest else None,
+        "latest_analyzer_records": last_records,
+        "current_analyzer_records": cur,
+        "delta_since_last_backup": delta,
+        "would_trigger": bool(pol.get("auto")) and delta is not None and delta >= thr,
+        "pending_prune": max(0, len(backups) - int(pol.get("keep") or 0)),
+    }
+
+
+def _maybe_auto_backup(reason=""):
+    """#26：**仅在数据刚增长后**被调用。条件满足则备份一次并清理旧快照。
+
+    触发条件：delta = 当前 Analyzer 主源条数 − 上次备份记录条数 ≥ delta_threshold。
+    首次（还没有任何备份）不触发——避免刚启动就凭空写盘；由用户手点 ⑤ 建立基线。
+    """
+    pol = _load_backup_policy()
+    if not pol.get("auto"):
+        return {"triggered": False, "reason": "auto=false"}
+    st = _backup_policy_status()
+    if st["latest_analyzer_records"] is None:
+        return {"triggered": False, "reason": "尚无备份基线（请先手点 ⑤ 建立）"}
+    if not st["would_trigger"]:
+        return {"triggered": False, "reason": "增量未达阈值", "delta": st["delta_since_last_backup"],
+                "threshold": pol.get("delta_threshold")}
+    try:
+        manifest = _create_backup()
+        removed = _prune_backups(pol.get("keep"))
+        return {"triggered": True, "reason": reason, "delta": st["delta_since_last_backup"],
+                "manifest": manifest, "pruned": removed}
+    except Exception as e:  # noqa
+        return {"triggered": False, "reason": "备份失败：%s" % e}
+
+
 def _list_backups():
     if not os.path.isdir(BACKUP_ROOT):
         return []
@@ -888,7 +1325,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # 静默默认访问日志
         pass
 
-    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+    def _send(self, code, body, ctype="application/json; charset=utf-8", headers=None):
         if isinstance(body, (dict, list)):
             body = json.dumps(body, ensure_ascii=False)
         if isinstance(body, str):
@@ -898,6 +1335,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
         except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
@@ -966,7 +1405,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/fetcher-health":
             # 探测本机 Analyzer/Fetcher 后端是否可达（8899/health）
-            self._send(200, _forward_fetcher("/health", timeout=5))
+            # #27：同时附带凭证健康（?sessdata=0 可跳过）与数据源实际生效模式
+            self._send(200, _health_payload(with_sessdata=flat.get("sessdata", "1") != "0"))
+            return
+        if path == "/api/data-source":
+            # #21 数据源主开关：读取当前模式 + 实际生效数据源（纯读）
+            self._send(200, {
+                "ok": True,
+                "mode": store.get_source_mode(),
+                "modes": list(store.SOURCE_MODES),
+                "status": store.source_status(),
+            })
             return
         if path == "/api/fetcher-trigger":
             # 触发 Analyzer 重新拉取/分析：?mode=full 走全量，默认增量
@@ -975,7 +1424,11 @@ class Handler(BaseHTTPRequestHandler):
             sync_deleted = flat.get("sync_deleted", "1")
             params = {"sync_deleted": sync_deleted}
             if mode == "full":
-                self._send(200, _forward_fetcher("/fetch/bili-history", timeout=240, params=params))
+                res = _forward_fetcher("/fetch/bili-history", timeout=240, params=params)
+                if isinstance(res, dict) and res.get("ok"):
+                    res = dict(res)
+                    res["post"] = _after_data_pull(res)
+                self._send(200, res)
                 return
             # 增量：先打 realtime；若 Analyzer 报『未找到本地历史记录』（缺基线），
             # 自动升级为全量——对齐开源 Frontend 的 updateBiliHistoryRealtime 回退策略。
@@ -989,8 +1442,12 @@ class Handler(BaseHTTPRequestHandler):
                     "message": "增量拉取缺少本地基线，已自动升级为全量拉取",
                     "incremental": d,
                     "full": full.get("data"),
+                    "post": _after_data_pull(full) if full.get("ok") else None,
                 })
                 return
+            if isinstance(inc, dict) and inc.get("ok"):
+                inc = dict(inc)
+                inc["post"] = _after_data_pull(inc)
             self._send(200, inc)
             return
         if path == "/api/fetcher-check":
@@ -999,6 +1456,46 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/backups":
             self._send(200, {"backups": _list_backups()})
+            return
+        if path == "/api/backup-policy":
+            # #26 备份触发/保留策略（纯读：只回报计数与阈值，不触发备份）
+            self._send(200, {"ok": True, "policy": _backup_policy_status()})
+            return
+        # ---- #25 导出中继（对齐 Frontend：自己不生成文件，全部转发 Analyzer /export/*）----
+        if path == "/api/export/db":
+            st, ct, cd, blob, err = _fetch_binary("/export/download_db")
+            if err:
+                self._send(502, {"ok": False, "error": err})
+                return
+            self._send(st or 200, blob, ct or "application/octet-stream",
+                       {"Content-Disposition": cd} if cd else None)
+            return
+        if path.startswith("/api/export/excel/"):
+            fn = urllib.parse.unquote(path[len("/api/export/excel/"):])
+            st, ct, cd, blob, err = _fetch_binary(
+                "/export/download_excel/" + urllib.parse.quote(fn))
+            if err:
+                self._send(502, {"ok": False, "error": err})
+                return
+            self._send(st or 200, blob, ct or "application/octet-stream",
+                       {"Content-Disposition": cd} if cd else None)
+            return
+        # ---- #23 图片批量下载中继（对齐 Frontend /images/*）----
+        if path == "/api/images/status":
+            self._send(200, _forward_fetcher("/images/status", timeout=10))
+            return
+        if path.startswith("/api/images/local/"):
+            tail = path[len("/api/images/local/"):]
+            st, ct, cd, blob, err = _fetch_binary("/images/local/" + tail, timeout=60)
+            if err:
+                self._send(404, {"ok": False, "error": err})
+                return
+            self._send(st or 200, blob, ct or "application/octet-stream")
+            return
+        if path == "/api/images/start-params":
+            # 供前端展示默认冒烟参数（不触发下载）：/images/start 必需参数说明
+            self._send(200, {"ok": True, "params": {"year": None, "use_sessdata": False},
+                             "hint": "POST /api/images/start?year=2026&use_sessdata=false 为安全冒烟组合"})
             return
         if path == "/api/fetcher-config":
             # 当前 Fetcher 连接配置（不回传明文 key，只给是否已设置 + 来源）
@@ -1096,8 +1593,84 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, request_restart(self.server, dry=dry))
             return
 
+        # ---- #25 导出中继：生成 Excel（转发 Analyzer，不自己写 xlsx）----
+        if parsed.path == "/api/export/excel":
+            q = {k: v[0] for k, v in qs.items() if k in ("year", "month", "start_date", "end_date")}
+            r = _forward_fetcher("/export/export_history", timeout=180, method="POST", params=q)
+            self._send(200 if r.get("ok") else 502, r)
+            return
+
+        # ---- #24 remark 编辑中继（写 Analyzer 主库；Finder 不落第三份数据）----
+        if parsed.path == "/api/remark":
+            bvid = (body.get("bvid") or "").strip()
+            view_at = body.get("view_at")
+            remark = body.get("remark")
+            if not bvid or view_at in (None, ""):
+                self._send(400, {"ok": False, "error": "需要 bvid 与 view_at"})
+                return
+            try:
+                view_at = int(view_at)
+            except Exception:
+                self._send(400, {"ok": False, "error": "view_at 必须是整数时间戳"})
+                return
+            payload = json.dumps({"bvid": bvid, "view_at": view_at,
+                                  "remark": "" if remark is None else str(remark)}).encode("utf-8")
+            r = _forward_fetcher_json("/history/update-remark", payload, timeout=30)
+            self._send(200 if r.get("ok") else 502, r)
+            return
+
+        # ---- #23 图片批量下载中继（start/stop/clear 会写盘，故前端默认走 use_sessdata=false 冒烟）----
+        if parsed.path in ("/api/images/start", "/api/images/stop", "/api/images/clear"):
+            action = parsed.path.rsplit("/", 1)[-1]
+            q = {k: v[0] for k, v in qs.items() if k in ("year", "use_sessdata")}
+            r = _forward_fetcher("/images/" + action, timeout=30, method="POST", params=q)
+            self._send(200 if r.get("ok") else 502, r)
+            return
+
+        if parsed.path == "/api/data-source":
+            # #21 数据源主开关：切换模式（可选改 Analyzer 库路径）→ 持久化 + 立即 reload（不重启）
+            mode = (body.get("mode") or "").strip().lower()
+            db = (body.get("analyzer_db") or "").strip()
+            if mode and mode not in store.SOURCE_MODES:
+                self._send(400, {"ok": False,
+                                 "error": "mode 必须是 %s 之一" % (list(store.SOURCE_MODES),)})
+                return
+            if db:
+                store.ANALYZER_DB = db
+            if mode:
+                store.set_source_mode(mode)
+            _persist_source_config(mode=mode or None, analyzer_db=db or None)
+            try:
+                reload_all()
+            except Exception as e:  # noqa
+                self._send(200, {"ok": False, "error": "切换后重载失败：%s" % e,
+                                 "mode": store.get_source_mode(),
+                                 "status": store.source_status()})
+                return
+            self._send(200, {"ok": True, "mode": store.get_source_mode(),
+                             "status": store.source_status(),
+                             "banner": store.get_meta_banner(store.get_raw())})
+            return
+
         if parsed.path == "/api/sync":
             full = qs.get("full", ["0"])[0] == "1"
+            mode = store.get_source_mode()
+            if mode in ("auto", "analyzer"):
+                # #1/#2「计划 A」：凭证单一化 —— 不再跑本地 collector（其 config.json 的 SESSDATA 已失效/弃用），
+                # 改为**触发 Analyzer 全量**：抓取执行者与凭证都归 Analyzer（即"中继"，非直连）。
+                # 与 /api/fetcher-trigger?mode=full 同语义，保留 /api/sync 这个既有按钮入口不破坏前端。
+                res = _forward_fetcher("/fetch/bili-history", timeout=240, method="GET",
+                                       params={"sync_deleted": qs.get("sync_deleted", ["1"])[0]})
+                self._send(200, {
+                    "started": bool(res.get("ok")),
+                    "engine": "analyzer",
+                    "mode": mode,
+                    "note": "计划A：走 Analyzer 全量拉取（不再使用 Finder 本地 collector 凭证）",
+                    "result": res,
+                    "post": _after_data_pull(res) if res.get("ok") else None,
+                })
+                return
+            # mode == local：模式 B（自身抓取），保留原 collector 语义，需自备有效 SESSDATA
             if sync_state["running"] or autoskip_state["running"]:
                 self._send(200, {"started": False, "blocked": True,
                                  "reason": "已有同步或规则应用任务进行中"})
@@ -1260,6 +1833,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    _console_probe()            # 只读探测 QuickEdit（影响"输出是否可能被冻结"，不影响功能）
     port = get_web_port()
     ensure_rules()
     reload_all()
@@ -1267,9 +1841,9 @@ def main():
     if not store.get_meta("rule_applied_hash"):
         try:
             _store_applied_rules()
-            print("[B站历史查看器] 首次启动：已按当前规则固化『已应用』状态", flush=True)
+            _safe_print("[B站历史查看器] 首次启动：已按当前规则固化『已应用』状态")
         except Exception as e:  # noqa
-            print(f"[B站历史查看器] 首次校准失败：{e}", flush=True)
+            _safe_print(f"[B站历史查看器] 首次校准失败：{e}")
     # 双栈绑定
     server = None
     bind_host = None
@@ -1285,29 +1859,34 @@ def main():
     if server is None:
         e = last_err
         if e.errno in (98, 10048, 48) or getattr(e, "winerror", None) == 10048:
-            print(f"[B站历史查看器] 端口 {port} 已被占用 —— 服务很可能已经在运行。", flush=True)
-            print(f"                 直接打开 http://127.0.0.1:{port} 即可；", flush=True)
-            print(f"                 若想重启，请先结束占用该端口的进程，再重新运行本命令。", flush=True)
+            _safe_print(f"[B站历史查看器] 端口 {port} 已被占用 —— 服务很可能已经在运行。\n"
+                        f"                 直接打开 http://127.0.0.1:{port} 即可；\n"
+                        f"                 若想重启，请在网页上点「⑥ 应用变更」，或先跑 stop.bat。")
         else:
-            print(f"[B站历史查看器] 无法绑定端口 {port}：{e}", flush=True)
+            _safe_print(f"[B站历史查看器] 无法绑定端口 {port}：{e}")
+        time.sleep(0.25)        # 给守护线程一点时间把上面这句写出去（该路径随即退出）
         sys.exit(1)
     banner = store.get_meta_banner(store.get_raw())
-    print(f"[B站历史查看器] 实例: boot_id={BOOT_ID}  pid={os.getpid()}  code={_code_version()}  "
-          f"supervised={'yes' if _is_supervised() else 'no'}", flush=True)
-    print(f"[B站历史查看器] 已启动: http://127.0.0.1:{port}  (也可访问 http://localhost:{port})", flush=True)
-    print(f"[B站历史查看器] 数据源: Analyzer(主,只读)={banner['analyzer']} 条 + "
-          f"本地Finder(备份,只读)={banner['local_backup']} 条 → 合并 {banner['total']} 条", flush=True)
-    print(f"[B站历史查看器] Analyzer 库: {banner['analyzer_db']}", flush=True)
+    lines = [
+        f"[B站历史查看器] 实例: boot_id={BOOT_ID}  pid={os.getpid()}  code={_code_version()}  "
+        f"supervised={'yes' if _is_supervised() else 'no'}",
+        f"[B站历史查看器] 已启动: http://127.0.0.1:{port}  (也可访问 http://localhost:{port})",
+        f"[B站历史查看器] 数据源: Analyzer(主,只读)={banner['analyzer']} 条 + "
+        f"本地Finder(备份,只读)={banner['local_backup']} 条 → 合并 {banner['total']} 条",
+        f"[B站历史查看器] Analyzer 库: {banner['analyzer_db']}",
+    ]
     try:
         st = rules_status()
-        print(f"[B站历史查看器] 规则状态: 待应用(pending)={st.get('pending')}  自上次应用以来新增未套用(dirty_count)={st.get('dirty_count')}", flush=True)
+        lines.append(f"[B站历史查看器] 规则状态: 待应用(pending)={st.get('pending')}  "
+                     f"自上次应用以来新增未套用(dirty_count)={st.get('dirty_count')}")
     except Exception:
         pass
-    print(f"[B站历史查看器] 按 Ctrl+C 停止（关闭本窗口也会停止服务）", flush=True)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n已停止。")
+    lines.append(f"[B站历史查看器] 控制台: {CONSOLE_INFO.get('note')}")
+    lines.append("[B站历史查看器] 按 Ctrl+C 停止（关闭本窗口也会停止服务）")
+    _log_restart_file("boot ok -> listen on %s:%d" % (bind_host, port))
+    _clear_relaunch_flag()          # 本次已成功启动 → 陈旧的重拉标记作废
+    _safe_print("\n".join(lines))
+    _serve_forever_and_exit(server)  # 退出码由主线程决定（见该函数说明）
 
 
 if __name__ == "__main__":

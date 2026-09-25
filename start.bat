@@ -1,5 +1,4 @@
 @echo off
-chcp 65001 >nul 2>&1
 setlocal
 cd /d "%~dp0"
 
@@ -39,7 +38,7 @@ echo [Python] %PYEXE%
 echo [Status] Starting server in THIS window (supervised mode).
 echo          Keep this window OPEN - closing it stops the server.
 echo          URL    : http://127.0.0.1:8765
-echo          Restart: use the "Restart service" button in the web UI
+echo          Restart: use the "6 Apply changes" button in the web UI
 echo                   (no need to reopen this window; the supervisor relaunches it)
 echo          Stop   : press Ctrl+C here, or run stop.bat
 echo ---------------------------------------------------
@@ -51,7 +50,14 @@ set "BHF_SUPERVISED=1"
 "%PYEXE%" "%~dp0src\server.py"
 set "RC=%errorlevel%"
 
-rem Exit code 42 = restart requested from the web UI -> relaunch automatically.
+rem --- Relaunch decision (this block writes nothing to the console) -------------
+rem 1) AUTHORITATIVE: handshake file. Before exiting on a web-UI restart the server
+rem    drops data\run\relaunch.flag. We trust the FILE, not the exit code - Windows
+rem    and the Python interpreter can lose the exit code (observed: it arrived as 0
+rem    because the interpreter tore down before the daemon worker called os._exit,
+rem    so this check must not depend on %RC% alone).
+if exist "%~dp0data\run\relaunch.flag" goto RESTART
+rem 2) Legacy signal: exit code 42.
 if "%RC%"=="42" goto RESTART
 
 echo ---------------------------------------------------
@@ -64,11 +70,16 @@ pause
 goto END
 
 :RESTART
-echo ---------------------------------------------------
-echo [Supervisor] Restart requested from the web UI (exit code 42).
-echo [Supervisor] Relaunching server in 2 seconds...
-echo ---------------------------------------------------
-timeout /t 2 /nobreak >nul
+rem ---------------------------------------------------------------------------
+rem Restart requested from the web UI (handshake file, or exit code 42).
+rem This block DELIBERATELY writes nothing to the console.
+rem Why: when a Windows console is in QuickEdit "selected" state, ANY write to it
+rem blocks until the selection is cancelled - the supervisor's own echo would then
+rem stall the relaunch chain. Delay is done with ping (no console I/O at all).
+rem Trail of this chain is written by the server to data\run\restart.log.
+rem ---------------------------------------------------------------------------
+del /q "%~dp0data\run\relaunch.flag" >nul 2>&1
+ping -n 3 -w 500 127.0.0.1 >nul 2>&1
 goto RUN
 
 :MONITOR

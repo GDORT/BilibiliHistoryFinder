@@ -255,6 +255,9 @@ function cardHtml(it) {
         <a class="title" href="${escapeHtml(webUrl)}" target="_blank" rel="noopener">${escapeHtml(it.title)}</a>
         ${actionBtn}
       </div>
+      <div class="remark-row" data-kid="${escapeHtml(it.kid)}" data-bvid="${escapeHtml(it.bvid || "")}" data-view-at="${it.view_at || 0}">
+        <span class="remark-text${it.remark ? "" : " empty"}" title="点击编辑备注（写回 Analyzer 主库，与 Frontend/官网互通）">${it.remark ? escapeHtml(it.remark) : "＋ 添加备注"}</span>
+      </div>
     </div>
     <div class="card-bottom">
       <span class="up">${escapeHtml(it.author_name || "未知UP")}</span>
@@ -1292,7 +1295,9 @@ function applyFetcherHealth(s) {
   dot.title = ok ? "Analyzer 已连接" : ("Analyzer 未连接：" + ((s && s.error) || "8899 不可达"));
 }
 function checkFetcher() {
-  fetch("/api/fetcher-health").then((r) => r.json()).then(applyFetcherHealth).catch(() => {});
+  // ?sessdata=0：这里只管「连通性」，不触发 Analyzer 去调 B站 /login/check（省一次外网往返）。
+  // 凭证健康由 refreshSourceHealth() 低频单独取，见文末「数据源健康横幅」。
+  fetch("/api/fetcher-health?sessdata=0").then((r) => r.json()).then(applyFetcherHealth).catch(() => {});
 }
 $("fetcherBtn").addEventListener("click", () => {
   const btn = $("fetcherBtn");
@@ -1456,8 +1461,10 @@ $("anApplyBtn").addEventListener("click", async () => {
     const a = st.action;
 
     if (a === "none") {
+      const c = (pre && pre.console) || {};
       showDiag("⑥ 应用变更", "未检测到任何变更，无需操作。\n\n"
-        + "boot_id=" + st.boot_id + "   version=" + st.version + "   pid=" + st.pid);
+        + "boot_id=" + st.boot_id + "   version=" + st.version + "   pid=" + st.pid
+        + "\n控制台：" + (c.note || "未探测"));
       return;
     }
 
@@ -1483,10 +1490,12 @@ $("anApplyBtn").addEventListener("click", async () => {
     if (a === "restart") {
       toast("正在重启服务…");
       const oldBoot = pre && pre.boot_id;
+      const pc = (pre && pre.console) || {};
       showDiag("⑥ 应用变更 — 已自动重启",
         "检测到需重启进程的改动：\n" + (st.changes.restart || []).join("、")
-        + "\n\n已发出重启请求，start.bat 的 supervisor 将在约 2 秒后重新拉起；"
-        + "服务恢复后本页会自动刷新。");
+        + "\n\n已发出重启请求，start.bat 的 supervisor 会在约 2 秒后重新拉起；"
+        + "服务恢复后本页会自动刷新。"
+        + "\n控制台：" + (pc.note || "未探测"));
       let newBoot = null;
       for (let i = 0; i < 40; i++) {
         await new Promise((r) => setTimeout(r, 500));
@@ -1498,9 +1507,18 @@ $("anApplyBtn").addEventListener("click", async () => {
       if (newBoot) { location.reload(); return; }
       showDiag("⑥ 应用变更 — 等待超时",
         "20 秒内未等到新进程（boot_id 未变化）。\n\n"
-        + "· 若通过 start.bat 启动：请看那个窗口里打印的报错（启动失败信息会留在窗口内）。\n"
-        + "· 若未托管（BHF_SUPERVISED=1 未设置）：请手动运行 start.bat。\n"
-        + "· 若 120 秒内重启已达 3 次，护栏会拒绝后续重启（见按钮提示）。");
+        + "① 最可能：旧进程没能退出 —— Windows 控制台被鼠标「选中」时，向它的任何输出都会"
+        + "被冻结，重启链就卡在那一步。\n"
+        + "   → 到那个控制台窗口按一下 Esc 或回车，重启会立刻继续。\n"
+        + "   → 本机控制台自检：" + (pc.attached
+              ? ("快速编辑(QuickEdit) " + (pc.quick_edit ? "开启 ⚠️（选中即冻结）" : "已关闭 ✓"))
+              : "未连接控制台")
+        + "\n   → 本版已做防护：服务端输出全部改为非阻塞、重启链只写文件、3 秒看门狗兜底；"
+        + "请先把控制台解冻，再点一次 ⑥ 让它加载。\n\n"
+        + "② 若通过 start.bat 启动：看那个窗口里的报错。\n"
+        + "③ 若未托管（BHF_SUPERVISED=1 未设置）：请手动运行 start.bat。\n"
+        + "④ 120 秒内重启已达 3 次时，护栏会拒绝后续重启。\n\n"
+        + "重启链路留痕：data/run/restart.log");
       btn.disabled = false;
       return;
     }
@@ -1533,6 +1551,7 @@ window.addEventListener("focus", () => refreshCodeStatus());
 
 /* ====== 设置：Analyzer / Fetcher 连接（低调入口，非常用触发） ====== */
 function openSettings() {
+  loadSourceCfg();
   fetch("/api/fetcher-config").then((r) => r.json()).then((c) => {
     $("fetcherBase").value = c.base || "http://localhost:8899";
     $("fetcherKey").value = c.has_key ? "************" : "";
@@ -2034,4 +2053,206 @@ $("batchApply").addEventListener("click", async (e) => {
 const _batchBtnClick = $("batchBtn").onclick;
 $("batchBtn").addEventListener("click", () => {
   setTimeout(syncBatchKindToViewExt, 0);
+});
+
+/* ====== 数据源健康横幅 + 数据源主开关（#27 / #21）====== */
+const SRC_BANNER_KEY = "bhf_src_banner_dismissed";
+const SRC_POLL_MS = 300000;   // 5 分钟：凭证查的是 B站 nav，低频即可
+
+function srcBannerDismissed(sig) {
+  try { return sessionStorage.getItem(SRC_BANNER_KEY) === sig; } catch (e) { return false; }
+}
+function srcBannerDismiss(sig) {
+  try { sessionStorage.setItem(SRC_BANNER_KEY, sig); } catch (e) {}
+}
+
+/* 依据 /api/fetcher-health 的 reachable + sessdata + source 计算横幅状态（3 态） */
+function renderSourceBanner(s) {
+  const box = $("srcBanner");
+  if (!box) return;
+  const reachable = !!(s && s.ok && s.reachable);
+  const sess = (s && s.sessdata) || {};
+  const src = (s && s.source) || {};
+  let level = "ok", sig = "ok", text = "", act = "";
+
+  if (!reachable) {
+    level = "bad"; sig = "unreachable";
+    text = "Analyzer 不可达（8899）—— 主源离线。" +
+           (src.effective === "local" ? "已降级为本地库 " + (src.local || 0) + " 条。" : "");
+    act = "打开设置";
+  } else if (sess.state === "invalid") {
+    level = "bad"; sig = "sessdata-invalid";
+    text = "Analyzer 凭证已失效（-101）—— 抓取/更新会失败，请更新 config/config.yaml 的 SESSDATA。";
+    act = "打开设置";
+  } else if (src.requested === "local") {
+    level = "warn"; sig = "mode-local";
+    text = "当前为「自身模式（local）」：只用本地 Finder 库 " + (src.local || 0) + " 条，历史深度可能不足。";
+    act = "打开设置";
+  } else if (src.effective === "local" && src.requested === "auto") {
+    level = "warn"; sig = "auto-degraded";
+    text = "auto 模式未能从 Analyzer 读到数据，已自动降级为本地库 " + (src.local || 0) + " 条。";
+    act = "打开设置";
+  }
+
+  if (level === "ok" || srcBannerDismissed(sig)) { box.classList.add("hidden"); return; }
+  box.className = "src-banner " + level;
+  $("srcText").textContent = text;
+  const a = $("srcAct");
+  a.classList.toggle("hidden", !act);
+  const dot = $("srcDot");
+  dot.className = "src-dot " + level;
+  box.dataset.sig = sig;
+  box.classList.remove("hidden");
+}
+
+function refreshSourceHealth() {
+  fetch("/api/fetcher-health")
+    .then((r) => r.json())
+    .then((s) => { applyFetcherHealth(s); renderSourceBanner(s); })
+    .catch(() => {});
+}
+
+$("srcClose").addEventListener("click", () => {
+  const box = $("srcBanner");
+  srcBannerDismiss(box.dataset.sig || "ok");
+  box.classList.add("hidden");
+});
+$("srcAct").addEventListener("click", () => { openSettings(); });
+
+/* 设置面板里的数据源三选一：读取当前 + 保存 */
+function loadSourceCfg() {
+  fetch("/api/data-source").then((r) => r.json()).then((d) => {
+    const sel = $("srcMode");
+    if (sel && d && d.mode) sel.value = d.mode;
+    const st = $("srcStatus");
+    if (st && d && d.status) {
+      const s = d.status;
+      st.textContent = "当前实际生效：" + (s.effective || "未加载") +
+        "（Analyzer " + (s.analyzer || 0) + " 条 / 本地 " + (s.local || 0) + " 条 → 合并 " + (s.merged || 0) + " 条）";
+      st.className = "fld-status";
+    }
+  }).catch(() => {});
+}
+$("srcSave").addEventListener("click", () => {
+  const mode = $("srcMode").value;
+  const db = $("srcAnalyzerDb").value.trim();
+  const st = $("srcStatus");
+  st.textContent = "正在切换…"; st.className = "fld-status";
+  fetch("/api/data-source", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(db ? { mode: mode, analyzer_db: db } : { mode: mode }),
+  }).then((r) => r.json()).then((s) => {
+    if (s && s.ok) {
+      const x = s.status || {};
+      st.textContent = "● 已切换为 " + s.mode + "（实际生效 " + (x.effective || "?") +
+        "，合并 " + (x.merged || 0) + " 条）";
+      st.className = "fld-status ok";
+      refreshSourceHealth();
+      load(true);
+    } else {
+      st.textContent = "● " + ((s && s.error) || "切换失败");
+      st.className = "fld-status bad";
+    }
+  }).catch((e) => { st.textContent = "● 切换失败：" + e.message; st.className = "fld-status bad"; });
+});
+
+refreshSourceHealth();
+setInterval(() => { if (!document.hidden) refreshSourceHealth(); }, SRC_POLL_MS);
+window.addEventListener("focus", () => refreshSourceHealth());
+
+/* ====== ⑧⑨⑩⑪ 导出 / 整库 / 图片批量下载 —— 测试入口（#25 / #23）====== */
+function postCall(btn, url, title) {
+  if (btn) btn.disabled = true;
+  toast("请求 Analyzer：" + title + " …");
+  fetch(url, { method: "POST" })
+    .then((r) => r.json())
+    .then((s) => { showDiag(title + " — 响应", s); checkFetcher(); })
+    .catch((e) => showDiag(title + " — 错误", { error: e.message }))
+    .finally(() => { if (btn) btn.disabled = false; });
+}
+
+/* ⑧ 导出 Excel：转发 Analyzer 生成 xlsx，再经 /api/export/excel/{file} 下载 */
+$("anExportBtn").addEventListener("click", () => {
+  const btn = $("anExportBtn");
+  const y = prompt("导出年份（YYYY，留空 = 不传 year 由 Analyzer 决定）",
+                   String(new Date().getFullYear()));
+  if (y === null) return;
+  const q = y.trim() ? ("?year=" + encodeURIComponent(y.trim())) : "";
+  btn.disabled = true;
+  toast("正在让 Analyzer 生成 Excel…");
+  fetch("/api/export/excel" + q, { method: "POST" })
+    .then((r) => r.json())
+    .then((s) => {
+      const fn = s && s.data && s.data.filename;
+      if (s && s.ok && fn) {
+        showDiag("⑧ 导出 Excel — 已生成，开始下载\n" + fn, s);
+        window.location.href = "/api/export/excel/" + encodeURIComponent(fn);
+      } else {
+        showDiag("⑧ 导出 Excel — 失败", s);
+      }
+    })
+    .catch((e) => showDiag("⑧ 导出 Excel — 错误", { error: e.message }))
+    .finally(() => { btn.disabled = false; });
+});
+
+/* ⑨ 下载整库 .db：直接走 windows 下载流 */
+$("anDbBtn").addEventListener("click", () => {
+  if (!confirm("将下载 Analyzer 整库 .db。\n注意：这是 Analyzer 的原始数据库快照，下载后请自行妥善保管。\n\n确认下载？")) return;
+  window.location.href = "/api/export/db";
+});
+
+/* ⑩ 图片状态（只读） */
+$("anImgBtn").addEventListener("click", () =>
+  anCall($("anImgBtn"), "/api/images/status", "⑩ 图片状态 (/images/status)"));
+
+/* ⑪ 下载图片（写盘操作，默认不用凭证 + 限定年份的安全冒烟组合） */
+$("anImgStartBtn").addEventListener("click", () => {
+  const y = prompt("年份（YYYY = 只下该年；留空 = 全部年份，量大）",
+                   String(new Date().getFullYear()));
+  if (y === null) return;
+  const useSess = confirm(
+    "下载时是否使用 SESSDATA？\n\n" +
+    "【取消】= 不使用（推荐：封面/头像属公开内容，无需凭证）\n" +
+    "【确定】= 使用（需 Analyzer 凭证有效）");
+  const q = "?use_sessdata=" + (useSess ? "true" : "false") +
+            (y.trim() ? "&year=" + encodeURIComponent(y.trim()) : "");
+  if (!confirm("⚠️ 这是写盘操作：会往 Analyzer 的输出目录批量写入封面/头像文件。\n" +
+               "参数：year=" + (y.trim() || "全部") + "，use_sessdata=" + useSess + "\n\n确认开始？")) return;
+  postCall($("anImgStartBtn"), "/api/images/start" + q, "⑪ 开始下载图片");
+});
+
+$("anImgStopBtn").addEventListener("click", () =>
+  postCall($("anImgStopBtn"), "/api/images/stop", "⑪ 停止下载图片"));
+
+/* ====== #24 remark 备注：卡片上点击即编辑（写回 Analyzer 主库，与 Frontend / 官网互通）====== */
+document.addEventListener("click", (e) => {
+  const el = e.target && e.target.closest ? e.target.closest(".remark-text") : null;
+  if (!el) return;
+  const row = el.closest(".remark-row");
+  if (!row) return;
+  const bvid = row.dataset.bvid || "";
+  const viewAt = row.dataset.viewAt || "";
+  if (!bvid || !viewAt) { toast("该记录无 bvid（直播/专栏不支持备注）"); return; }
+  const cur = el.classList.contains("empty") ? "" : el.textContent;
+  const next = prompt("备注（写回 Analyzer 主库；留空即清除）", cur);
+  if (next === null) return;
+  el.textContent = "保存中…";
+  fetch("/api/remark", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ bvid, view_at: Number(viewAt), remark: next }),
+  }).then((r) => r.json()).then((s) => {
+    if (s && s.ok) {
+      el.textContent = next || "＋ 添加备注";
+      el.classList.toggle("empty", !next);
+      toast(next ? "备注已保存" : "备注已清除");
+    } else {
+      el.textContent = cur || "＋ 添加备注";
+      toast("保存失败：" + ((s && s.error) || "未知错误"));
+    }
+  }).catch((err) => {
+    el.textContent = cur || "＋ 添加备注";
+    toast("保存失败：" + err.message);
+  });
 });

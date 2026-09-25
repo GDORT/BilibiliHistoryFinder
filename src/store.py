@@ -135,47 +135,87 @@ def _read_local(db_path):
 
 
 def _fold_latest_by_bvid(records):
-    """Plan A：同一 bvid 只保留 view_at 最大的一条，对齐 B站官网历史页行为。
+    """Plan B：同一 bvid 折叠为一条 —— **展示取「最近一次」，判断取「最有利」**。
 
     背景：B站历史接口每次「观看会话」记一条独立记录（各自 view_at），同一视频
-    当天多次打开 → 多条。Analyzer 与开源 Frontend 均保留全部会话、展示层不折叠；
-    本函数让 Finder 网页与「B站官网历史页」一致（每视频只显示最近一次观看）。
+    多次打开 → 多条。Analyzer 与开源 Frontend 均保留全部会话、展示层不折叠。
 
-    规则：
-    - 无 bvid 的记录（直播/专栏等）不参与折叠，原样保留；
-    - 折叠后**保留原始记录 dict（含其 kid=(bvid,view_at)）**，不重算键，
-      故既有 manual_skip / auto_exempt 等跳过状态对「最新一条」继续有效，
-      canonical_state.db 无需迁移。
+    ⚠️ Plan A（只取 view_at 最大一条）有**功能性缺陷**：实测 7 条视频
+    「历史某次 progress == -1（已看完）、最近一次只点开没看完」，
+    折叠后丢掉 -1 → 被误判为「需要观看」。故改为下面的**状态聚合**：
+
+    - 展示字段（标题 / 封面 / 作者 / uri…）取 `view_at` 最大的一条 = 「最近一次观看」；
+    - `progress` 取**最有利值**：任一会话 `== -1` → 结果 `-1`；否则取 `max`；
+    - `duration` 取 `max`（防御性；实测与最近一条一致）；
+    - 新增 `session_count` / `first_view_at` / `kids`（全部会话的 kid 列表）；
+    - 记录自身的 `kid` 仍是「最近一次」的 kid → 展示与既有接口零改动；
+    - 无 `bvid` 的记录（直播/专栏/pgc 等）不参与折叠，原样保留。
+
+    配合 `classify_record` 的 `kids` 多键命中（**同批改动，缺一不可**）：
+    skip / archived 只要命中任一会话即生效，因此「同一视频再看一次产生新会话」
+    不会让既有跳过状态失效（修 Plan A 遗留的 P2 漂移）。
     """
-    best = {}
+    groups = {}
+    order = []
     rest = []
     for r in records:
         bvid = r.get("bvid")
         if not bvid:
             rest.append(r)
             continue
-        va = int(r.get("view_at") or 0)
-        cur = best.get(bvid)
-        if cur is None or va > int(cur.get("view_at") or 0):
-            best[bvid] = r
-    return rest + list(best.values())
+        if bvid not in groups:
+            groups[bvid] = []
+            order.append(bvid)
+        groups[bvid].append(r)
+
+    out = []
+    for bvid in order:
+        sess = sorted(groups[bvid], key=lambda x: int(x.get("view_at") or 0))
+        if len(sess) == 1:
+            # 单会话：原地标注聚合字段，避免多余 dict 拷贝（4450+ 条量级）
+            r = sess[0]
+            r["session_count"] = 1
+            r["first_view_at"] = int(r.get("view_at") or 0)
+            r["kids"] = [r.get("kid")]
+            out.append(r)
+            continue
+        rep = dict(sess[-1])                       # 最近一次观看 = 展示基准
+        progs = [x.get("progress") for x in sess]
+        if any(p == -1 for p in progs):
+            rep["progress"] = -1                   # 已看完优先（修 P0 误判）
+        else:
+            ints = [p for p in progs if isinstance(p, int)]
+            rep["progress"] = max(ints) if ints else rep.get("progress")
+        durs = [x.get("duration") or 0 for x in sess]
+        if durs:
+            rep["duration"] = max(durs)
+        rep["session_count"] = len(sess)
+        rep["first_view_at"] = int(sess[0].get("view_at") or 0)
+        rep["kids"] = [x.get("kid") for x in sess]
+        out.append(rep)
+    return rest + out
 
 
 def load_raw_records():
-    """读取 Analyzer（主源）+ 本地 Finder（备份）合并为 canonical derived 列表。
+    """读取数据源并按「数据源主开关」合并为 canonical derived 列表。
 
-    合并策略：以 kid 为键，Analyzer 优先；本地独有的记录（备份补齐）并入。
-    返回 list[dict]，每项含规则引擎所需字段 + 展示字段 + source 标记。
+    合并策略（mode=auto/analyzer）：以 kid 为键，**Analyzer 优先**；本地库补齐 Analyzer 没有的。
+    合并策略（mode=local）：只用本地 Finder 库。
+    auto 会在 Analyzer 读不到记录时**自动降级本地**，并把 effective 记入 _LAST_SOURCE 供前端横幅提示。
+    返回 list[dict]，每项含规则引擎所需字段 + 展示字段 + 聚合字段（session_count/first_view_at/kids）。
     """
     analyzer = _read_analyzer(ANALYZER_DB)
     local = _read_local(LOCAL_DB)
-    merged = dict(analyzer)  # 主源优先
-    for kid, d in local.items():
-        if kid not in merged:
-            merged[kid] = d
-    records = list(merged.values())
-    # Plan A：对齐官网——同一视频只显示最近一次观看
-    return _fold_latest_by_bvid(records)
+    merged, effective = _pick_sources(get_source_mode(), analyzer, local)
+    _LAST_SOURCE.update({
+        "requested": get_source_mode(),
+        "effective": effective,
+        "analyzer": len(analyzer),
+        "local": len(local),
+        "merged": len(merged),
+    })
+    # Plan B：同一视频只显示最近一次观看，但保留「已看完」判断与全部会话键
+    return _fold_latest_by_bvid(list(merged.values()))
 
 
 # 模块级缓存：避免每请求重读 7 张年表
@@ -192,6 +232,68 @@ def get_raw():
     if RAW_CACHE["records"] is None:
         reload_raw()
     return RAW_CACHE["records"]
+
+
+# ===================== 数据源主开关（#21，见 说明-主备架构与数据模式.md §3） =====================
+# auto     ：Analyzer 有数据 → 以 Analyzer 为主源、本地库补齐；Analyzer 空/不可达 → 自动降级本地只读
+# analyzer ：强制 Analyzer 为主源（本地仅补齐）
+# local    ：强制只用本地 Finder 库（模式 B：自身抓取，需有效 SESSDATA）
+SOURCE_MODES = ("auto", "analyzer", "local")
+SOURCE = {"mode": "auto"}
+# effective 初始为 None：表示「尚未加载过」，避免在 main() 的首次 reload 之前
+# 对外谎报 effective=auto（前端据此显示"未加载"而非"Analyzer 主力"）。
+_LAST_SOURCE = {"requested": "auto", "effective": None,
+                "analyzer": 0, "local": 0, "merged": 0}
+
+
+def set_source_mode(mode):
+    """设置数据源模式（运行时生效，持久化由 server 层负责）。"""
+    m = (mode or "").strip().lower()
+    if m not in SOURCE_MODES:
+        raise ValueError("mode 必须是 %s 之一" % (SOURCE_MODES,))
+    SOURCE["mode"] = m
+    return m
+
+
+def get_source_mode():
+    return SOURCE.get("mode") or "auto"
+
+
+def _merge_records(analyzer, local, with_local_backfill=True):
+    """Analyzer 优先，本地库仅补齐 Analyzer 没有的 kid（保持既有口径）。"""
+    merged = dict(analyzer)
+    if with_local_backfill:
+        for kid, d in local.items():
+            if kid not in merged:
+                merged[kid] = d
+    return merged
+
+
+def _pick_sources(mode, analyzer, local):
+    """按模式决定合并策略，返回 (records_dict, effective_mode)。
+
+    auto 的降级判据用「Analyzer 是否读到记录」而非「库文件是否存在」——
+    与 说明-主备架构与数据模式.md §6 的提醒一致：路径配错时不会假装有数据。
+    """
+    if mode == "local":
+        return dict(local), "local"
+    if mode == "analyzer":
+        return _merge_records(analyzer, local, True), "analyzer"
+    # auto
+    if analyzer:
+        return _merge_records(analyzer, local, True), "analyzer"
+    return dict(local), "local"
+
+
+def source_status():
+    """当前数据源状态（供 /api/data-source 展示；纯读，不触库）。"""
+    st = dict(_LAST_SOURCE)
+    st["modes"] = list(SOURCE_MODES)
+    st["analyzer_db"] = ANALYZER_DB
+    st["analyzer_db_exists"] = os.path.exists(ANALYZER_DB)
+    st["local_db"] = LOCAL_DB
+    st["local_db_exists"] = os.path.exists(LOCAL_DB)
+    return st
 
 
 # ===================== 侧状态库（manual_skip / auto_exempt / meta） =====================
@@ -306,6 +408,20 @@ def classify_record(rec, rule, now, state):
     finished = (prog == -1)
     kid = rec.get("kid")
     m = state.get(kid) or {}
+    # Plan B 配套：折叠记录可能承载多个会话（kids），skip/archived **命中任一会话即生效**。
+    # 否则「同一视频再看一次 → 产生新 view_at → 新 kid」会让既有 manual_skip 静默失效。
+    for k in (rec.get("kids") or ()):
+        if k == kid:
+            continue
+        mm = state.get(k)
+        if not mm:
+            continue
+        if mm.get("manual_skip") or mm.get("auto_exempt") or mm.get("archived"):
+            m = {
+                "manual_skip": bool(m.get("manual_skip")) or bool(mm.get("manual_skip")),
+                "auto_exempt": bool(m.get("auto_exempt")) or bool(mm.get("auto_exempt")),
+                "archived": bool(m.get("archived")) or bool(mm.get("archived")),
+            }
     manual_skip = bool(m.get("manual_skip"))
     auto_exempt = bool(m.get("auto_exempt"))
     archived = bool(m.get("archived"))

@@ -25,6 +25,8 @@
 
 1. **主用（权威）：Analyzer 的 `config.yaml`**。若已装 BilibiliHistoryAnalyzer 后台，SESSDATA 填在这里（服务端读取，网页/前端都不碰凭证）。过期后在 Analyzer 侧重填即可。
 2. **遗留（不推荐）：本仓库根 `config.json`**。仅供 `collector.py`（本地备份采集）使用，**当前该份已失效**（同步会报接口 `-101`）；按「计划 A」它将被停用（见 `doc/方案-后端与数据源.md` §7.4）。**新用户不必再填这份。**
+   > **计划 A 已实现（2026-09-25，§7.11.2）**：数据源切换到 `auto`/`analyzer` 时，网页「同步数据」按钮**不再运行 `collector.py`**，改为转发 Analyzer 全量拉取——即 Finder 侧不再使用这份遗留凭证。**只有**把数据源模式显式切成 `local`（模式 B：自身抓取）时才需要它有效。
+   > 凭证健康可在网页顶部横幅直接看到（🟢 正常 / 🔴 失效 / 🔴 Analyzer 不可达）；Analyzer 侧另有 `scheduler_config.yaml` 每 10 分钟检查并按邮件告警。
 
 取值方式（两份通用）：
 1. 用浏览器登录 B站（bilibili.com）。
@@ -54,8 +56,7 @@ python src/collector.py --config config.json
 # 启动 Web 服务（默认端口 8765）
 python src/server.py
 
-# 可选：换端口起第二个实例（不干扰在跑实例；用于测试）
-BHF_PORT=8799 python src/server.py        # Windows cmd 用: set BHF_PORT=8799 && python src/server.py
+# 换端口：改 config.json 的 "web_port" 即可（端口只由配置文件决定，无环境变量开关）
 ```
 > 注意：**手动 `python src/server.py` 启动时没有 supervisor**——点「⑥ 应用变更」若需要重启，接口会返回 `action: manual` 并**明确警告"重启后不会自动拉起"（且不会自杀）**，避免把服务点死。要用一键重启请走 `start.bat`。
 
@@ -70,8 +71,15 @@ BHF_PORT=8799 python src/server.py        # Windows cmd 用: set BHF_PORT=8799 &
 - **筛选 ▾**：时长 / 时间 / 设备 / 含存档的**临时浏览条件**（不落库，刷新即还原）。
 - **搜索**：按标题或 UP主名实时搜索。
 - **⚙ 续看规则**：右侧抽屉编辑规则；橙色圆点＝待应用，数字＝脏计数（自上次应用以来未标记的新记录）。
-- **同步数据 / 全量重建**：增量同步 / 强制全量校准"仅本地存档"标记（走本仓库遗留 collector；当前其 SESSDATA 已失效，见 §6）。
-- **Analyzer 联调（①–⑤）**：① 健康探测 ② 增量拉取 ③ 全量拉取 ④ 数据自检 ⑤ 本地备份 / 查看备份 —— 经本机 Analyzer（`:8899`）中继，详见 `doc/方案-前端.md` §6。
+- **同步数据 / 全量重建**：增量同步 / 强制全量校准"仅本地存档"标记。
+  **计划 A 已实现（§7.11.2）**：数据源模式为 `auto`/`analyzer` 时**不再运行本仓库 collector**，改走 Analyzer 全量（中继）；仅 `local` 模式才用本地 collector。
+- **Analyzer 联调（①–⑪）**：① 健康探测 ② 增量拉取 ③ 全量拉取 ④ 数据自检 ⑤ 本地备份 / 查看备份 ⑧ 导出 Excel ⑨ 下载整库 ⑩ 图片状态 ⑪ 下载图片 / 停止 —— 经本机 Analyzer（`:8899`）中继，详见 `doc/方案-前端.md` §6。
+  - **⑧⑨ 导出**：转发 Analyzer `/export/*`，**Finder 自己不生成 Excel**（避免第二份口径）。
+  - **⑩⑪ 图片**：转发 `/images/*`；封面/头像属公开内容，⑪ 默认 `use_sessdata=false`（**不消耗凭证**），且为**写盘操作**，会二次确认。
+  - **卡片备注**：卡片上直接点备注处即可编辑，写回 **Analyzer 主库** `remark` 字段（与官方 Frontend 互通）。
+- **数据源主开关（设置 ⚙ 内，§7.11.2）**：`auto`（默认：Analyzer 优先，读不到则降级本地）/ `analyzer`（强制主源）/ `local`（模式 B：只用本地库）。
+  切换**即时生效并持久化**（`data/source_config.json`），无需重启；`kid=(bvid,view_at)` 跨模式一致 → **切换不丢跳过/视图/名单**。
+- **数据源健康横幅（§7.11.2）**：Analyzer 不可达 / 凭证失效（-101）/ 处于自身模式或已降级时，页面顶部出现对应提示条；一切正常则隐藏。收起后同状态不再打扰。
 - **⑥ 应用变更（唯一开发运维入口，不是数据功能）**：
   - **一个按钮，零判断**：`POST /api/apply` 自动比对"启动基线 vs 磁盘"，自己决定 → 热重载 / 重启 / 只需刷新 / 无需动作。
   - 徽章 `● N` = 待应用变更数（页面加载、窗口获得焦点、每 15 s 轮询 `GET /api/code-status`；`document.hidden` 时不请求）；**只提示、不自动执行**，建议动作为重启时徽章转红。
@@ -127,7 +135,12 @@ BilibiliHistoryFinder/
 | `data/canonical_state.db` | 侧状态库：跳过状态 / 视图 / 名单（本仓库唯一可写） |
 | `data/bilibili_history.db` | 本地**备份库**（collector 写入；非主源） |
 | `data/backup/<时间戳>/` | ⑤ 本地备份快照（`POST /api/backup` 生成） |
+| `data/source_config.json` | **数据源主开关**（`mode` + `analyzer_db`；`POST /api/data-source` 写入，2026-09-25 新增） |
+| `data/backup_policy.json` | **备份触发/保留策略**（`auto` / `delta_threshold` / `keep`，2026-09-25 新增；可手改） |
 | `data/config.json` | 遗留配置，含 collector 用 `SESSDATA`（当前已失效） |
+| `data/run/restarts.json` | ⑥ 重启护栏记账（120 秒窗口内 ≥3 次则拒绝，防重启风暴） |
+| `data/run/restart.log` | **重启链路留痕**（每次启动/重启写 2–4 行；排障「点了 ⑥ 到底走没走通」就看它，2026-09-25 新增） |
+| `data/run/relaunch.flag` | **重启握手标记**：进程退出前落下它，`start.bat` 只看它在不在就重新拉起（**不依赖退出码**）；启动时自动清除（2026-09-25 新增） |
 | `data/rules.json` | 续看规则（由 ⚙ 抽屉编辑，不直接手改） |
 | `data/sync_progress.json` / `sync_result.json` | 同步进度与完成判定 |
 | `data/auto_skip_progress.json` | 规则应用进度（运行时产生） |
@@ -141,8 +154,10 @@ BilibiliHistoryFinder/
 
 - **只能"从现在起"留存**：B站端已被上限顶掉的过去历史无法恢复（服务端限制，任何方案都救不回）；原型价值是"以后一条不漏"。
 - 单账号；多账号为后续阶段。
-- SESSDATA 过期需手动更新，暂无前端提示/重填 UI。当前存在**两份**凭证（Analyzer `config.yaml`＝主用、根 `config.json`＝collector 遗留且已失效）；「同步数据」按钮走后者会报 `-101`，**计划 A 将停用该遗留路径**（见 `doc/方案-后端与数据源.md` §7.4）。
-- 一键**本地备份**已实现（「⑤ 本地备份」按钮：`POST /api/backup` 对 Analyzer 主源 + 本地库做 sqlite3 在线快照至 `data/backup/<时间戳>/`，详见 `doc/方案-后端与数据源.md` §7.5）；**导出为独立文件（如 JSON/CSV 便携备份）仍待做**。
+- SESSDATA 过期需手动更新。**2026-09-25 已补前端提示**：顶部横幅会在 Analyzer 凭证失效（-101）时变红提示，Analyzer 不可达或在自身模式/已降级时变黄（见 §3）。当前仍存在**两份**凭证（Analyzer `config.yaml`＝主用、根 `config.json`＝collector 遗留且已失效）；**计划 A 已实现**——`auto`/`analyzer` 模式下「同步数据」改走 Analyzer 全量，不再使用遗留凭证（见 `doc/方案-后端与数据源.md` §7.11.2）。
+- 一键**本地备份**已实现（「⑤ 本地备份」按钮：`POST /api/backup` 对 Analyzer 主源 + 本地库做 sqlite3 在线快照至 `data/backup/<时间戳>/`，详见 `doc/方案-后端与数据源.md` §7.5）。**导出为独立文件已接入**：⑧ 导出 Excel / ⑨ 下载整库 `.db`，全部**中继 Analyzer `/export/*`**（Finder 不自己生成文件，避免第二份口径；§7.11.3）。
+- **自动备份触发**（2026-09-25）：不做定时备份（Analyzer/Frontend 也都没有），改为**「自上次备份以来 Analyzer 主源新增条数 ≥ 阈值」**时在拉取成功后自动备份一次，并按 `keep` 清理旧快照（§7.11.4）。阈值见 `data/backup_policy.json`，可用 `GET /api/backup-policy` 查看当前增量与是否达线。
+- **⑥ 应用变更与控制台的关系（2026-09-25 已修）**：Windows 控制台被鼠标**选中**时处于 QuickEdit 状态，向它的**任何输出都会阻塞**；旧实现把重启提示 `print` 放在 `os._exit(42)` 之前，于是「光标停在控制台里 → 点了 ⑥ 没反应」。现已三层防护：服务端输出全部改 `_safe_print`（守护线程，不阻塞）、重启链只写 `data/run/restart.log`、**3 秒看门狗**保证一定按退出码 42 退出；`start.bat` 的 `:RESTART` 段也改为零控制台输出。回归脚本 `dev/regression_restart.py`（详见 `doc/方案-后端与数据源.md` §7.12）。**另：退出码本身也曾不可靠**——旧实现把 `os._exit(42)` 放在**守护线程**里，`shutdown()` 之后主线程先走完、解释器收尾把守护线程回收，退出码变成 **0**，于是 `start.bat` 落到 `pause`、服务停住。现已改为**主线程决定退出码** + **文件握手**（回归对照：旧设计 3/3 得 0、新设计 3/3 得 42），详见 §7.13。**2026-09-26 00:15 已在 QuickEdit 冻结场景现场验证**：控制台全程保持选中（写入被冻结）时点 ⑥，整链 **≈ 3 秒**完成自动重启并刷新（修复前同一链路 56 秒）。
 - 设备类型（`dt`）仅为占位标签（B站未公开真实设备映射）。
 - 同步内自动套用规则暂缓，当前以"应用规则"为统一重校准入口。
 
@@ -161,6 +176,8 @@ BilibiliHistoryFinder/
 | `doc/待办-当前阶段.md` | 当前阶段待办清单（不含 Phase 2 油猴 D）；供逐项标注「怎么做 / 是否做」 |
 
 **源码副本（只读参考，非文档）**：`doc/BilibiliHistoryFetcher-master/`（Analyzer/Fetcher 后端源码）、`doc/BiliHistoryFrontend-master/`（开源前端，Tauri/Vue3）。二者为整份源码副本，供评估与字段/接口核对用。
+
+**开发工具（`dev/`，非文档）**：`regression_restart.py` —— **⑥ 重启链路的常驻回归**（2026-09-25 由 `_verify_restart.py` 更名，转为正式资产）。跑法 `python dev/regression_restart.py`。它只绑 `127.0.0.1` 随机端口，**不启动对外服务、不读写任何历史数据**，所有写盘重定向到临时目录；断言生产拓扑（真实 `ThreadingHTTPServer` + 主线程 `serve_forever` + 工作线程发起重启）连跑 3 次退出码均为哨兵 **42**，并以旧设计对照（**0/0/0**，即线上 bug 的复现）。`stub_fetcher.py` 为接口桩。
 
 **归档溯源（`doc/archive/`，仅作历史参考，内容已并入上述三方案）**：
 - `方案定稿-前后端分离前-2026-08-24.md`（拆分前单文件定稿）

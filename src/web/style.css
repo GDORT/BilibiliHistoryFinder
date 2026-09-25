@@ -577,3 +577,39 @@ body.lock-scroll { overflow: hidden; }
   font-size: 12px; color: var(--sub); min-width: 40px; text-align: right;
   font-variant-numeric: tabular-nums; white-space: nowrap;
 }
+
+/* ====== 数据源健康横幅（#27）：3 态 warn / bad / ok(隐藏) ====== */
+.src-banner {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 14px; font-size: 13px; line-height: 1.4;
+  border-bottom: 1px solid var(--border);
+}
+.src-banner.warn { background: #fff8e6; color: #8a6100; border-bottom-color: #f0dfae; }
+.src-banner.bad  { background: #fdecec; color: #9f2f2e; border-bottom-color: #f3c9c9; }
+.src-banner .src-text { flex: 1; min-width: 0; }
+.src-dot {
+  width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto;
+}
+.src-dot.warn { background: #e6a700; box-shadow: 0 0 0 2px rgba(230,167,0,.22); }
+.src-dot.bad  { background: #e24b4a; box-shadow: 0 0 0 2px rgba(226,75,74,.22); }
+.src-banner .src-act { flex: 0 0 auto; }
+.src-banner .src-x {
+  background: transparent; border: 0; cursor: pointer; flex: 0 0 auto;
+  font-size: 16px; line-height: 1; padding: 0 2px; color: inherit; opacity: .6;
+}
+.src-banner .src-x:hover { opacity: 1; }
+
+/* 设置弹窗内分隔线 */
+.fld-sep { border: 0; border-top: 1px solid var(--border); margin: 16px 0 12px; }
+.fld-status select.fld-input { cursor: pointer; }
+
+/* ====== #24 卡片备注行 ====== */
+.remark-row { margin-top: 6px; }
+.remark-row .remark-text {
+  display: inline-block; max-width: 100%; font-size: 12px; line-height: 1.5;
+  padding: 1px 6px; border-radius: 6px; cursor: text;
+  background: #fff7fa; color: #8a4a63; border: 1px dashed #f3cdda;
+  word-break: break-word;
+}
+.remark-row .remark-text:hover { background: #ffeef4; border-color: var(--pink); }
+.remark-row .remark-text.empty { color: #b6b9bf; background: transparent; border-color: var(--border); }
