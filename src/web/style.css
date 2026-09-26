@@ -613,3 +613,9 @@ body.lock-scroll { overflow: hidden; }
 }
 .remark-row .remark-text:hover { background: #ffeef4; border-color: var(--pink); }
 .remark-row .remark-text.empty { color: #b6b9bf; background: transparent; border-color: var(--border); }
+/* #36 系统备注（Analyzer「互动补充：」溯源标记）—— 灰底灰字 + 斜体 + 点状边框，与你手写的备注一眼可分 */
+.remark-row .remark-text.sys {
+  background: #f5f6f8; color: #7c828c; border-style: dotted; border-color: #d9dce1;
+  font-style: italic;
+}
+.remark-row .remark-text.sys:hover { background: #eef0f3; border-color: #b9bec6; }

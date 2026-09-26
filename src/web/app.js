@@ -45,6 +45,27 @@ function escapeHtml(s) {
   );
 }
 
+/* #36 系统备注识别 —— Analyzer 会把「收藏 / 点赞 / 投币」补进历史库（因 B站观看历史只保留近三个月），
+   并写一条形如「互动补充：收藏」的备注标明来源（analyzer 侧 interaction_records.py 的
+   HISTORY_IMPORT_REMARK_PREFIX）。Finder 不写这个字段，只在展示上把它和用户自写备注区分开，
+   避免用户误在溯源标记上写字把它覆盖掉。 */
+const SYS_REMARK_PREFIX = "互动补充";
+
+function isSystemRemark(s) {
+  return typeof s === "string" && s.indexOf(SYS_REMARK_PREFIX) === 0;
+}
+
+function remarkClass(remark) {
+  if (!remark) return "remark-text empty";
+  return "remark-text" + (isSystemRemark(remark) ? " sys" : "");
+}
+
+function remarkTitle(remark) {
+  return isSystemRemark(remark)
+    ? "Analyzer 自动写入的溯源标记（非你手写）；点击编辑会覆盖它"
+    : "点击编辑备注（写回 Analyzer 主库，与 Frontend/官网互通）";
+}
+
 // 时长（秒）→ MM:SS 或 H:MM:SS
 function fmtDur(s) {
   if (s == null || s <= 0) return "";
@@ -256,7 +277,7 @@ function cardHtml(it) {
         ${actionBtn}
       </div>
       <div class="remark-row" data-kid="${escapeHtml(it.kid)}" data-bvid="${escapeHtml(it.bvid || "")}" data-view-at="${it.view_at || 0}">
-        <span class="remark-text${it.remark ? "" : " empty"}" title="点击编辑备注（写回 Analyzer 主库，与 Frontend/官网互通）">${it.remark ? escapeHtml(it.remark) : "＋ 添加备注"}</span>
+        <span class="${remarkClass(it.remark)}" title="${remarkTitle(it.remark)}">${it.remark ? escapeHtml(it.remark) : "＋ 添加备注"}</span>
       </div>
     </div>
     <div class="card-bottom">
@@ -2073,6 +2094,7 @@ function renderSourceBanner(s) {
   const reachable = !!(s && s.ok && s.reachable);
   const sess = (s && s.sessdata) || {};
   const src = (s && s.source) || {};
+  const diag = src.diagnosis || {};   // #37：Analyzer 库路径诊断（error=路径配错 / warn=库为空）
   let level = "ok", sig = "ok", text = "", act = "";
 
   if (!reachable) {
@@ -2087,6 +2109,16 @@ function renderSourceBanner(s) {
   } else if (src.requested === "local") {
     level = "warn"; sig = "mode-local";
     text = "当前为「自身模式（local）」：只用本地 Finder 库 " + (src.local || 0) + " 条，历史深度可能不足。";
+    act = "打开设置";
+  } else if (diag.level === "error") {
+    /* #37：路径配错 / 不是 Analyzer 库 / 打不开 —— 必须与「Analyzer 确实没有数据」区分开。
+       否则 auto 静默降级成 local 时，你会以为 Analyzer 没数据而去白折腾一遍。 */
+    level = "bad"; sig = "src-diag-" + (diag.code || "error");
+    text = diag.message || "Analyzer 库配置有问题（见设置 ⚙ 的数据源段）。";
+    act = "打开设置";
+  } else if (diag.level === "warn") {
+    level = "warn"; sig = "src-diag-" + (diag.code || "warn");
+    text = diag.message || "Analyzer 库里没有记录。";
     act = "打开设置";
   } else if (src.effective === "local" && src.requested === "auto") {
     level = "warn"; sig = "auto-degraded";
@@ -2245,7 +2277,8 @@ document.addEventListener("click", (e) => {
   }).then((r) => r.json()).then((s) => {
     if (s && s.ok) {
       el.textContent = next || "＋ 添加备注";
-      el.classList.toggle("empty", !next);
+      el.className = remarkClass(next);   // #36 同步 empty / sys（编辑后可能已不是系统标记）
+      el.title = remarkTitle(next);
       toast(next ? "备注已保存" : "备注已清除");
     } else {
       el.textContent = cur || "＋ 添加备注";

@@ -165,7 +165,7 @@ BilibiliHistoryFinder/
 
 ## 7. 文档索引
 
-> **方案文档（`doc/` 根：三份方案，按后端/前端/油猴三轴拆分，各带总览+阶段；另有一份当前阶段待办清单）**：
+> **方案文档（`doc/` 根：三份方案，按后端/前端/油猴三轴拆分，各带总览+阶段；另有当前阶段待办清单 + 一份轻量化讨论输入）**：
 > 早期评估稿、架构分析、规则分析、源码评估报告等已**吸收进这三份方案并归档至 `doc/archive/`**，不再单独维护。
 
 | 文档 | 内容 |
@@ -174,10 +174,11 @@ BilibiliHistoryFinder/
 | `doc/方案-前端.md` | 方案·前端轴：现有网页能力、历史展示页、高级筛选器超集（已落地）、控制触发 UI 变更量、独立前端全量设计评估 |
 | `doc/方案-油猴D.md` | 方案·油猴轴：最终轻量形态（Phase 2 规划，尚未动手）、IndexedDB 双存储、引擎 JS 移植 |
 | `doc/待办-当前阶段.md` | 当前阶段待办清单（不含 Phase 2 油猴 D）；供逐项标注「怎么做 / 是否做」 |
+| `doc/方案-Finder轻量化.md` | **讨论输入**（2026-09-26）：单 Finder（独立）与 Finder+Analyzer 组合在**同一功能面**上的逐项对比 —— 实现者、需补代码量、凭证归属、失效面、维护面，以及组合模式下 Finder 现存包袱的实读体量（可减总量 ≈650 行）。**尚未形成方案** |
 
 **源码副本（只读参考，非文档）**：`doc/BilibiliHistoryFetcher-master/`（Analyzer/Fetcher 后端源码）、`doc/BiliHistoryFrontend-master/`（开源前端，Tauri/Vue3）。二者为整份源码副本，供评估与字段/接口核对用。
 
-**开发工具（`dev/`，非文档）**：`regression_restart.py` —— **⑥ 重启链路的常驻回归**（2026-09-25 由 `_verify_restart.py` 更名，转为正式资产）。跑法 `python dev/regression_restart.py`。它只绑 `127.0.0.1` 随机端口，**不启动对外服务、不读写任何历史数据**，所有写盘重定向到临时目录；断言生产拓扑（真实 `ThreadingHTTPServer` + 主线程 `serve_forever` + 工作线程发起重启）连跑 3 次退出码均为哨兵 **42**，并以旧设计对照（**0/0/0**，即线上 bug 的复现）。`stub_fetcher.py` 为接口桩。
+**开发工具（`dev/`，非文档）**：`regression_restart.py` —— **⑥ 重启链路的常驻回归**（2026-09-25 由 `_verify_restart.py` 更名，转为正式资产）。跑法 `python dev/regression_restart.py`。它只绑 `127.0.0.1` 随机端口，**不启动对外服务、不读写任何历史数据**，所有写盘重定向到临时目录；断言生产拓扑（真实 `ThreadingHTTPServer` + 主线程 `serve_forever` + 工作线程发起重启）连跑 3 次退出码均为哨兵 **42**，并以旧设计对照（**0/0/0**，即线上 bug 的复现）。`mock_analyzer.py` —— **② 自动回退的离线复现桩**（2026-09-26 新增，与前者同级）：假扮 Analyzer，增量接口固定回「未找到本地历史记录」以逼出回退分支，全量接口默认返回 `503`（→ Finder 侧判定 `ok=false`，不触发 `post`，故测试**零副作用**；`set BHF_MOCK_FULL=200` 可放行全量）。只绑 `127.0.0.1`（默认 8790），不连 B站、不读写任何真实历史库；跑法与还原步骤见 `doc/待办-当前阶段.md` §6.2。`regression_fallback.py` —— **② 自动回退（增量 → 全量）的端到端回归**（2026-09-26 新增，与前者同级）。跑法 `python dev/regression_fallback.py`。它**真起 `server.Handler` + 真发 HTTP 请求**（不复制判定逻辑，避免测到副本）；**base 走内存覆盖 `FETCHER_OVERRIDE`**，因此 `data/fetcher_config.json` 一字节不动——省掉手工测法「改配置 → 必须还原」整步。三条用例互相对照：缺基线**必须**回退、基线正常**不得**回退、其它错误**不得**回退；`_after_data_pull`（唯一会真写备份 + reload 的函数）以记录桩替换，跑完核对 config md5 / `data/run/` / `data/backup/` 零污染。`stub_fetcher.py` 为接口桩。四个脚本的**用途、跑法、共同安全约定与写新回归脚本的经验**见 **`dev/README.md`**（测试资产手册）。
 
 **归档溯源（`doc/archive/`，仅作历史参考，内容已并入上述三方案）**：
 - `方案定稿-前后端分离前-2026-08-24.md`（拆分前单文件定稿）

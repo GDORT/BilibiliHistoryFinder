@@ -234,7 +234,7 @@ def get_raw():
     return RAW_CACHE["records"]
 
 
-# ===================== 数据源主开关（#21，见 说明-主备架构与数据模式.md §3） =====================
+# ===================== 数据源主开关（#21，见 doc/archive/说明-主备架构与数据模式.md §3） =====================
 # auto     ：Analyzer 有数据 → 以 Analyzer 为主源、本地库补齐；Analyzer 空/不可达 → 自动降级本地只读
 # analyzer ：强制 Analyzer 为主源（本地仅补齐）
 # local    ：强制只用本地 Finder 库（模式 B：自身抓取，需有效 SESSDATA）
@@ -273,7 +273,7 @@ def _pick_sources(mode, analyzer, local):
     """按模式决定合并策略，返回 (records_dict, effective_mode)。
 
     auto 的降级判据用「Analyzer 是否读到记录」而非「库文件是否存在」——
-    与 说明-主备架构与数据模式.md §6 的提醒一致：路径配错时不会假装有数据。
+    与 doc/archive/说明-主备架构与数据模式.md §6 的提醒一致：路径配错时不会假装有数据。
     """
     if mode == "local":
         return dict(local), "local"
@@ -285,14 +285,67 @@ def _pick_sources(mode, analyzer, local):
     return dict(local), "local"
 
 
-def source_status():
-    """当前数据源状态（供 /api/data-source 展示；纯读，不触库）。"""
+def analyzer_db_diagnosis():
+    """#37：区分「路径配错」与「Analyzer 确实没有数据」。
+
+    两者在前端表现**完全相同**（都读不到记录 → auto 静默降级 local），但排查方向相反：
+    前者要改 `data/source_config.json` 的 `analyzer_db`，后者要去让 Analyzer 跑一次抓取。
+    全程只做 read-only 探测（`mode=ro`），不写任何文件。
+    """
+    p = ANALYZER_DB
+    if not os.path.exists(p):
+        return {
+            "level": "error", "code": "path_missing",
+            "message": "Analyzer 库路径不存在：%s —— 这属于「路径配错」，不是「Analyzer 没有数据」。"
+                       "改 data/source_config.json 的 analyzer_db，或设环境变量 ANALYZER_DB。" % p,
+        }
+    if not os.path.isfile(p):
+        return {"level": "error", "code": "not_a_file",
+                "message": "Analyzer 库路径指向的不是文件：%s。" % p}
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % p.replace("\\", "/"), uri=True)
+    except Exception as e:  # noqa
+        return {"level": "error", "code": "unreadable",
+                "message": "Analyzer 库打不开：%s（%s）" % (p, e)}
+    try:
+        cur = con.cursor()
+        try:
+            tables = _list_base_year_tables(cur)
+        except Exception as e:  # noqa
+            return {"level": "error", "code": "not_analyzer_db",
+                    "message": "该文件不是 Analyzer 库（读不到年表）：%s。" % e}
+        if not tables:
+            return {"level": "error", "code": "no_year_tables",
+                    "message": "该文件不是 Analyzer 库（没有 bilibili_history_YYYY 年表）：%s。" % p}
+        total = 0
+        for tb in tables:
+            try:
+                total += cur.execute('SELECT COUNT(*) FROM "%s"' % tb).fetchone()[0]
+            except Exception:  # noqa
+                pass
+        if total == 0:
+            return {"level": "warn", "code": "empty",
+                    "message": "Analyzer 库可读，但 %d 张年表全为空 —— 先让 Analyzer 跑一次抓取。" % len(tables)}
+        return {"level": "ok", "code": "ok",
+                "message": "Analyzer 库正常：%d 张年表、%d 条记录。" % (len(tables), total)}
+    finally:
+        con.close()
+
+
+def source_status(with_diagnosis=False):
+    """当前数据源状态（供 /api/data-source 展示）。
+
+    `with_diagnosis=False`（默认）时**完全不触库**，保持原有契约；
+    为 True 时附带 `diagnosis` —— read-only 探测 Analyzer 库（见 `analyzer_db_diagnosis`）。
+    """
     st = dict(_LAST_SOURCE)
     st["modes"] = list(SOURCE_MODES)
     st["analyzer_db"] = ANALYZER_DB
     st["analyzer_db_exists"] = os.path.exists(ANALYZER_DB)
     st["local_db"] = LOCAL_DB
     st["local_db_exists"] = os.path.exists(LOCAL_DB)
+    if with_diagnosis:
+        st["diagnosis"] = analyzer_db_diagnosis()
     return st
 
 

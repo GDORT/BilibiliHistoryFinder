@@ -1099,7 +1099,9 @@ def _health_payload(with_sessdata=True):
         res["sessdata"] = {"state": "unknown", "reason": "Analyzer 不可达",
                            "owner": "Analyzer(config.yaml)"}
     try:
-        res["source"] = store.source_status()
+        # #37：带上 diagnosis（read-only 探测 Analyzer 库路径），让前端能区分
+        # 「路径配错」与「Analyzer 没有数据」——这两者在日志里长得一模一样。
+        res["source"] = store.source_status(with_diagnosis=True)
     except Exception as e:  # noqa
         res["source"] = {"error": str(e)}
     return res
@@ -1414,7 +1416,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "mode": store.get_source_mode(),
                 "modes": list(store.SOURCE_MODES),
-                "status": store.source_status(),
+                "status": store.source_status(with_diagnosis=True),
             })
             return
         if path == "/api/fetcher-trigger":
@@ -1645,10 +1647,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # noqa
                 self._send(200, {"ok": False, "error": "切换后重载失败：%s" % e,
                                  "mode": store.get_source_mode(),
-                                 "status": store.source_status()})
+                                 "status": store.source_status(with_diagnosis=True)})
                 return
             self._send(200, {"ok": True, "mode": store.get_source_mode(),
-                             "status": store.source_status(),
+                             "status": store.source_status(with_diagnosis=True),
                              "banner": store.get_meta_banner(store.get_raw())})
             return
 
@@ -1693,7 +1695,10 @@ class Handler(BaseHTTPRequestHandler):
             # 轻量级自主备份：对 Finder 依赖的 Analyzer 主源 + 本地库做一致快照
             try:
                 manifest = _create_backup()
-                self._send(200, {"ok": True, "manifest": manifest})
+                # #35：手动备份同样执行「只保留最近 N 份」。此前 _prune_backups 只挂在
+                # 自动路径（_maybe_auto_backup），手动连点会无限堆积，与策略不一致。
+                removed = _prune_backups(_load_backup_policy().get("keep"))
+                self._send(200, {"ok": True, "manifest": manifest, "pruned": removed})
             except Exception as e:  # noqa
                 self._send(500, {"ok": False, "error": f"备份失败：{e}"})
             return
