@@ -2177,9 +2177,19 @@ $("srcSave").addEventListener("click", () => {
   }).then((r) => r.json()).then((s) => {
     if (s && s.ok) {
       const x = s.status || {};
-      st.textContent = "● 已切换为 " + s.mode + "（实际生效 " + (x.effective || "?") +
+      const msg = "已切换为 " + s.mode + "（实际生效 " + (x.effective || "?") +
         "，合并 " + (x.merged || 0) + " 条）";
-      st.className = "fld-status ok";
+      // C-H3（2026-10-01 复核修）：后端已如实回报 persisted，前端此前只判顶层 ok →
+      // 写盘失败时界面照报"已保存"，F-H2 补的落盘结果成了**死数据**。
+      // 注意这里**不能**当成"切换失败"：模式已在内存生效、reload 也成功了，
+      // 只是没写进 data/source_config.json —— 重启后会退回旧值，必须这么说清楚。
+      if (s.persisted === false) {
+        st.textContent = "● " + msg + "，但配置未写入文件（重启后会退回旧值）";
+        st.className = "fld-status bad";
+      } else {
+        st.textContent = "● " + msg;
+        st.className = "fld-status ok";
+      }
       refreshSourceHealth();
       load(true);
     } else {

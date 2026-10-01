@@ -49,7 +49,9 @@ RULES_FILE = os.path.join(PROJECT_ROOT, "data", "rules.json")
 AUTOSKIP_PROGRESS_FILE = os.path.join(PROJECT_ROOT, "data", "auto_skip_progress.json")
 
 # 同步状态（后台线程写，前端轮询读）
-sync_state = {"running": False, "last": None, "started_at": 0}
+# `no_baseline`：「上次增量报缺基线」标记 —— 阶段 2 由 /api/sync 的抓取分支置位，
+# 现在只被 store.decide_sync_plan() 的 R2 读取（恒 False = 该规则暂不触发）。
+sync_state = {"running": False, "last": None, "started_at": 0, "no_baseline": False}
 # 自动跳过应用状态（后台线程写，前端轮询读）
 autoskip_state = {"running": False, "last": None, "started_at": 0}
 
@@ -97,14 +99,41 @@ def validate_rule(rule):
 
 # ===================== 既有工具 =====================
 
-def _write_json_file(path, obj):
+def _write_json_file(path, obj, indent=None):
+    """原子写 JSON：同目录 `*.tmp` → `fsync` → `os.replace`。**全部配置写入的唯一入口**。
+
+    N-L3 / N-H1（2026-10-01 修）：
+    - **原子性**：`_persist_fetcher_override` / `_persist_source_config` 原本各自
+      `open(..., "w")` **直写**，写到一半崩溃 / 断电即留下半截 JSON，而读取侧又是
+      "解析失败 → 静默回落默认值" → 用户刚改的设置凭空消失。现统一走本函数。
+      （审查稿 §4 把"配置写入半写"整条判为"server 侧正确"，实际只对了一半：
+      `_write_json_file` 是对的，另两个写盘方不是。）
+    - **可观测**：`except Exception: pass` 会把"写失败"伪装成"已保存"（前端照样报成功）。
+      现在记一条失败并返回 False。
+      C-N8（2026-10-01 更正）：此处原写"既有调用方都不读返回值，故**零行为变更**" ——
+      该句**已过期**：`_persist_source_config()` 现在读它（`ok = _write_json_file(...)`），
+      并把结果作为 `persisted` 回给前端（`/api/data-source`）。行为确实变了一处，
+      但**只在"写盘失败"这条原本静默的路径上**：以前前端无论如何都收到 `ok:true`。
+      `_ensure_rules` / `_save_rules` / autoskip 进度等其余调用点仍不读返回值。
+    - `indent=None` 与旧行为逐字节一致（既有 6 个调用点全是紧凑格式）。
+    """
+    tmp = path + ".tmp"
     try:
-        tmp = path + ".tmp"
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False)
-        os.replace(tmp, path)
-    except Exception:
-        pass
+            json.dump(obj, f, ensure_ascii=False, indent=indent)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)          # 同目录替换 → 原子
+        return True
+    except Exception as e:
+        store.note_failure("server._write_json_file", e, "path=%s" % path)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
 
 
 def _job_running():
@@ -114,7 +143,10 @@ def _job_running():
 def get_db_path():
     try:
         cfg = collector.load_config(collector.DEFAULT_CONFIG)
-    except Exception:
+    except FileNotFoundError:
+        cfg = {}                   # 还没跑过 collector：正常态，不记失败
+    except Exception as e:
+        store.note_failure("server.get_db_path", e, "config=%s" % collector.DEFAULT_CONFIG)
         cfg = {}
     db = cfg.get("db_path") or collector.DEFAULT_DB
     if not os.path.isabs(db):
@@ -128,11 +160,15 @@ def get_web_port():
     历史上曾支持 `BHF_PORT` 环境变量覆盖（当初为「在不干扰在跑实例的前提下
     另起一个测试实例」而加），**2026-09-25 深夜已回退移除** —— 端口只由配置
     文件决定，不再受环境变量影响，避免环境里残留的值把服务引到别的端口。
+    （2026-10-01 复核：监听**地址**同理不加环境变量开关 —— 只绑回环，见 F-H1。）
     """
     try:
         cfg = collector.load_config(collector.DEFAULT_CONFIG)
         return int(cfg.get("web_port", 8765))
-    except Exception:
+    except FileNotFoundError:
+        return 8765                # 还没生成 config.json：正常态，不记失败
+    except Exception as e:
+        store.note_failure("server.get_web_port", e, "config=%s" % collector.DEFAULT_CONFIG)
         return 8765
 
 
@@ -889,18 +925,18 @@ def _load_fetcher_override():
             d = json.load(f) or {}
         FETCHER_OVERRIDE["base"] = d.get("base") or None
         FETCHER_OVERRIDE["key"] = d.get("api_key") or None
-    except Exception:
-        pass
+    except FileNotFoundError:
+        pass                       # 首次运行：正常态，**不记失败**
+    except Exception as e:
+        # N-H1：文件在、却解析失败 —— 这才是"静默用了默认后端"的根因，必须留痕
+        store.note_failure("server._load_fetcher_override", e, "path=%s" % _fetcher_cfg_path())
 
 def _persist_fetcher_override(base, key):
     FETCHER_OVERRIDE["base"] = base or None
     FETCHER_OVERRIDE["key"] = key or None
-    try:
-        os.makedirs(os.path.dirname(_fetcher_cfg_path()), exist_ok=True)
-        with open(_fetcher_cfg_path(), "w", encoding="utf-8") as f:
-            json.dump({"base": base or "", "api_key": key or ""}, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    # N-L3：改为原子写（旧实现直写，半截 JSON 会被下次启动静默当成"没配过"）
+    return _write_json_file(_fetcher_cfg_path(),
+                            {"base": base or "", "api_key": key or ""}, indent=2)
 
 _load_fetcher_override()
 
@@ -915,7 +951,12 @@ def _load_source_config():
     try:
         with open(_source_cfg_path(), "r", encoding="utf-8") as f:
             d = json.load(f) or {}
-    except Exception:
+    except FileNotFoundError:
+        d = {}                     # 首次运行：正常态，**不记失败**
+    except Exception as e:
+        # N-H1：解析失败会让 mode / analyzer_db **静默回落到默认值**
+        #（表现就是"我明明配了，怎么又变回 auto 了"），必须留痕。
+        store.note_failure("server._load_source_config", e, "path=%s" % _source_cfg_path())
         d = {}
     m = (d.get("mode") or "auto").strip().lower()
     if m in store.SOURCE_MODES:
@@ -930,17 +971,33 @@ def _load_source_config():
 
 
 def _persist_source_config(mode=None, analyzer_db=None):
-    cur = {"mode": store.get_source_mode(), "analyzer_db": store.ANALYZER_DB}
-    if mode:
-        cur["mode"] = mode
-    if analyzer_db:
-        cur["analyzer_db"] = analyzer_db
+    # C-H2（2026-10-01 复核修）：本函数与 `store.save_policy()` **写同一个文件** ——
+    # `store.POLICY_FILE`（store.py:433）与 `_source_cfg_path()` 都是
+    # `data/source_config.json`。旧实现**从零重建** `{mode, analyzer_db}`，
+    # 而 `save_policy()` 是"读旧 → 合并 policy/mode"：
+    # 两侧先后写，**先写的一方的字段会被后写的一方整片清掉**（配置静默丢字段）。
+    # 阶段 1 时 `save_policy()` 没有生产调用点，所以这雷是睡着的 ——
+    # 阶段 5 一接上就会炸。现在改为与它同一种语义：**读旧 → 只覆盖自己的两个键**。
+    cur = {}
     try:
-        os.makedirs(os.path.dirname(_source_cfg_path()), exist_ok=True)
-        with open(_source_cfg_path(), "w", encoding="utf-8") as f:
-            json.dump(cur, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        with open(_source_cfg_path(), "r", encoding="utf-8") as f:
+            cur = json.load(f) or {}
+    except FileNotFoundError:
+        cur = {}                       # 首次运行 / 尚未生成：正常态，**不记失败**
+    except Exception as e:
+        # N-H1：解析失败会让旧字段（含 `policy` 段）在本次写入中丢失，必须留痕
+        store.note_failure("server._persist_source_config:read", e,
+                           "path=%s" % _source_cfg_path())
+        cur = {}
+    if not isinstance(cur, dict):
+        cur = {}
+    cur["mode"] = mode or store.get_source_mode()
+    cur["analyzer_db"] = analyzer_db or store.ANALYZER_DB
+    # N-L3：改为原子写。返回 True/False —— 供 /api/data-source 如实回报"配置有没有真的落盘"
+    # （F-H2：旧实现 `except: pass`，写失败时前端照样收到 ok:true）。
+    # 注：`_persisted` 是**回给前端的运行态字段**，写在落盘**之后**，不会进文件。
+    ok = _write_json_file(_source_cfg_path(), cur, indent=2)
+    cur["_persisted"] = bool(ok)
     return cur
 
 
@@ -1105,6 +1162,196 @@ def _health_payload(with_sessdata=True):
     except Exception as e:  # noqa
         res["source"] = {"error": str(e)}
     return res
+
+
+# ============ 「连接即模式」阶段 1：探测层 + 只读端点（见 doc/方案-连接即模式.md D2） ============
+# 三层单向：probe_connection()（唯一做 IO）→ store.derive_capabilities()/decide_sync_plan()
+# （纯函数）→ 前端渲染（阶段 4 才切）。本段**纯增**：旧端点与旧按钮一行未动。
+
+def _finder_sessdata_status():
+    """Finder 侧凭证状态（对应未定项 T7）。
+
+    **阶段 1 契约：只做本地判定、绝不联网** —— 值域仅 `missing | present`。
+    `present` 只表示"`config.json` 里 SESSDATA 非空"，**不代表有效**。
+
+    键名统一为 `sessdata`（与 `store.derive_capabilities()` / `decide_sync_plan()` 的读取键
+    一致）—— 曾经这里叫 `state`，导致能力层读不到值、独立形态下 `fetch` 恒判为 `unknown`，
+    而 Analyzer 可达时又被 `reachable` 分支掩盖（由 dev/test_capabilities.py --live 抓出）。
+
+    为什么不在这里直连 B站 nav 做真实探测：
+      ① 本函数会被 `/api/capabilities` 以 5 分钟周期（`SRC_POLL_MS`）调用 —— 不该为"显示一个状态"
+         而周期性向 B站发请求；
+      ② 真实探测属阶段 2 的功能补齐 D 项（`方案-Finder轻量化.md` §7.3 步骤 3），
+         届时值域扩展为 `valid | invalid | missing | unknown`。
+    """
+    p = collector.DEFAULT_CONFIG
+    try:
+        cfg = collector.load_config(p) or {}
+    except Exception:
+        return {"sessdata": "missing", "owner": "finder(config.json)", "source": p,
+                "note": "config.json 不存在或不可读"}
+    s = (cfg.get("SESSDATA") if isinstance(cfg, dict) else "") or ""
+    if not str(s).strip():
+        return {"sessdata": "missing", "owner": "finder(config.json)", "source": p,
+                "note": "config.json 里 SESSDATA 为空"}
+    return {"sessdata": "present", "owner": "finder(config.json)", "source": p,
+            "note": "仅本地判定（已填写，未联网验证）"}
+
+
+def _int_or_none(v):
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def _sync_plan_state():
+    """`store.decide_sync_plan()` 的状态入参（**纯数据**，便于单测整体替换）。"""
+    meta = {}
+    try:
+        meta = get_sync_meta()
+    except Exception:
+        pass
+    lmeta = {}
+    try:
+        lmeta = store.local_meta(["last_success_at", "last_full_sync", "span_peak_days"])
+    except Exception:
+        pass
+    return {
+        "now": int(time.time()),
+        "last_success_at": _int_or_none(lmeta.get("last_success_at")) or meta.get("last_success_at"),
+        "last_full_at": _int_or_none(lmeta.get("last_full_sync")),
+        # 阶段 2 接上：由 /api/sync 的抓取分支在命中「未找到本地历史记录」时置位。
+        "last_incremental_no_baseline": bool(sync_state.get("no_baseline")),
+        "local_count": meta.get("local_backup") or 0,
+        # R3 的输入：本地库历史跨度峰值（毫秒级维护见阶段 2）。阶段 1 恒为 None → R3 不触发，
+        # 这是**有意的保守**（理由见 store.decide_sync_plan 里对 R3 的说明）。
+        "span_peak_days": _int_or_none(lmeta.get("span_peak_days")),
+    }
+
+
+def probe_connection(with_sessdata=True):
+    """探测层：**全项目唯一做网络 IO 的地方**（D2 三层架构的第一层）。
+
+    纯只读：`GET /health` ＋（可选）`GET /login/check`；**不触发任何抓取、不写任何库/文件**。
+    产出结构化 probe dict，交给两个纯函数消费（`store.derive_capabilities` /
+    `store.decide_sync_plan`）—— 网络 IO 全部集中在此，可测性由此保证。
+    """
+    health = _forward_fetcher("/health", timeout=5)
+    health = dict(health) if isinstance(health, dict) else {"ok": False, "reachable": False}
+    reachable = bool(health.get("reachable"))
+    base, _key = _fetcher_cfg()
+
+    try:
+        diag = store.analyzer_db_diagnosis()
+    except Exception as e:  # noqa
+        diag = {"level": "error", "code": "probe_failed",
+                "message": "%s: %s" % (type(e).__name__, e)}
+
+    if with_sessdata and reachable:
+        ana_sess = _sessdata_status()
+    else:
+        ana_sess = {"state": "unknown", "reason": "Analyzer 不可达",
+                    "owner": "Analyzer(config.yaml)"}
+
+    now = int(time.time())
+    # 先确保数据已加载：`source_status()` 读的是 `_LAST_SOURCE`（上一轮 reload 的结论），
+    # 首次调用时它是初始值（merged=0 / effective=None）→ 会**谎报**（#39 同类问题）。
+    # `get_raw()` 只读库且走模块缓存，成本可接受。
+    try:
+        store.get_raw()
+    except Exception:
+        pass
+    try:
+        a_span = store.analyzer_span_days(now=now)
+    except Exception:
+        a_span = {"count": 0, "oldest": None, "days": None}
+    try:
+        l_span = store.local_span_days(now=now)
+    except Exception:
+        l_span = {"count": 0, "oldest": None, "days": None}
+    try:
+        src = store.source_status(with_diagnosis=True)
+    except Exception as e:  # noqa
+        src = {"error": str(e)}
+    lmeta = {}
+    try:
+        lmeta = store.local_meta(["last_success_at", "last_full_sync", "span_peak_days"])
+    except Exception:
+        pass
+
+    a_days, l_days = a_span.get("days"), l_span.get("days")
+    gap_days = (int(a_days) - int(l_days)) if (a_days is not None and l_days is not None) else None
+
+    return {
+        "connection": {
+            "analyzer": {
+                "reachable": reachable,
+                "base": base,
+                "health_status": health.get("status"),
+                "error": health.get("error"),
+                "db_count": a_span.get("count") or 0,
+                "diagnosis": diag,
+            },
+            "finder": dict(_finder_sessdata_status(),
+                           db_count=l_span.get("count") or 0,
+                           last_success_at=_int_or_none(lmeta.get("last_success_at"))),
+        },
+        "data": {
+            "analyzer": a_span.get("count") or 0,
+            "local": l_span.get("count") or 0,
+            "merged": src.get("merged") or 0,
+            "effective": src.get("effective"),
+            "span": {
+                "analyzer_days": a_days,
+                "local_days": l_days,
+                # 结构性跨度差（主源深度 − 本地深度）。**只作展示与说明**，不作决策依据
+                # —— 拿它当"缺口"会让 R3 永久误触发（见 store.decide_sync_plan 的注释）。
+                "gap_days": gap_days,
+                "analyzer_oldest": a_span.get("oldest"),
+                "local_oldest": l_span.get("oldest"),
+                "peak_days": _int_or_none(lmeta.get("span_peak_days")),
+            },
+        },
+        "sessdata": {"analyzer": ana_sess,
+                     "owner": ana_sess.get("owner"),
+                     "state": ana_sess.get("state")},
+        "source": src,
+    }
+
+
+def capabilities_payload(with_sessdata=True):
+    """`GET /api/capabilities` 的响应体（阶段 1 的只读端点，D2）。
+
+    **超集兼容**（排序约束 #2）：除新结构外，顶层原样带上旧 `/api/fetcher-health` 的
+    `reachable` / `status` / `source` —— 这样阶段 4 切换前端那一笔**不必改下游函数**。
+    """
+    probe = probe_connection(with_sessdata=with_sessdata)
+    policy = store.load_policy()
+    state = _sync_plan_state()
+    # R1 的 `local_count` 取**本地库真实行数**（probe 已查得），而非 `get_meta_banner()` 的
+    # `local_backup`（= 合并后仍归因本地的条数，实测 464 vs 真实 2865，语义不同）。
+    if probe["data"].get("local") is not None:
+        state["local_count"] = probe["data"]["local"]
+    ana = probe["connection"]["analyzer"]
+    return {
+        "ok": True,
+        # 只读结论：Analyzer 可达 → 组合形态；不可达 → 独立形态
+        "mode": "combined" if ana.get("reachable") else "standalone",
+        "connection": probe["connection"],
+        "data": probe["data"],
+        "policy": policy,
+        "plan": store.decide_sync_plan(probe, policy, state),
+        # 说明性结论（不参与决策）：把"主源/本地跨度差是结构性差异、要长尾得做迁移"
+        # 这件事在运行时直接告诉用户，而不是让人以为多点几次同步就能补回来。
+        "advisory": store.span_advisory(probe["data"].get("span")),
+        "sessdata": probe["sessdata"],
+        "capabilities": store.derive_capabilities(probe),
+        # ---- 以下为旧 /api/fetcher-health 的顶层字段（过渡期兼容，阶段 5 收敛时移除）----
+        "reachable": ana.get("reachable"),
+        "status": ana.get("health_status"),
+        "source": probe["source"],
+    }
 
 
 def _analyzer_integrity_check():
@@ -1323,6 +1570,15 @@ def _list_backups():
 
 
 
+# C-H1（2026-10-01 复核修）：POST 请求体大小上限。
+# 本服务是**单用户本机工具**，所有合法请求体都在 KB 级（规则 JSON / 模式切换 / 备注文本）——
+# 1 MB 是宽松到不可能误伤的上限。旧实现（沿袭至今）直接 `self.rfile.read(length)`，
+# 于是任何能访问本端口的进程都能用一个超大 Content-Length 把内存吃掉：
+# 请求体是**未经鉴权的**（本服务无鉴权），这条路径不能没有上限。
+# 超限时**先回 413 再断开**，不把那 2 GB 读进内存。
+MAX_POST_BODY = 1_000_000
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):  # 静默默认访问日志
         pass
@@ -1409,6 +1665,13 @@ class Handler(BaseHTTPRequestHandler):
             # 探测本机 Analyzer/Fetcher 后端是否可达（8899/health）
             # #27：同时附带凭证健康（?sessdata=0 可跳过）与数据源实际生效模式
             self._send(200, _health_payload(with_sessdata=flat.get("sessdata", "1") != "0"))
+            return
+        if path == "/api/capabilities":
+            # 「连接即模式」阶段 1（**纯增、只读**）：连接 → 能力 → 策略 三层结论。
+            # 旧端点 /api/fetcher-health 与 GET /api/data-source 一行未动（超集兼容期）。
+            # ?sessdata=0 可跳过 Analyzer 凭证探测（与 fetcher-health 同参数）。
+            self._send(200, capabilities_payload(
+                with_sessdata=flat.get("sessdata", "1") != "0"))
             return
         if path == "/api/data-source":
             # #21 数据源主开关：读取当前模式 + 实际生效数据源（纯读）
@@ -1561,12 +1824,48 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
+        # F-H3（2026-10-01 修）：请求体解析失败**不得**静默退化成 `{}`。
+        # 旧实现一行 `except Exception: body = {}`，后果是脏请求被当成"空操作"继续往下跑，
+        # 多数入口还会回 `ok: true` —— 表现为"点了没反应，但界面说成功"，是最难排查的一类失败。
+        # 现在明确区分三种情况：
+        #   ① 空体 / 无 Content-Length → **合法**（等价 `{}`）：有些入口本就不需要 body；
+        #   ② 非空、但不是合法 JSON → 400，不带病往下走；
+        #   ③ 是合法 JSON、但顶层不是对象（如 `[1,2]`）→ 400 —— 旧实现会一路传到
+        #      `body.get(...)` 处才炸成 AttributeError（500 / 断连），现在提前拦住。
+        #   ④（C-H1 / C-M1，2026-10-01 复核修）**长度**与**空白**这两处收尾：
+        #      旧实现 `read(length)` 无上限（超大 body 可吃满内存），且 `raw.strip()` 让
+        #      纯空白（如 `"   "`）被当成"合法空体"绕过 400 —— 与 ①②③ 同族：**"错"被当"空"**。
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
-            raw = self.rfile.read(length) if length else b"{}"
-            body = json.loads(raw or b"{}") if raw else {}
-        except Exception:
+        except (TypeError, ValueError):
+            self._send(400, {"ok": False, "error": "Content-Length 非法"})
+            return
+        if length < 0:
+            self._send(400, {"ok": False, "error": "Content-Length 不能为负"})
+            return
+        if length > MAX_POST_BODY:
+            self.close_connection = True    # 不回读 body → 必须断连，避免残留字节污染下一个请求
+            self._send(413, {"ok": False,
+                             "error": "请求体过大（%d 字节 > 上限 %d）" % (length, MAX_POST_BODY)})
+            return
+        try:
+            raw = self.rfile.read(length) if length > 0 else b""
+        except Exception as e:  # noqa
+            self._send(400, {"ok": False, "error": "读取请求体失败：%s" % e})
+            return
+        if not raw:                         # 空体才合法；纯空白不再算"空"
             body = {}
+        else:
+            try:
+                body = json.loads(raw)
+            except Exception as e:  # noqa
+                self._send(400, {"ok": False, "error": "请求体不是合法 JSON：%s" % e})
+                return
+            if not isinstance(body, dict):
+                self._send(400, {"ok": False,
+                                 "error": "请求体顶层必须是 JSON 对象，收到 %s"
+                                          % type(body).__name__})
+                return
 
         if parsed.path == "/api/apply":
             # ① 单入口「应用变更」：自动判定热重载 or 重启；?force=reload|restart 为 API 级逃生口
@@ -1630,7 +1929,15 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/data-source":
-            # #21 数据源主开关：切换模式（可选改 Analyzer 库路径）→ 持久化 + 立即 reload（不重启）
+            # #21 数据源主开关：切换模式（可选改 Analyzer 库路径）→ **先校验 → 再生效 → 最后落盘**
+            #
+            # F-H2（2026-10-01 修）：旧顺序是「改内存 → 落盘 → reload」，两个问题：
+            #   ① `analyzer_db` **完全没有校验**（路径拼错、指向非 sqlite、指向非 Analyzer 库
+            #      一律照单全收）；② 坏路径**已经写进 source_config.json**，reload 就算失败，
+            #      重启后依旧是坏的 —— 于是"改错路径"变成一个**跨进程、且无法自愈**的状态。
+            #       #37 的 diagnosis 只解决了"看得见"，没解决"挡得住"。
+            # 新顺序：候选路径先做**只读探测**（复用 `store.analyzer_db_diagnosis`，error 级直接 400）
+            # → 内存生效 → reload 失败则**回滚到旧值并重载**、且**不落盘** → 只有 reload 成功才持久化。
             mode = (body.get("mode") or "").strip().lower()
             db = (body.get("analyzer_db") or "").strip()
             if mode and mode not in store.SOURCE_MODES:
@@ -1638,18 +1945,44 @@ class Handler(BaseHTTPRequestHandler):
                                  "error": "mode 必须是 %s 之一" % (list(store.SOURCE_MODES),)})
                 return
             if db:
+                # 只读探测候选路径：路径不存在 / 不是文件 / 打不开 / 读不到年表 → error
+                #（"年表全为空"是 warn，属合法状态：库没问题，只是还没抓过）
+                diag = store.analyzer_db_diagnosis(db)
+                if diag.get("level") == "error":
+                    self._send(400, {"ok": False,
+                                     "error": "Analyzer 库不可用（已拒绝，配置未改动）：%s"
+                                              % diag.get("message"),
+                                     "diagnosis": diag,
+                                     "mode": store.get_source_mode(),
+                                     "status": store.source_status(with_diagnosis=True)})
+                    return
+            old_db, old_mode = store.ANALYZER_DB, store.get_source_mode()
+            if db:
                 store.ANALYZER_DB = db
             if mode:
                 store.set_source_mode(mode)
-            _persist_source_config(mode=mode or None, analyzer_db=db or None)
             try:
                 reload_all()
             except Exception as e:  # noqa
-                self._send(200, {"ok": False, "error": "切换后重载失败：%s" % e,
+                # 回滚内存并重载 → 服务停在"改之前"的可用状态，且**不写盘**
+                store.ANALYZER_DB = old_db
+                try:
+                    store.set_source_mode(old_mode)
+                except Exception:
+                    pass
+                try:
+                    reload_all()
+                except Exception:  # noqa
+                    pass
+                self._send(200, {"ok": False,
+                                 "error": "切换后重载失败（已回滚，配置未写入）：%s" % e,
+                                 "rolled_back": True,
                                  "mode": store.get_source_mode(),
                                  "status": store.source_status(with_diagnosis=True)})
                 return
+            saved = _persist_source_config(mode=mode or None, analyzer_db=db or None)
             self._send(200, {"ok": True, "mode": store.get_source_mode(),
+                             "persisted": bool(saved.get("_persisted")),
                              "status": store.source_status(with_diagnosis=True),
                              "banner": store.get_meta_banner(store.get_raw())})
             return
@@ -1849,11 +2182,18 @@ def main():
             _safe_print("[B站历史查看器] 首次启动：已按当前规则固化『已应用』状态")
         except Exception as e:  # noqa
             _safe_print(f"[B站历史查看器] 首次校准失败：{e}")
-    # 双栈绑定
+    # 监听地址（F-H1，2026-10-01 修）：**只绑回环**。
+    # 旧顺序 ("::", "0.0.0.0", "127.0.0.1") 几乎总是命中前两项 —— 本机 `data/run/restart.log`
+    # 连续 5 条 `listen on 0.0.0.0:8765` 即为实证 —— 服务实际监听**全网卡**：同网段任何人
+    # 可读全部历史、改 skip/备注、触发抓取，乃至 `POST /api/apply` 重启服务；而启动横幅与
+    # README 都宣称 127.0.0.1，暴露面被文案盖住，这是最危险的一种"看起来没事"。
+    # 现改为先 IPv4 回环、再 IPv6 回环（::1 仅为 IPv6-only 环境兜底）。
+    # 刻意**不加**环境变量开关：与 2026-09-25 移除 `BHF_PORT` 的既有决定保持一致 ——
+    # 「环境里残留的值把服务引到别处」比"偶尔想跨设备访问"更常见，真要开也应是显式配置项。
     server = None
     bind_host = None
     last_err = None
-    for _host in ("::", "0.0.0.0", "127.0.0.1"):
+    for _host in ("127.0.0.1", "::1"):
         try:
             server = ThreadingHTTPServer((_host, port), Handler)
             bind_host = _host
@@ -1872,10 +2212,14 @@ def main():
         time.sleep(0.25)        # 给守护线程一点时间把上面这句写出去（该路径随即退出）
         sys.exit(1)
     banner = store.get_meta_banner(store.get_raw())
+    # F-H1：横幅**如实**显示实际监听地址。旧版无论绑到哪都写死 `http://127.0.0.1:{port}`，
+    # 正是"暴露面被文案掩盖"的那一半 —— 现在日志与横幅都以真实 `bind_host` 为准。
+    _disp = ("[%s]" % bind_host) if ":" in bind_host else bind_host
+    _also_local = ("  (也可访问 http://localhost:%d)" % port) if bind_host in ("127.0.0.1", "::1") else ""
     lines = [
         f"[B站历史查看器] 实例: boot_id={BOOT_ID}  pid={os.getpid()}  code={_code_version()}  "
         f"supervised={'yes' if _is_supervised() else 'no'}",
-        f"[B站历史查看器] 已启动: http://127.0.0.1:{port}  (也可访问 http://localhost:{port})",
+        f"[B站历史查看器] 已启动: http://{_disp}:{port}{_also_local}",
         f"[B站历史查看器] 数据源: Analyzer(主,只读)={banner['analyzer']} 条 + "
         f"本地Finder(备份,只读)={banner['local_backup']} 条 → 合并 {banner['total']} 条",
         f"[B站历史查看器] Analyzer 库: {banner['analyzer_db']}",
@@ -1886,6 +2230,10 @@ def main():
                      f"自上次应用以来新增未套用(dirty_count)={st.get('dirty_count')}")
     except Exception:
         pass
+    if bind_host not in ("127.0.0.1", "::1"):
+        # 将来若有人重新放开非回环绑定，这里必须**大声**提示（本服务无鉴权 / 无 CSRF）
+        lines.append("[B站历史查看器] ⚠️ 监听地址非回环(%s)：本服务无鉴权，同网段可直接读写全部数据。"
+                     % bind_host)
     lines.append(f"[B站历史查看器] 控制台: {CONSOLE_INFO.get('note')}")
     lines.append("[B站历史查看器] 按 Ctrl+C 停止（关闭本窗口也会停止服务）")
     _log_restart_file("boot ok -> listen on %s:%d" % (bind_host, port))
