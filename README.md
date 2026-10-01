@@ -1,7 +1,7 @@
 # BilibiliHistoryFinder — B站历史查看器（原型版）
 
 > **状态：原型阶段（Prototype）**。本仓库为「续看 / 历史筛选分类」规则的**原型实现**：用纯 Python 标准库把 B站观看历史抓到本地、长期留存，并用一个类 B站网页端的界面浏览、搜索、筛选，找出「还没看完」的视频。
-> 后续正式版路线见 `doc/方案-后端与数据源.md`、`doc/方案-前端.md`、`doc/方案-油猴D.md`（按后端/前端/油猴三轴拆分，各带总览+阶段）；本 README 只描述**当前原型**的使用与结构。
+> 后续正式版路线见 **[`doc/README.md`](file:///d:/Programs/Share/BilibiliHistoryFinder/doc/README.md)**（文档总入口：`现状.md` 写"现在是什么" · `方案.md` 写"要做什么" · `adr/` 记已拍板决策 · `log/` 存过程记录）；本 README 只描述**当前原型**的使用与结构。
 
 ---
 
@@ -24,8 +24,8 @@
 > 本仓库现阶段**读取的权威数据来自 Analyzer**（见 §4）。因此**主用凭证是 Analyzer 的 `config/config.yaml` 里的 SESSDATA**，**不是**本仓库根 `config.json`。
 
 1. **主用（权威）：Analyzer 的 `config.yaml`**。若已装 BilibiliHistoryAnalyzer 后台，SESSDATA 填在这里（服务端读取，网页/前端都不碰凭证）。过期后在 Analyzer 侧重填即可。
-2. **遗留（不推荐）：本仓库根 `config.json`**。仅供 `collector.py`（本地备份采集）使用，**当前该份已失效**（同步会报接口 `-101`）；按「计划 A」它将被停用（见 `doc/方案-后端与数据源.md` §7.4）。**新用户不必再填这份。**
-   > **计划 A 已实现（2026-09-25，§7.11.2）**：数据源切换到 `auto`/`analyzer` 时，网页「同步数据」按钮**不再运行 `collector.py`**，改为转发 Analyzer 全量拉取——即 Finder 侧不再使用这份遗留凭证。**只有**把数据源模式显式切成 `local`（模式 B：自身抓取）时才需要它有效。
+2. **遗留（不推荐）：本仓库根 `config.json`**。仅供 `collector.py`（本地备份采集）使用，**当前该份已失效**（同步会报接口 `-101`）；`collector.py` 本身**保留**（决策见 `doc/adr/0004`），仅 `local` 模式使用；`auto`/`analyzer` 模式下不调用它。**新用户不必再填这份。**
+   > **凭证单一化已实现（2026-09-25）**：数据源切换到 `auto`/`analyzer` 时，网页「同步数据」按钮**不再运行 `collector.py`**，改为转发 Analyzer 全量拉取——即 Finder 侧不再使用这份遗留凭证。**只有**把数据源模式显式切成 `local`（模式 B：自身抓取）时才需要它有效。
    > 凭证健康可在网页顶部横幅直接看到（🟢 正常 / 🔴 失效 / 🔴 Analyzer 不可达）；Analyzer 侧另有 `scheduler_config.yaml` 每 10 分钟检查并按邮件告警。
 
 取值方式（两份通用）：
@@ -50,7 +50,7 @@
 ### 2.3 手动启动（等价命令）
 ```bash
 # 0) 数据来源：主源是 Analyzer（read-only 直连），本仓库不负责拉取；仅当无 Analyzer 时才用 collector 兜底。
-#    （collector 为遗留路径，其 config.json 的 SESSDATA 当前已失效 → 计划 A 待停用，见 doc/方案-后端与数据源.md §7.4）
+#    （collector 为遗留路径，其 config.json 的 SESSDATA 当前已失效；collector 保留、仅 local 模式用，见 doc/adr/0004）
 python src/collector.py --config config.json
 
 # 启动 Web 服务（默认端口 8765）
@@ -72,7 +72,7 @@ python src/server.py
 - **搜索**：按标题或 UP主名实时搜索。
 - **⚙ 续看规则**：右侧抽屉编辑规则；橙色圆点＝待应用，数字＝脏计数（自上次应用以来未标记的新记录）。
 - **同步数据 / 全量重建**：增量同步 / 强制全量校准"仅本地存档"标记。
-  **计划 A 已实现（§7.11.2）**：数据源模式为 `auto`/`analyzer` 时**不再运行本仓库 collector**，改走 Analyzer 全量（中继）；仅 `local` 模式才用本地 collector。
+  **凭证单一化已实现**：数据源模式为 `auto`/`analyzer` 时**不再运行本仓库 collector**，改走 Analyzer 全量（中继）；仅 `local` 模式才用本地 collector（`collector.py` 保留，见 `doc/adr/0004`）。
 - **Analyzer 联调（①–⑪）**：① 健康探测 ② 增量拉取 ③ 全量拉取 ④ 数据自检 ⑤ 本地备份 / 查看备份 ⑧ 导出 Excel ⑨ 下载整库 ⑩ 图片状态 ⑪ 下载图片 / 停止 —— 经本机 Analyzer（`:8899`）中继，详见 `doc/方案-前端.md` §6。
   - **⑧⑨ 导出**：转发 Analyzer `/export/*`，**Finder 自己不生成 Excel**（避免第二份口径）。
   - **⑩⑪ 图片**：转发 `/images/*`；封面/头像属公开内容，⑪ 默认 `use_sessdata=false`（**不消耗凭证**），且为**写盘操作**，会二次确认。
@@ -105,7 +105,7 @@ BilibiliHistoryFinder/
 │   ├── server.py         # 本地 Web 服务（http.server）：/api/* 历史/规则/跳过/查询 + Analyzer 中继/自检/备份
 │   ├── store.py          # 只读数据层：读 Analyzer(主) + 本地库(备份) 合并 → canonical；按 bvid 折叠
 │   ├── engine.py         # 续看规则引擎（纯逻辑，无 I/O）
-│   ├── collector.py      # 采集器（遗留/备用）：SESSDATA + cursor 分页落 SQLite；按需调用，计划 A 待停用
+│   ├── collector.py      # 采集器（遗留/备用）：SESSDATA + cursor 分页落 SQLite；仅 local 模式调用（保留，见 doc/adr/0004）
 │   ├── adapter_analyzer.py
 │   └── web/              # 前端单页：index.html / app.js / style.css（零框架、零 npm）
 ├── data/
@@ -154,7 +154,7 @@ BilibiliHistoryFinder/
 
 - **只能"从现在起"留存**：B站端已被上限顶掉的过去历史无法恢复（服务端限制，任何方案都救不回）；原型价值是"以后一条不漏"。
 - 单账号；多账号为后续阶段。
-- SESSDATA 过期需手动更新。**2026-09-25 已补前端提示**：顶部横幅会在 Analyzer 凭证失效（-101）时变红提示，Analyzer 不可达或在自身模式/已降级时变黄（见 §3）。当前仍存在**两份**凭证（Analyzer `config.yaml`＝主用、根 `config.json`＝collector 遗留且已失效）；**计划 A 已实现**——`auto`/`analyzer` 模式下「同步数据」改走 Analyzer 全量，不再使用遗留凭证（见 `doc/方案-后端与数据源.md` §7.11.2）。
+- SESSDATA 过期需手动更新。**2026-09-25 已补前端提示**：顶部横幅会在 Analyzer 凭证失效（-101）时变红提示，Analyzer 不可达或在自身模式/已降级时变黄（见 §3）。当前仍存在**两份**凭证（Analyzer `config.yaml`＝主用、根 `config.json`＝collector 遗留且已失效）；**凭证单一化已实现**——`auto`/`analyzer` 模式下「同步数据」改走 Analyzer 全量，不再使用遗留凭证（见 `doc/adr/0004`）。
 - 一键**本地备份**已实现（「⑤ 本地备份」按钮：`POST /api/backup` 对 Analyzer 主源 + 本地库做 sqlite3 在线快照至 `data/backup/<时间戳>/`，详见 `doc/方案-后端与数据源.md` §7.5）。**导出为独立文件已接入**：⑧ 导出 Excel / ⑨ 下载整库 `.db`，全部**中继 Analyzer `/export/*`**（Finder 不自己生成文件，避免第二份口径；§7.11.3）。
 - **自动备份触发**（2026-09-25）：不做定时备份（Analyzer/Frontend 也都没有），改为**「自上次备份以来 Analyzer 主源新增条数 ≥ 阈值」**时在拉取成功后自动备份一次，并按 `keep` 清理旧快照（§7.11.4）。阈值见 `data/backup_policy.json`，可用 `GET /api/backup-policy` 查看当前增量与是否达线。
 - **⑥ 应用变更与控制台的关系（2026-09-25 已修）**：Windows 控制台被鼠标**选中**时处于 QuickEdit 状态，向它的**任何输出都会阻塞**；旧实现把重启提示 `print` 放在 `os._exit(42)` 之前，于是「光标停在控制台里 → 点了 ⑥ 没反应」。现已三层防护：服务端输出全部改 `_safe_print`（守护线程，不阻塞）、重启链只写 `data/run/restart.log`、**3 秒看门狗**保证一定按退出码 42 退出；`start.bat` 的 `:RESTART` 段也改为零控制台输出。回归脚本 `dev/regression_restart.py`（详见 `doc/方案-后端与数据源.md` §7.12）。**另：退出码本身也曾不可靠**——旧实现把 `os._exit(42)` 放在**守护线程**里，`shutdown()` 之后主线程先走完、解释器收尾把守护线程回收，退出码变成 **0**，于是 `start.bat` 落到 `pause`、服务停住。现已改为**主线程决定退出码** + **文件握手**（回归对照：旧设计 3/3 得 0、新设计 3/3 得 42），详见 §7.13。**2026-09-26 00:15 已在 QuickEdit 冻结场景现场验证**：控制台全程保持选中（写入被冻结）时点 ⑥，整链 **≈ 3 秒**完成自动重启并刷新（修复前同一链路 56 秒）。
@@ -165,26 +165,16 @@ BilibiliHistoryFinder/
 
 ## 7. 文档索引
 
-> **方案文档（`doc/` 根：三份方案，按后端/前端/油猴三轴拆分，各带总览+阶段；另有当前阶段待办清单 + 一份轻量化讨论输入）**：
-> 早期评估稿、架构分析、规则分析、源码评估报告等已**吸收进这三份方案并归档至 `doc/archive/`**，不再单独维护。
-
-| 文档 | 内容 |
-|---|---|
-| `doc/方案-后端与数据源.md` | 方案·后端轴：目标运行状态（Analyzer+Finder+网页三方并存）、数据源选型、Frontend/Fetcher 替代评估、架构现状、Phase1 验证、规则引擎核心、统一契约、控制 Analyzer 变更量、**联调四步 + 轻量备份实际落地（§7）**、网页可控重启机制（§7.9）、**单入口「⑥ 应用变更」+ 自动判定 + 护栏 + 指纹 + 资源实测（§7.10）** |
-| `doc/方案-前端.md` | 方案·前端轴：现有网页能力、历史展示页、高级筛选器超集（已落地）、控制触发 UI 变更量、独立前端全量设计评估 |
-| `doc/方案-油猴D.md` | 方案·油猴轴：最终轻量形态（Phase 2 规划，尚未动手）、IndexedDB 双存储、引擎 JS 移植 |
-| `doc/待办-当前阶段.md` | 当前阶段待办清单（不含 Phase 2 油猴 D）；供逐项标注「怎么做 / 是否做」 |
-| `doc/方案-Finder轻量化.md` | **讨论输入**（2026-09-26）：单 Finder（独立）与 Finder+Analyzer 组合在**同一功能面**上的逐项对比 —— 实现者、需补代码量、凭证归属、失效面、维护面，以及组合模式下 Finder 现存包袱的实读体量（可减总量 ≈650 行）。**尚未形成方案** |
+> **唯一入口：[`doc/README.md`](file:///d:/Programs/Share/BilibiliHistoryFinder/doc/README.md)**（2026-10-01 完成文档结构重整，四层职责）：
+> [`doc/现状.md`](file:///d:/Programs/Share/BilibiliHistoryFinder/doc/现状.md) 「现在是什么」· [`doc/方案.md`](file:///d:/Programs/Share/BilibiliHistoryFinder/doc/方案.md) 「要做什么」· [`doc/待办.md`](file:///d:/Programs/Share/BilibiliHistoryFinder/doc/待办.md) 「还没做的」· `doc/adr/` 已拍板决策 · `doc/log/` 过程快照 · `doc/archive/` 历史方案（冻结）。
+>
+> ⚠️ **本 README 正文（§2 / §3 / §6）里出现的 `doc/方案-后端与数据源.md §x`、`doc/方案-前端.md §x` 等，是重构前的路径** —— 那些文件已移入 [`doc/archive/`](file:///d:/Programs/Share/BilibiliHistoryFinder/doc/archive)（内容多已并入 `doc/现状.md` / `doc/方案.md`）。查现行内容一律以 `doc/` 入口为准。
 
 **源码副本（只读参考，非文档）**：`doc/BilibiliHistoryFetcher-master/`（Analyzer/Fetcher 后端源码）、`doc/BiliHistoryFrontend-master/`（开源前端，Tauri/Vue3）。二者为整份源码副本，供评估与字段/接口核对用。
 
-**开发工具（`dev/`，非文档）**：`regression_restart.py` —— **⑥ 重启链路的常驻回归**（2026-09-25 由 `_verify_restart.py` 更名，转为正式资产）。跑法 `python dev/regression_restart.py`。它只绑 `127.0.0.1` 随机端口，**不启动对外服务、不读写任何历史数据**，所有写盘重定向到临时目录；断言生产拓扑（真实 `ThreadingHTTPServer` + 主线程 `serve_forever` + 工作线程发起重启）连跑 3 次退出码均为哨兵 **42**，并以旧设计对照（**0/0/0**，即线上 bug 的复现）。`mock_analyzer.py` —— **② 自动回退的离线复现桩**（2026-09-26 新增，与前者同级）：假扮 Analyzer，增量接口固定回「未找到本地历史记录」以逼出回退分支，全量接口默认返回 `503`（→ Finder 侧判定 `ok=false`，不触发 `post`，故测试**零副作用**；`set BHF_MOCK_FULL=200` 可放行全量）。只绑 `127.0.0.1`（默认 8790），不连 B站、不读写任何真实历史库；跑法与还原步骤见 `doc/待办-当前阶段.md` §6.2。`regression_fallback.py` —— **② 自动回退（增量 → 全量）的端到端回归**（2026-09-26 新增，与前者同级）。跑法 `python dev/regression_fallback.py`。它**真起 `server.Handler` + 真发 HTTP 请求**（不复制判定逻辑，避免测到副本）；**base 走内存覆盖 `FETCHER_OVERRIDE`**，因此 `data/fetcher_config.json` 一字节不动——省掉手工测法「改配置 → 必须还原」整步。三条用例互相对照：缺基线**必须**回退、基线正常**不得**回退、其它错误**不得**回退；`_after_data_pull`（唯一会真写备份 + reload 的函数）以记录桩替换，跑完核对 config md5 / `data/run/` / `data/backup/` 零污染。`stub_fetcher.py` 为接口桩。四个脚本的**用途、跑法、共同安全约定与写新回归脚本的经验**见 **`dev/README.md`**（测试资产手册）。
+**开发工具（`dev/`，非文档）**：`regression_restart.py` —— **⑥ 重启链路的常驻回归**（2026-09-25 由 `_verify_restart.py` 更名，转为正式资产）。跑法 `python dev/regression_restart.py`。它只绑 `127.0.0.1` 随机端口，**不启动对外服务、不读写任何历史数据**，所有写盘重定向到临时目录；断言生产拓扑（真实 `ThreadingHTTPServer` + 主线程 `serve_forever` + 工作线程发起重启）连跑 3 次退出码均为哨兵 **42**，并以旧设计对照（**0/0/0**，即线上 bug 的复现）。`mock_analyzer.py` —— **② 自动回退的离线复现桩**（2026-09-26 新增，与前者同级）：假扮 Analyzer，增量接口固定回「未找到本地历史记录」以逼出回退分支，全量接口默认返回 `503`（→ Finder 侧判定 `ok=false`，不触发 `post`，故测试**零副作用**；`set BHF_MOCK_FULL=200` 可放行全量）。只绑 `127.0.0.1`（默认 8790），不连 B站、不读写任何真实历史库；跑法与还原步骤见 `doc/log/2026-10-01-待办-当前阶段.md` §6.2。`regression_fallback.py` —— **② 自动回退（增量 → 全量）的端到端回归**（2026-09-26 新增，与前者同级）。跑法 `python dev/regression_fallback.py`。它**真起 `server.Handler` + 真发 HTTP 请求**（不复制判定逻辑，避免测到副本）；**base 走内存覆盖 `FETCHER_OVERRIDE`**，因此 `data/fetcher_config.json` 一字节不动——省掉手工测法「改配置 → 必须还原」整步。三条用例互相对照：缺基线**必须**回退、基线正常**不得**回退、其它错误**不得**回退；`_after_data_pull`（唯一会真写备份 + reload 的函数）以记录桩替换，跑完核对 config md5 / `data/run/` / `data/backup/` 零污染。`stub_fetcher.py` 为接口桩。四个脚本的**用途、跑法、共同安全约定与写新回归脚本的经验**见 **`dev/README.md`**（测试资产手册）。
 
-**归档溯源（`doc/archive/`，仅作历史参考，内容已并入上述三方案）**：
-- `方案定稿-前后端分离前-2026-08-24.md`（拆分前单文件定稿）
-- `架构分析.md`、`记录筛选规则分析.md`、`adapter-验证报告.md`（工程架构/规则/验证，已吸收）
-- `BiliHistoryFrontend替代评估.md`、`Fetcher后端源码评估.md`（源码评估，结论已并入后端轴 §2.3）
-- `测试版评估文档.md`、`哔哩哔哩历史查看器-需求评估.md`、`原型方案.md`、`使用说明.md`（评估期/原型期原始文档）
+**归档溯源（`doc/archive/`，19 份，冻结不动）**：三轴方案原稿（`方案-后端与数据源` / `方案-前端` / `方案-油猴D`）、`方案-连接即模式`、`方案-Finder轻量化`、拆分前定稿、架构 / 规则 / 验证报告、源码评估、评估期与原型期原始文档等。完整索引见 [`doc/README.md`](file:///d:/Programs/Share/BilibiliHistoryFinder/doc/README.md) §2。
 
 ---
 
