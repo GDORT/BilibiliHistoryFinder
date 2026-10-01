@@ -53,7 +53,7 @@ ANALYZER_COLS = [
 #   3. **不追平 124 处** —— 只覆盖"源读取 + 配置写入"这条链。
 #
 # 覆盖范围（C-N8，2026-10-01 更正：此前注释写"本文件 3 点 + server.py 6 点"，名单与总数都对不上，
-# 而它又被 `doc/待办-当前阶段.md` 第十九轮照抄，形成"代码注释 → 文档"的错误传播链）：
+# 而它又被 `doc/log/2026-10-01-待办轮次流水（至第二十轮）.md` 第十九轮照抄，形成"代码注释 → 文档"的错误传播链）：
 #   - **直接调用 `note_failure`**：本文件 4 处 —— `_read_analyzer` · `_read_local` ·
 #     `_write_json_atomic` · `save_policy`(读)；`server.py` 6 处 —— `_write_json_file` ·
 #     `get_db_path` · `get_web_port` · `_load_fetcher_override` · `_load_source_config` ·
@@ -429,7 +429,7 @@ def source_status(with_diagnosis=False):
     return st
 
 
-# ============ 「连接即模式」阶段 1：策略层 + 能力层 + 跨度读取（见 doc/方案-连接即模式.md） ============
+# ============ 「连接即模式」阶段 1：策略层 + 能力层 + 跨度读取（见 doc/archive/方案-连接即模式.md） ============
 # 分工铁律（直接决定可测性）：
 #   - 本段除 `load_policy` / `save_policy`（只读写一个 json）与 `*_span_days` / `local_meta`
 #     （只读探测，`mode=ro`）之外，**全部是纯函数**：不碰 sqlite、不发 HTTP、不改任何源库。

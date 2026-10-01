@@ -1,5 +1,11 @@
 # BilibiliHistoryFetcher 后端源码评估（结合 BiliHistoryFrontend 参考价值）
 
+> 状态：冻结
+> 性质：快照
+> 最后核对：2026-10-01 @9ca9669
+
+> 归档说明：本稿为**历史产物**，冻结于此仅作溯源；其结论或已并入 `现状.md` / `方案.md` / `adr/`，**以那三者为准**，此后不再编辑。
+
 > 本文基于本地副本 `doc/BilibiliHistoryFetcher-master`（真实开源后端，Python + FastAPI）与
 > 上一轮评估的 `doc/BiliHistoryFrontend-master`（纯前端副本）交叉分析。
 > 核心问题：**一开始问的"是否需要拉取源码来分析能否接入/控制 Analyzer"，现在有了 Fetcher 源码副本，能否据此得出结论？**

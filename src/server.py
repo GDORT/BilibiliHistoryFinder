@@ -897,7 +897,7 @@ def apply_rules_background(dry=False):
 # 本服务仅做只读转发 + 优雅降级；不持有任何凭证（SESSDATA 在 Fetcher 侧读取）。
 
 def _fetcher_cfg():
-    """返回 (base_url, api_key)。优先级：运行时覆盖 > 环境变量 > data/config.json[fetcher] > 默认值。"""
+    """返回 (base_url, api_key)。优先级：运行时覆盖 > 环境变量 > data/fetcher_config.json > 默认值。"""
     base = FETCHER_OVERRIDE.get("base") or os.environ.get("FETCHER_BASE", "")
     key = FETCHER_OVERRIDE.get("key") or os.environ.get("FETCHER_KEY", "")
     if not base:
@@ -1164,7 +1164,7 @@ def _health_payload(with_sessdata=True):
     return res
 
 
-# ============ 「连接即模式」阶段 1：探测层 + 只读端点（见 doc/方案-连接即模式.md D2） ============
+# ============ 「连接即模式」阶段 1：探测层 + 只读端点（见 doc/archive/方案-连接即模式.md D2） ============
 # 三层单向：probe_connection()（唯一做 IO）→ store.derive_capabilities()/decide_sync_plan()
 # （纯函数）→ 前端渲染（阶段 4 才切）。本段**纯增**：旧端点与旧按钮一行未动。
 

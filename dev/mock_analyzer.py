@@ -1,6 +1,6 @@
 """本地 mock Analyzer —— 用于离线复现 Finder 的「② 自动回退」分支。
 
-背景（#3 / #20 / #32 ｜ 详见 doc/待办-当前阶段.md §6.2）：
+背景（#3 / #20 / #32 ｜ 详见 doc/log/2026-10-01-待办-当前阶段.md §6.2）：
     Finder 的 `GET /api/fetcher-trigger`（增量）在拿到 Analyzer 的响应后，会检查
     顶层 `status == "error"` 且 message 含「未找到本地历史记录」→ 说明 Analyzer 缺
     增量基线 → 自动改发全量 `/fetch/bili-history`（对齐开源 Frontend 的回退策略）。

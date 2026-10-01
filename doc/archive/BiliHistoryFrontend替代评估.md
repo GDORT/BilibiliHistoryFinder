@@ -1,5 +1,11 @@
 # BiliHistoryFrontend 能否被我们的网页+服务替代 —— 源码评估报告
 
+> 状态：冻结
+> 性质：快照
+> 最后核对：2026-10-01 @9ca9669
+
+> 归档说明：本稿为**历史产物**，冻结于此仅作溯源；其结论或已并入 `现状.md` / `方案.md` / `adr/`，**以那三者为准**，此后不再编辑。
+
 > 评估对象：`doc/BiliHistoryFrontend-master/`（真实开源项目 `github.com/2977094657/BiliHistoryFrontend` 的源码副本，Vue3 + Tauri 前端）
 > 对照对象：我们自己的工程 `D:\Programs\Share\BilibiliHistoryFinder\`（Python `server.py` + 原生 JS 网页 + read-only 消费 Analyzer 数据）
 > 评估方式：**仅读源码、不运行、不调用接口**。评估时间：2026-08-24

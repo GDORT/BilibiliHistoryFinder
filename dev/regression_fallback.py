@@ -9,7 +9,7 @@ Finder 自动改发全量 `/fetch/bili-history`（对齐开源 Frontend 的回�
   1. **不改磁盘配置**。`_fetcher_cfg()` 的优先级是
      `FETCHER_OVERRIDE`(内存 dict) > 环境变量 > `data/fetcher_config.json`
      → 只在内存里把 base 指向假 Analyzer，`data/fetcher_config.json` 一个字节不动。
-     （这是 doc/待办-当前阶段.md §6.2 手工测法的升级：省掉「改配置 → 必须还原」整步。）
+     （这是 doc/log/2026-10-01-待办-当前阶段.md §6.2 手工测法的升级：省掉「改配置 → 必须还原」整步。）
   2. **假 Analyzer 的全量支默认返回 503** → `full.ok=false` → 回退路径的 `post` 为 None。
   3. `_after_data_pull`（唯一会真写备份 + reload 的函数）被替换成**记录桩**；
      被测的分支判定逻辑本身完全真实。事后仍做零污染核对（config md5 / run / backup）。
