@@ -85,6 +85,17 @@ def http(method, url, body=None, timeout=8):
         return e.code, e.read().decode("utf-8", "replace")
 
 
+def raw_get(port, path, timeout=10):
+    """返回 (status, bytes) —— 取**二进制**响应体（导出类端点用，`http()` 会 decode 坏字节）。"""
+    op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), method="GET")
+    try:
+        with op.open(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
 def nonloopback_ipv4():
     """本机非回环 IPv4 候选（取不到就返回 []，对应断言自动降级为 SKIP）。"""
     out = []
@@ -387,6 +398,48 @@ def main():
         # 顺手把配置恢复成沙箱基线，避免影响后续步骤
         with open(cfg, "w", encoding="utf-8") as f:
             json.dump({"mode": "auto", "analyzer_db": ghost}, f, ensure_ascii=False, indent=2)
+
+        # ---------- A3 / A5（阶段 2 修正）----------
+        print("\n-- A5 /api/export/local/db：与 ⑤ 备份同源（sqlite3 在线快照，非裸读字节流）")
+        st, _ = http("GET", base + "/api/export/local/db")
+        check(st == 404, "  本地库不存在 → 404（不凭空建库）", "HTTP %s" % st)
+        local_db = os.path.join(root, "data", "bilibili_history.db")
+        con = sqlite3.connect(local_db)
+        con.execute("CREATE TABLE history(kid TEXT PRIMARY KEY, bvid TEXT, view_at INTEGER)")
+        con.execute("INSERT INTO history VALUES ('k9','BV9',9)")
+        con.commit()
+        con.close()
+        st, blob = raw_get(port, "/api/export/local/db")
+        check(st == 200 and blob[:16] == b"SQLite format 3\x00",
+              "  返回的是**有效 sqlite 文件**（magic 头正确）",
+              "HTTP %s 前 16 字节=%r" % (st, blob[:16]))
+        leak = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith("bhf_export_")]
+        check(leak == [], "  临时快照文件已清理（不残留）", str(leak[:3]))
+
+        print("\n-- A3 主源为 Analyzer 时 /api/local/delete 必须拒绝（否则「删了立刻被补回」）")
+        fake_ana = os.path.join(root, "data", "__fake_analyzer__.db")
+        con = sqlite3.connect(fake_ana)
+        con.execute("CREATE TABLE bilibili_history_2026 "
+                    "(kid TEXT, bvid TEXT, oid TEXT, view_at INTEGER, title TEXT)")
+        con.execute("INSERT INTO bilibili_history_2026 "
+                    "VALUES ('k1','BV1','1',1,'t')")
+        con.commit()
+        con.close()
+        st, _ = http("POST", base + "/api/data-source",
+                     {"mode": "auto", "analyzer_db": fake_ana})
+        check(st == 200, "  切到**可读**主源（mode=auto）→ 200", "HTTP %s" % st)
+        st, txt = http("POST", base + "/api/local/delete", {"kids": ["k1"]})
+        d = json.loads(txt) if txt else {}
+        check(st == 200 and d.get("blocked") is True and "立刻补回" in str(d.get("reason")),
+              "  blocked + 说明原因（不再是「删了看不出效果」）",
+              "HTTP %s %s" % (st, json.dumps(d, ensure_ascii=False)[:110]))
+        st, _ = http("POST", base + "/api/data-source", {"mode": "local"})
+        check(st == 200, "  切到 mode=local（独立形态：主源不参与合并）", "HTTP %s" % st)
+        st, txt = http("POST", base + "/api/local/delete", {"kids": ["k1"]})
+        d = json.loads(txt) if txt else {}
+        check(st == 200 and d.get("blocked") is not True,
+              "  独立形态下**放行**（这才是本端点的有效场景）",
+              "HTTP %s %s" % (st, json.dumps(d, ensure_ascii=False)[:110]))
 
         # ---------- N-H1 失败可观测 ----------
         print("\n-- N-H1 失败可观测（收窄版：只覆盖源读取 + 配置写入）")

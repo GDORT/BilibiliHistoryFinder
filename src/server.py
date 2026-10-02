@@ -27,6 +27,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import datetime
@@ -49,9 +50,13 @@ RULES_FILE = os.path.join(PROJECT_ROOT, "data", "rules.json")
 AUTOSKIP_PROGRESS_FILE = os.path.join(PROJECT_ROOT, "data", "auto_skip_progress.json")
 
 # 同步状态（后台线程写，前端轮询读）
-# `no_baseline`：「上次增量报缺基线」标记 —— 阶段 2 由 /api/sync 的抓取分支置位，
-# 现在只被 store.decide_sync_plan() 的 R2 读取（恒 False = 该规则暂不触发）。
-sync_state = {"running": False, "last": None, "started_at": 0, "no_baseline": False}
+# `no_baseline`：「上次增量报缺基线」标记 —— 阶段 2 由抓取分支置位、**全量成功即清**
+#    （`_note_full_success()`；否则该标记粘住 → 此后每次同步都判全量，A1）。
+#    只被 `store.decide_sync_plan()` 的 R2 读取。
+# `last_full_at`：**Analyzer 侧**全量成功的时间；本地库 meta 的 `last_full_sync` 只由
+#    Finder 自己的 collector 写，Analyzer 全量不碰它 → 需在此单独记账，R4 冷却才生效。
+sync_state = {"running": False, "last": None, "started_at": 0, "no_baseline": False,
+              "last_full_at": 0}
 # 自动跳过应用状态（后台线程写，前端轮询读）
 autoskip_state = {"running": False, "last": None, "started_at": 0}
 
@@ -815,6 +820,11 @@ def run_sync_background(full=False):
                     res = None
             completed = bool(res and res.get("completed"))
             if completed:
+                if full or not incremental:
+                    # A1 残留（2026-10-02 二轮复核）：finder 形态的**全量**成功同样要收敛 ——
+                    # 否则 Analyzer 侧置下的 `no_baseline` 会一直粘住，此后每过冷却就再全量一次。
+                    # `incremental` 为假 == 本次实际是建/重建基线（见本函数开头的判据），故一并收敛。
+                    _note_full_success()
                 sync_state["last"] = {
                     "ok": True, "at": int(time.time()),
                     "fetched": (res or {}).get("fetched"),
@@ -1124,7 +1134,8 @@ def _sessdata_status():
     因此它反映的是「主源凭证」的存活状态，与 Finder `config.json` 那份无关（且不需要）。
     **纯只读**：只发 GET，不改任何数据、不触发拉取。
 
-    状态：ok（code=0 且 isLogin）/ invalid（-101 未登录）/ unknown（不可达或异常）
+    状态：ok（code=0 且 isLogin）/ invalid（码表判为 fatal，如 -101 未登录 / -111 csrf）
+    / unknown（不可达、风控类码或异常）。码表见 `collector.classify_api_code()`（阶段 1.5 ①）。
     """
     r = _forward_fetcher("/login/check", timeout=8)
     if not r.get("reachable"):
@@ -1137,12 +1148,18 @@ def _sessdata_status():
         return {"state": "ok", "code": 0, "uname": payload.get("uname"),
                 "vip": payload.get("vipStatus") == 1,
                 "owner": "Analyzer(config.yaml)"}
-    if code == -101:
+    # 码表与 collector 的抓取路径**共用**（阶段 1.5 ①）：一处判断，避免两处各认几个码。
+    kind, note = collector.classify_api_code(code)
+    if kind == "fatal":
         return {"state": "invalid", "code": code,
-                "message": d.get("message") or "未登录",
+                "message": d.get("message") or note or "未登录",
                 "owner": "Analyzer(config.yaml)",
                 "hint": "请更新 Analyzer 的 config/config.yaml 中的 SESSDATA（Analyzer 自带邮件告警，已在跑）"}
-    return {"state": "unknown", "code": code, "message": d.get("message"),
+    if kind == "backoff":
+        return {"state": "unknown", "code": code, "message": d.get("message") or note,
+                "owner": "Analyzer(config.yaml)",
+                "hint": "疑被风控/限流拦截，稍后重试"}
+    return {"state": "unknown", "code": code, "message": d.get("message") or note,
             "owner": "Analyzer(config.yaml)"}
 
 
@@ -1150,10 +1167,20 @@ def _health_payload(with_sessdata=True):
     """`/api/fetcher-health` 的响应体：可达性 + （可选）凭证健康 + 数据源实际生效模式。"""
     res = _forward_fetcher("/health", timeout=5)
     res = dict(res) if isinstance(res, dict) else {"ok": False, "reachable": False}
+    # 阶段 2 修正（A2）：这里也发布探测结论 —— 它是前端**周期轮询**的端点（`SRC_POLL_MS`），
+    # 天然充当 store 侧缓存的心跳；否则该结论只有 `/api/capabilities`（前端从不调）会刷新。
+    try:
+        store.note_analyzer_usable(res.get("reachable"))
+    except Exception:
+        pass
     if with_sessdata and res.get("reachable"):
         res["sessdata"] = _sessdata_status()
     elif with_sessdata:
         res["sessdata"] = {"state": "unknown", "reason": "Analyzer 不可达",
+                           "owner": "Analyzer(config.yaml)"}
+    elif res.get("reachable"):
+        # A7 同类修正：可达但本次不查凭证 —— 旧文案写死「Analyzer 不可达」，是**误导**。
+        res["sessdata"] = {"state": "unknown", "reason": "本次未探测（只做本地判定，未打 B站）",
                            "owner": "Analyzer(config.yaml)"}
     try:
         # #37：带上 diagnosis（read-only 探测 Analyzer 库路径），让前端能区分
@@ -1168,21 +1195,21 @@ def _health_payload(with_sessdata=True):
 # 三层单向：probe_connection()（唯一做 IO）→ store.derive_capabilities()/decide_sync_plan()
 # （纯函数）→ 前端渲染（阶段 4 才切）。本段**纯增**：旧端点与旧按钮一行未动。
 
-def _finder_sessdata_status():
-    """Finder 侧凭证状态（对应未定项 T7）。
+def _finder_sessdata_status(probe=False):
+    """Finder 侧凭证状态（对应未定项 T7；阶段 1.5 ④ 扩展值域）。
 
-    **阶段 1 契约：只做本地判定、绝不联网** —— 值域仅 `missing | present`。
+    **默认仍只做本地判定、绝不联网** —— 值域 `missing | present`。
     `present` 只表示"`config.json` 里 SESSDATA 非空"，**不代表有效**。
 
     键名统一为 `sessdata`（与 `store.derive_capabilities()` / `decide_sync_plan()` 的读取键
     一致）—— 曾经这里叫 `state`，导致能力层读不到值、独立形态下 `fetch` 恒判为 `unknown`，
     而 Analyzer 可达时又被 `reachable` 分支掩盖（由 dev/test_capabilities.py --live 抓出）。
 
-    为什么不在这里直连 B站 nav 做真实探测：
+    为什么不在这里一律直连 B站 nav 做真实探测：
       ① 本函数会被 `/api/capabilities` 以 5 分钟周期（`SRC_POLL_MS`）调用 —— 不该为"显示一个状态"
          而周期性向 B站发请求；
-      ② 真实探测属阶段 2 的功能补齐 D 项（`方案-Finder轻量化.md` §7.3 步骤 3），
-         届时值域扩展为 `valid | invalid | missing | unknown`。
+      ② 故真实探测**只在显式请求时联网**：`probe=True` 由 `GET /api/finder-session-check` 触发，
+         值域扩为 `missing | present | valid | invalid | unknown`。
     """
     p = collector.DEFAULT_CONFIG
     try:
@@ -1194,8 +1221,53 @@ def _finder_sessdata_status():
     if not str(s).strip():
         return {"sessdata": "missing", "owner": "finder(config.json)", "source": p,
                 "note": "config.json 里 SESSDATA 为空"}
+    if probe:
+        return _probe_finder_sessdata(str(s).strip(), p)
     return {"sessdata": "present", "owner": "finder(config.json)", "source": p,
             "note": "仅本地判定（已填写，未联网验证）"}
+
+
+def _probe_finder_sessdata(sessdata, source_path):
+    """真实探测 Finder 凭证：GET B站 nav 接口（**只在显式请求时调用**，绝不周期调用）。
+
+    纯只读：只发一次 GET，不写任何库/文件。`present` 之外的三个结论都从这里产出。
+    """
+    req = urllib.request.Request(
+        "https://api.bilibili.com/x/web-interface/nav",
+        headers={"User-Agent": collector.UA, "Referer": collector.REFERER,
+                 "Cookie": "SESSDATA=%s" % sessdata},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        # A6：`HTTPError` 是 `URLError` 的**子类** —— 必须先接住，否则 412 风控会被
+        # 报成「网络不可达」（措辞把排查方向带偏）。状态码走 collector 的既有分类表。
+        _kind, note = collector.classify_http_status(getattr(e, "code", None))
+        return {"sessdata": "unknown", "code": getattr(e, "code", None),
+                "owner": "finder(config.json)", "source": source_path,
+                "note": "探测失败（HTTP %s）：%s" % (getattr(e, "code", None),
+                                                note or "响应非 2xx")}
+    except (urllib.error.URLError, OSError) as e:
+        return {"sessdata": "unknown", "owner": "finder(config.json)", "source": source_path,
+                "note": "探测失败（网络不可达）：%s" % (getattr(e, "reason", None) or e)}
+    except Exception as e:  # noqa
+        return {"sessdata": "unknown", "owner": "finder(config.json)", "source": source_path,
+                "note": "探测失败：%s: %s" % (type(e).__name__, e)}
+    d = body.get("data") if isinstance(body.get("data"), dict) else {}
+    if body.get("code") == 0 and d.get("isLogin"):
+        return {"sessdata": "valid", "code": 0, "uname": d.get("uname"),
+                "owner": "finder(config.json)", "source": source_path,
+                "note": "已联网验证：凭证有效"}
+    kind, note = collector.classify_api_code(body.get("code"))
+    if kind == "fatal":
+        return {"sessdata": "invalid", "code": body.get("code"),
+                "message": body.get("message") or note,
+                "owner": "finder(config.json)", "source": source_path,
+                "note": "已联网验证：凭证无效（请更新 config.json 的 SESSDATA）"}
+    return {"sessdata": "unknown", "code": body.get("code"), "message": body.get("message"),
+            "owner": "finder(config.json)", "source": source_path,
+            "note": "已联网探测但结论不确定（code=%s）" % body.get("code")}
 
 
 def _int_or_none(v):
@@ -1217,13 +1289,26 @@ def _sync_plan_state():
         lmeta = store.local_meta(["last_success_at", "last_full_sync", "span_peak_days"])
     except Exception:
         pass
+    # 本地库**真实行数**（单表 COUNT）。原先回退用 `get_sync_meta()["local_backup"]` ——
+    # 那是「合并后仍归因本地」的条数：本地记录若全部也存在于主源会得 0，会让 R1 误判
+    # 「本地库为空」而反复全量（二轮复核 ⑨）。调用方仍会用 probe 的实测值覆盖，这里保证
+    # 未被覆盖时也是正确语义。
+    l_count = 0
+    try:
+        l_count = int((store.local_span_days() or {}).get("count") or 0)
+    except Exception:
+        l_count = 0
     return {
         "now": int(time.time()),
         "last_success_at": _int_or_none(lmeta.get("last_success_at")) or meta.get("last_success_at"),
-        "last_full_at": _int_or_none(lmeta.get("last_full_sync")),
+        # 两个来源取较新者：本地库 meta 的 `last_full_sync`（collector 自己的全量写的）
+        # ＋ 进程内 `sync_state["last_full_at"]`（Analyzer 侧全量成功的）。
+        # 后者必需 —— Analyzer 全量**不写**本地库 meta，只靠前者 R4 冷却对 Analyzer 完全不生效（A1）。
+        "last_full_at": max(_int_or_none(lmeta.get("last_full_sync")) or 0,
+                            int(sync_state.get("last_full_at") or 0)) or None,
         # 阶段 2 接上：由 /api/sync 的抓取分支在命中「未找到本地历史记录」时置位。
         "last_incremental_no_baseline": bool(sync_state.get("no_baseline")),
-        "local_count": meta.get("local_backup") or 0,
+        "local_count": l_count,
         # R3 的输入：本地库历史跨度峰值（毫秒级维护见阶段 2）。阶段 1 恒为 None → R3 不触发，
         # 这是**有意的保守**（理由见 store.decide_sync_plan 里对 R3 的说明）。
         "span_peak_days": _int_or_none(lmeta.get("span_peak_days")),
@@ -1241,6 +1326,8 @@ def probe_connection(with_sessdata=True):
     health = dict(health) if isinstance(health, dict) else {"ok": False, "reachable": False}
     reachable = bool(health.get("reachable"))
     base, _key = _fetcher_cfg()
+    # 阶段 2：把本次探测结论发布给 store —— `load_raw_records()` 据此在独立形态下跳过 Analyzer 年表。
+    store.note_analyzer_usable(reachable)
 
     try:
         diag = store.analyzer_db_diagnosis()
@@ -1250,6 +1337,11 @@ def probe_connection(with_sessdata=True):
 
     if with_sessdata and reachable:
         ana_sess = _sessdata_status()
+    elif reachable:
+        # A7：可达但本次不查凭证（如 `/api/sync` 固定用 `with_sessdata=False`）——
+        # 旧文案写死「Analyzer 不可达」，实际可达时这句话是**错的**（还会随 plan 回给前端）。
+        ana_sess = {"state": "unknown", "reason": "本次未探测（只做本地判定，未打 B站）",
+                    "owner": "Analyzer(config.yaml)"}
     else:
         ana_sess = {"state": "unknown", "reason": "Analyzer 不可达",
                     "owner": "Analyzer(config.yaml)"}
@@ -1469,6 +1561,70 @@ def _after_data_pull(payload):
     return out
 
 
+# Analyzer 增量「缺基线」的判据关键词（Analyzer/Fetcher 的原文措辞）
+_NO_BASELINE_MARK = "未找到本地历史记录"
+
+
+def _note_full_success():
+    """一次**全量成功**后的状态收敛（阶段 2 修正 A1）。
+
+    ① 清 `no_baseline` —— 全量成功即代表基线已就位；不清就会**粘住**，此后每次同步
+       都判全量（原先 R2 又排在 R4 之前，冷却对此完全失效）。
+    ② 记 `last_full_at` —— Analyzer 侧全量**不写**本地库 meta 的 `last_full_sync`，
+       不记这一笔，R4 冷却对 Analyzer 形态永远不生效。
+    """
+    sync_state["no_baseline"] = False
+    sync_state["last_full_at"] = int(time.time())
+
+
+def _note_plan_not_started(plan, reason):
+    """把「没开始」的原因落进 `sync_state["last"]`（阶段 2 修正 A4）。
+
+    `POST /api/sync` 的响应体前端**不看**（`fetch(...).then(() => pollSync())`），它只轮询
+    `GET /api/sync` 的 `last` —— 所以阻断/跳过必须写在这里，否则用户观感仍是「点了没反应」。
+    把 blocked / skip 分开渲染属阶段 4 的前端工作。
+    """
+    sync_state["last"] = {"ok": False, "at": int(time.time()),
+                          "err": reason or "未开始（策略判定）",
+                          "plan_mode": (plan or {}).get("mode")}
+
+
+def _analyzer_incremental_with_fallback(params, timeout_inc=180, timeout_full=240):
+    """Analyzer 增量拉取；命中「未找到本地历史记录」时自动升级为全量（**共享回退逻辑**）。
+
+    阶段 2 的收敛点之一：这段回退原先只在 `GET /api/fetcher-trigger`（前端「实时更新」）里，
+    现在 `POST /api/sync`（「同步数据」）也走它 —— 同一处判据、同一份行为，不再各写一遍
+    （对应 `方案.md` §3.2 的「分散判据收敛」）。
+
+    副作用：维护 `sync_state["no_baseline"]` —— 它是 `store.decide_sync_plan()` 的 R2 输入
+    （「上次增量报缺基线 → 本次直接全量，不必先白跑一趟增量再回退」）。
+    清标记只在**真正拿到结论**时做（见下），否则一次网络故障会被误当成「基线已就位」。
+    返回可直接 `_send()` 的 dict（调用方各自附加字段），不再自己发响应。
+    """
+    inc = _forward_fetcher("/fetch/bili-history-realtime", timeout=timeout_inc, params=params)
+    d = inc.get("data") if isinstance(inc.get("data"), dict) else {}
+    if inc.get("ok") and d.get("status") == "error" and _NO_BASELINE_MARK in str(d.get("message", "")):
+        sync_state["no_baseline"] = True
+        full = _forward_fetcher("/fetch/bili-history", timeout=timeout_full, params=params)
+        if isinstance(full, dict) and full.get("ok"):
+            _note_full_success()      # A1：全量成功 → 清标记 ＋ 记 last_full_at
+        return {
+            "ok": True,
+            "fallback_to_full": True,
+            "message": "增量拉取缺少本地基线，已自动升级为全量拉取",
+            "incremental": d,
+            "full": full.get("data"),
+            "post": _after_data_pull(full) if full.get("ok") else None,
+        }
+    if isinstance(inc, dict) and inc.get("ok"):
+        # A8：有结论才能在增量成功时断言「基线在」；inc 不 ok（Analyzer 不可达、没结论）
+        # 时**保持原值**，不冒充一次成功。
+        sync_state["no_baseline"] = False
+        inc = dict(inc)
+        inc["post"] = _after_data_pull(inc)
+    return inc
+
+
 def _backup_policy_path():
     return os.path.join(PROJECT_ROOT, "data", "backup_policy.json")
 
@@ -1673,6 +1829,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, capabilities_payload(
                 with_sessdata=flat.get("sessdata", "1") != "0"))
             return
+        if path == "/api/finder-session-check":
+            # 阶段 1.5 ④：**显式**的 Finder 凭证真实探测（唯一联网路径，绝不周期调用）。
+            # 周期路径 /api/capabilities 仍走本地判定（present），不受本端点影响。
+            self._send(200, _finder_sessdata_status(probe=True))
+            return
         if path == "/api/data-source":
             # #21 数据源主开关：读取当前模式 + 实际生效数据源（纯读）
             self._send(200, {
@@ -1697,23 +1858,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             # 增量：先打 realtime；若 Analyzer 报『未找到本地历史记录』（缺基线），
             # 自动升级为全量——对齐开源 Frontend 的 updateBiliHistoryRealtime 回退策略。
-            inc = _forward_fetcher("/fetch/bili-history-realtime", timeout=180, params=params)
-            d = inc.get("data") if isinstance(inc.get("data"), dict) else {}
-            if inc.get("ok") and d.get("status") == "error" and "未找到本地历史记录" in str(d.get("message", "")):
-                full = _forward_fetcher("/fetch/bili-history", timeout=240, params=params)
-                self._send(200, {
-                    "ok": True,
-                    "fallback_to_full": True,
-                    "message": "增量拉取缺少本地基线，已自动升级为全量拉取",
-                    "incremental": d,
-                    "full": full.get("data"),
-                    "post": _after_data_pull(full) if full.get("ok") else None,
-                })
-                return
-            if isinstance(inc, dict) and inc.get("ok"):
-                inc = dict(inc)
-                inc["post"] = _after_data_pull(inc)
-            self._send(200, inc)
+            # 阶段 2：回退逻辑已抽成共享 helper，`/api/sync` 走同一份（判据收敛到一处）。
+            # 本端点对外行为**不变**（`方案.md` §4 排序约束：前端仍打这里，阶段 4 才切）。
+            self._send(200, _analyzer_incremental_with_fallback(params))
             return
         if path == "/api/fetcher-check":
             # Step④ 数据自检（重新实现）：真正调用 Analyzer 完整性校验 + 报告
@@ -1744,6 +1891,47 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(st or 200, blob, ct or "application/octet-stream",
                        {"Content-Disposition": cd} if cd else None)
+            return
+        # ---- 阶段 1.5 ②：本地库导出（独立形态下 Analyzer 不可达时的出口）----
+        # 与上面两个端点的区别：**不转发**，直接回本地 Finder 库（data/bilibili_history.db）。
+        if path == "/api/export/local/db":
+            # A5：改走 `sqlite3` 在线 backup 到临时文件再回吐 —— 与 ⑤ 备份（`_backup_one`）同源。
+            # 原先 `open(rb).read()` 裸读字节流：抓取正在写库时可能取到**不一致副本**，
+            # 也与备份端点取的快照方式不一致。
+            src = collector.DEFAULT_DB
+            if not os.path.exists(src):
+                self._send(404, {"ok": False, "error": "本地库不存在（尚未同步过）"})
+                return
+            tmp = None
+            try:
+                fd, tmp = tempfile.mkstemp(prefix="bhf_export_", suffix=".db")
+                os.close(fd)
+                _backup_one(src, tmp)
+                with open(tmp, "rb") as f:
+                    blob = f.read()
+            except Exception as e:  # noqa
+                self._send(500, {"ok": False, "error": "读取本地库失败：%s" % e})
+                return
+            finally:
+                if tmp:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+            self._send(200, blob, "application/octet-stream",
+                       {"Content-Disposition": 'attachment; filename="bilibili_history.db"'})
+            return
+        if path == "/api/export/local/json":
+            try:
+                recs = store._read_local(collector.DEFAULT_DB)
+            except Exception as e:  # noqa
+                self._send(500, {"ok": False, "error": "读取本地库失败：%s" % e})
+                return
+            blob = json.dumps({"ok": True, "source": "local",
+                               "count": len(recs), "records": list(recs.values())},
+                              ensure_ascii=False).encode("utf-8")
+            self._send(200, blob, "application/json; charset=utf-8",
+                       {"Content-Disposition": 'attachment; filename="bilibili_history_local.json"'})
             return
         # ---- #23 图片批量下载中继（对齐 Frontend /images/*）----
         if path == "/api/images/status":
@@ -1988,40 +2176,132 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/sync":
-            full = qs.get("full", ["0"])[0] == "1"
-            mode = store.get_source_mode()
-            if mode in ("auto", "analyzer"):
-                # #1/#2「计划 A」：凭证单一化 —— 不再跑本地 collector（其 config.json 的 SESSDATA 已失效/弃用），
-                # 改为**触发 Analyzer 全量**：抓取执行者与凭证都归 Analyzer（即"中继"，非直连）。
-                # 与 /api/fetcher-trigger?mode=full 同语义，保留 /api/sync 这个既有按钮入口不破坏前端。
-                res = _forward_fetcher("/fetch/bili-history", timeout=240, method="GET",
-                                       params={"sync_deleted": qs.get("sync_deleted", ["1"])[0]})
-                self._send(200, {
-                    "started": bool(res.get("ok")),
-                    "engine": "analyzer",
-                    "mode": mode,
-                    "note": "计划A：走 Analyzer 全量拉取（不再使用 Finder 本地 collector 凭证）",
-                    "result": res,
-                    "post": _after_data_pull(res) if res.get("ok") else None,
-                })
+            # 阶段 2：判据由「读手切模式 store.get_source_mode()」换成「探测 + 策略纯函数」——
+            # 与 /api/capabilities 同源（probe_connection → decide_sync_plan），因此不会出现
+            # 「能力面板说不可抓、点同步却去抓」的自相矛盾。
+            # ⚠️ `?full=1`（前端「全量重建」按钮）映射为 policy 覆盖 `sync=full` —— 与隐藏 override
+            # 同一条路（覆盖在 R1–R4 之前，故不受 R4 冷却拦截），保持该按钮语义不变。
+            params = {"sync_deleted": qs.get("sync_deleted", ["1"])[0]}
+            probe = probe_connection(with_sessdata=False)  # R5 只用 finder.sessdata（本地判定），不必打 B站
+            policy = store.load_policy()
+            state = _sync_plan_state()
+            if probe["data"].get("local") is not None:
+                state["local_count"] = probe["data"]["local"]
+            if qs.get("full", ["0"])[0] == "1":
+                policy = dict(policy)
+                policy["sync"] = "full"
+            plan = store.decide_sync_plan(probe, policy, state)
+            pmode = plan.get("mode")
+            if pmode == "blocked":
+                # 不再"点了然后失败"：先把阻断原因讲清楚（凭证缺失 / 失效）
+                _note_plan_not_started(plan, plan.get("reason"))
+                self._send(200, {"ok": False, "started": False, "blocked": True,
+                                 "owner": plan.get("owner"), "reason": plan.get("reason"),
+                                 "plan": plan})
                 return
-            # mode == local：模式 B（自身抓取），保留原 collector 语义，需自备有效 SESSDATA
+            if pmode == "skip":
+                # A4：原因落进 sync_state["last"]，前端轮询才会显示 —— 否则「点了没反应」
+                _note_plan_not_started(plan, plan.get("reason"))
+                self._send(200, {"ok": True, "started": False, "skipped": True,
+                                 "reason": plan.get("reason"), "plan": plan})
+                return
+            if plan.get("owner") == "analyzer":
+                if pmode == "full":
+                    res = _forward_fetcher("/fetch/bili-history", timeout=240, method="GET",
+                                           params=params)
+                    if isinstance(res, dict) and res.get("ok"):
+                        _note_full_success()      # A1：全量成功 → 清 no_baseline ＋ 记 last_full_at
+                    self._send(200, {
+                        "started": bool(res.get("ok")),
+                        "engine": "analyzer",
+                        "mode": pmode,
+                        "reason": plan.get("reason"),
+                        "plan": plan,
+                        "result": res,
+                        "post": _after_data_pull(res) if res.get("ok") else None,
+                    })
+                    return
+                # 增量：走与「实时更新」按钮同一个回退 helper（缺基线自动升级全量 + 置 no_baseline）
+                payload = _analyzer_incremental_with_fallback(params)
+                payload = dict(payload) if isinstance(payload, dict) else {"result": payload}
+                payload.setdefault("started", bool(payload.get("ok")))
+                payload["engine"] = "analyzer"
+                payload["mode"] = pmode
+                payload["reason"] = plan.get("reason")
+                payload["plan"] = plan
+                self._send(200, payload)
+                return
+            # owner == finder：独立形态，本地 collector 抓取（需自持有效凭证，R5 已放行）
             if sync_state["running"] or autoskip_state["running"]:
-                self._send(200, {"started": False, "blocked": True,
+                self._send(200, {"ok": False, "started": False, "blocked": True,
                                  "reason": "已有同步或规则应用任务进行中"})
-            else:
+                return
+            try:
+                with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "phase": "start", "page": 0, "fetched": 0,
+                        "completed": False, "is_end": False,
+                        "total_estimate": None, "updated_at": int(time.time()),
+                        "mode": pmode,
+                    }, f)
+            except Exception:
+                pass
+            run_sync_background(full=(pmode == "full"))
+            self._send(200, {"started": True, "running": True, "engine": "finder",
+                             "mode": pmode, "reason": plan.get("reason"), "plan": plan})
+            return
+
+        if parsed.path == "/api/local/delete":
+            # 阶段 1.5 ③：按 kid 列表删本地库记录 + 清侧状态库同 kid 的 skip_state。
+            # 粒度按 kid（T11 已定）；删除写方是 collector（本地库唯一写入方）。
+            kids = body.get("kids") if isinstance(body, dict) else None
+            if not isinstance(kids, list) or not kids:
+                self._send(400, {"ok": False, "error": "kids 必须为非空列表"})
+                return
+            if sync_state["running"] or autoskip_state["running"]:
+                self._send(200, {"ok": False, "blocked": True,
+                                 "reason": "已有同步或规则应用任务进行中，请稍后再试"})
+                return
+            # A3：主源为 Analyzer 时**直接拒绝**并说明原因 —— 删的是本地库行，而合并视图
+            # 是 Analyzer ∪ 本地，只要主源可达，被删记录会立刻补回（用户看到"删了没效果"）。
+            # 本端点只在「本地独立形态」（Analyzer 不可达 / 降级 / mode=local）下有意义。
+            # A3 修正（2026-10-02 二轮复核 ⑩）：`source_status()` 只是 `_LAST_SOURCE` 的
+            # **快照**（上一次 load 的结论），不重新加载就会把「主源刚变过」判成旧结论。
+            # 删除是低频手动操作，这里宁可多读一次也要让判据与当前事实一致。
+            try:
+                store.reload_raw()
+            except Exception:
+                pass
+            try:
+                eff = (store.source_status() or {}).get("effective")
+            except Exception:
+                eff = None
+            if eff == "analyzer":
+                self._send(200, {
+                    "ok": False, "blocked": True, "effective": eff,
+                    "reason": "当前主源是 Analyzer 年表，删除本地库记录会被主源立刻补回"
+                              "（此操作只在本地独立形态下有意义：Analyzer 不可达 / 已降级 / mode=local）"})
+                return
+            try:
+                deleted = collector.delete_records(collector.DEFAULT_DB, kids)
+                # A8：本地库删除与侧状态库清理是**两个独立事务**（两个库），可能只成功一半 ——
+                # 明说，不把它伪装成一次原子操作。
+                state_cleaned, side_err = None, None
                 try:
-                    with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-                        json.dump({
-                            "phase": "start", "page": 0, "fetched": 0,
-                            "completed": False, "is_end": False,
-                            "total_estimate": None, "updated_at": int(time.time()),
-                            "mode": "full" if full else None,
-                        }, f)
+                    state_cleaned = store.delete_skip_states(kids)
+                except Exception as e:  # noqa
+                    side_err = str(e)
+                try:
+                    reload_all()
                 except Exception:
                     pass
-                run_sync_background(full=full)
-                self._send(200, {"started": True, "running": True})
+                out = {"ok": True, "deleted": deleted, "state_cleaned": state_cleaned}
+                if side_err:
+                    out.update({"partial": True, "state_error": side_err,
+                                "note": "本地库记录已删，但侧状态库清理失败（两个独立事务）"})
+                self._send(200, out)
+            except Exception as e:  # noqa
+                self._send(500, {"ok": False, "error": "删除失败：%s" % e})
             return
 
         if parsed.path == "/api/backup":

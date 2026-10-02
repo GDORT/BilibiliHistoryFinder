@@ -13,7 +13,7 @@
 届时这套单测几秒内就能告诉你**决策逻辑有没有被改坏**（端到端要起服务、30 秒以上）。
 
 安全性（本脚本的硬约束）：
-    - 默认**不联网**：只 import `store`（其模块顶层不打开任何库、不发任何请求）。
+    - 默认**不联网**：只 import `store` 与 `collector`（两者模块顶层都不打开任何库、不发任何请求）。
     - 唯一触盘的是 T5 / T6 —— 全部在 `tempfile.mkdtemp()` 里建**临时** sqlite / json，结束即删。
     - **不读不写** `data/` 下任何文件、**不动** 8765 服务、**不碰** Analyzer 库。
     - `--live` 是唯一会发请求的开关，且只打本机 8765 的**只读** GET，并带 `?sessdata=0`
@@ -165,6 +165,15 @@ def t2_derive_capabilities():
     check("SESSDATA" in c["fetch"]["reason"], "独立+missing：reason 指向 SESSDATA", c["fetch"])
     check(c["backup"]["available"] is True, "独立+missing：backup 仍可用")
 
+    # 阶段 1.5 ④：值域扩为 5 值，valid 与 present 同视为可用，invalid 明确不可用
+    c = store.derive_capabilities(mk_probe(reachable=False, fsess="valid"))
+    check(c["fetch"]["available"] is True, "独立+valid：fetch 可用（联网验证通过）")
+    eq(c["fetch"]["owner"], "finder", "独立+valid：fetch owner=finder")
+    c = store.derive_capabilities(mk_probe(reachable=False, fsess="invalid"))
+    check(c["fetch"]["available"] is False, "独立+invalid：fetch 不可用")
+    check("SESSDATA" in c["fetch"]["reason"], "独立+invalid：reason 指向 SESSDATA", c["fetch"])
+    check(c["backup"]["available"] is True, "独立+invalid：backup 仍可用")
+
     # unknown（探测不出结论）走保守分支 —— 不让用户点一个必然失败的抓取
     c = store.derive_capabilities(mk_probe(reachable=False, fsess="unknown"))
     check(c["fetch"]["available"] is False, "独立+unknown：fetch 保守不可用（unknown ≠ present）")
@@ -180,6 +189,29 @@ def t2_derive_capabilities():
     # 空 / 脏入参不炸
     check(store.derive_capabilities({})["fetch"]["available"] is False, "空 probe → fetch 不可用")
     check(store.derive_capabilities(None)["sync"]["available"] is True, "None probe → 不炸")
+
+
+# ---------------------------------------------------------------- T2.2 接口码表
+
+def t22_api_code_table():
+    sec("T2.2 接口码表（阶段 1.5 ①）—— classify_api_code / classify_http_status 纯函数")
+    # collector 顶层无 IO（只 import 标准库 + 定义常量/函数），与 store 同属可安全 import 的模块。
+    import collector
+
+    eq(collector.classify_api_code(-101)[0], "fatal", "-101 未登录 → fatal")
+    eq(collector.classify_api_code(-111)[0], "fatal", "-111 csrf → fatal")
+    eq(collector.classify_api_code(-412)[0], "backoff", "-412 风控 → backoff")
+    eq(collector.classify_api_code(-509)[0], "backoff", "-509 限流 → backoff")
+    eq(collector.classify_api_code(0), ("retry", ""), "未收录码 → 保守按 retry、无附注")
+    eq(collector.classify_api_code(-99999)[0], "retry", "未知码 → retry（不因未知而放弃同步）")
+
+    eq(collector.classify_http_status(412)[0], "backoff", "HTTP 412 → backoff")
+    eq(collector.classify_http_status(429)[0], "backoff", "HTTP 429 → backoff")
+    eq(collector.classify_http_status(500)[0], "retry", "HTTP 500 → retry")
+    eq(collector.classify_http_status(404), ("retry", ""), "未收录 HTTP 码 → retry")
+
+    # 码表必须能答出可读中文（用于日志 / 前端 hint），不是只有分类
+    check(collector.classify_api_code(-412)[1], "风控类码带可读说明", collector.classify_api_code(-412))
 
 
 # ---------------------------------------------------------------- T2.5 跨度说明
@@ -211,6 +243,45 @@ def t25_span_advisory():
 
 # ---------------------------------------------------------------- T3 策略层
 
+def t26_analyzer_skippable(tmp):
+    """阶段 2 修正 A2：探测结论必须**会失效**，且不能只凭「HTTP 不可达」就跳过读文件。"""
+    sec("T2.6 _analyzer_skippable —— 跳过主源读取的三条前置（TTL / mtime / 撤销）")
+    a = os.path.join(tmp, "fake_analyzer.db")
+    l = os.path.join(tmp, "fake_local.db")
+    for p in (a, l):
+        with open(p, "wb") as f:
+            f.write(b"x")
+    os.utime(a, (NOW, NOW))
+    os.utime(l, (NOW + 10, NOW + 10))          # 本地库更新 → 主源不新
+
+    oa, ol = store.ANALYZER_DB, store.LOCAL_DB
+    ottl = store.ANALYZER_PROBE_TTL
+    oprobe = dict(store._ANALYZER_PROBE)
+    try:
+        store.ANALYZER_DB, store.LOCAL_DB = a, l
+        store.note_analyzer_usable(None)
+        eq(store._analyzer_skippable(), False, "尚未探测 → 照读（不跳过）")
+        store.note_analyzer_usable(True)
+        eq(store._analyzer_skippable(), False, "结论=可达 → 不跳过")
+        store.note_analyzer_usable(False)
+        eq(store._analyzer_skippable(), True, "不可达 + 未过期 + 主源不新 → 可跳过")
+        os.utime(a, (NOW + 100, NOW + 100))
+        eq(store._analyzer_skippable(), False,
+           "主源 mtime 更新（迁移后又被 Analyzer 写过）→ **不得跳过**")
+        os.utime(a, (NOW, NOW))
+        store._ANALYZER_PROBE["at"] = int(time.time()) - 400
+        eq(store._analyzer_skippable(), False, "结论过期（> TTL）→ 不再跳过（A2 的核心修正）")
+        store.note_analyzer_usable(None)
+        eq(store._analyzer_skippable(), False, "撤销（None）→ 回到尚未探测")
+        store.note_analyzer_usable(False)
+        store.ANALYZER_DB = os.path.join(tmp, "nope.db")
+        eq(store._analyzer_skippable(), False, "主源 mtime 读不到 → 保守不跳过")
+    finally:
+        store.ANALYZER_DB, store.LOCAL_DB = oa, ol
+        store.ANALYZER_PROBE_TTL = ottl
+        store._ANALYZER_PROBE.update(oprobe)
+
+
 def t3_decide_sync_plan():
     sec("T3 decide_sync_plan —— 规则表 R1–R6 + 覆盖（唯一决定增量/全量的地方）")
 
@@ -237,6 +308,11 @@ def t3_decide_sync_plan():
     r = plan({"last_incremental_no_baseline": True})
     eq(r["mode"], "full", "R2 上次增量报缺基线 → full")
     check("缺基线" in r["reason"], "R2 reason")
+
+    # R2 的**冷却收敛**（阶段 2 修正 A1）：缺基线不该让冷却形同不存在
+    r = plan({"last_incremental_no_baseline": True, "last_full_at": NOW - 300})
+    eq(r["mode"], "skip", "R2 命中但 5 分钟前刚全量过 → skip（不再连点全量）")
+    check("冷却" in r["reason"], "R2 收敛 reason 说明冷却中", r["reason"])
 
     # R3 长尾缺口 —— 判据是"**本地库丢过数据**"（当前跨度 vs 历史峰值）
     r = plan(probe=mk_probe(reachable=True, a_days=2400, l_days=30),
@@ -283,6 +359,12 @@ def t3_decide_sync_plan():
     r = store.decide_sync_plan(mk_probe(reachable=False, fsess="present"),
                                {"sync": "full"}, dict(base))
     eq(r["mode"], "full", "R5 通过后 override 才生效")
+    # 阶段 1.5 ④：valid 与 present 同放行；invalid 明确 blocked（reason 说明已验证失效）
+    eq(store.decide_sync_plan(mk_probe(reachable=False, fsess="valid"), {}, dict(base))["mode"],
+       "incremental", "R5：valid 放行（联网验证通过 → 不 blocked）")
+    r = store.decide_sync_plan(mk_probe(reachable=False, fsess="invalid"), {}, dict(base))
+    eq(r["mode"], "blocked", "R5：invalid → blocked")
+    check("失效" in r["reason"], "R5：invalid 的 reason 说明已验证失效", r["reason"])
 
     # 显式覆盖（Q3 的隐藏 override）
     r = plan(policy={"sync": "full"})
@@ -308,7 +390,8 @@ def t3_decide_sync_plan():
     # ---- 一致性地板：`capabilities.fetch` 与 `plan.mode` 必须互相自洽 ----
     # （两处共用同一判据；任一侧写歪，这里立刻报红 —— 这是"能力层是唯一判断处"的护栏）
     for reachable, fsess in ((True, "unknown"), (True, "present"), (False, "missing"),
-                             (False, "unknown"), (False, "present")):
+                             (False, "unknown"), (False, "present"),
+                             (False, "valid"), (False, "invalid")):
         pr = mk_probe(reachable=reachable, fsess=fsess)
         can = store.derive_capabilities(pr)["fetch"]["available"]
         mode = store.decide_sync_plan(pr, {}, dict(base))["mode"]
@@ -606,11 +689,13 @@ def main():
 
     t1_normalize_policy()
     t2_derive_capabilities()
+    t22_api_code_table()
     t25_span_advisory()
     t3_decide_sync_plan()
 
     tmp = tempfile.mkdtemp(prefix="bhf_test_")
     try:
+        t26_analyzer_skippable(tmp)
         t4_span_and_meta(tmp)
         t5_policy_io(tmp)
     finally:

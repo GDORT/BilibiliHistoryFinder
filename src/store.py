@@ -183,9 +183,11 @@ def _read_local(db_path):
             cur = con.cursor()
             cur.execute("SELECT name FROM pragma_table_info('history')")
             have = {r[0] for r in cur.fetchall()}
-            base = ["kid", "title", "author_name", "author_mid", "view_at", "bvid",
+            base = ["kid", "title", "author_name", "author_mid", "view_at", "bvid", "oid",
                     "business", "cover", "progress", "duration", "uri", "archived_only",
-                    "raw_json"]
+                    "raw_json",
+                    # 阶段 0 P2 迁移带进来的备注列（老库没有时由 pragma 过滤自动跳过）
+                    "remark", "remark_time"]
             sel = [c for c in base if c in have]
             recs = {}
             for row in cur.execute(f"SELECT {', '.join(sel)} FROM history"):
@@ -272,6 +274,50 @@ def _fold_latest_by_bvid(records):
     return rest + out
 
 
+# 阶段 2：Analyzer 可用性提示 —— 由 `server.probe_connection()`（唯一做网络 IO 的那层）刷新。
+# `None` = 「尚未探测」→ 保持旧行为（照读 Analyzer 年表），避免启动早期就误跳过。
+#
+# ⚠️ 阶段 2 修正一（A2）：**结论必须会过期，且不能只凭"HTTP 不可达"就跳过读文件**
+#    - 原先是一个「一次 False 就永久 False」的全局开关：Analyzer 重启后旧结论不失效，
+#      auto 模式会**长期**跳过主源、停在本地快照上（而横幅另走 `/api/fetcher-health`，
+#      显示的是"已连接"）→ 横幅说连着、数据却是旧的。
+#    - 三条同时成立才允许跳过（`_analyzer_skippable()`）：近期探测过 + 结论不可达 + 主源文件不新。
+#      第三条是关键 —— **读文件不需要服务在线**：迁移之后若 Analyzer 又写过主源
+#      （mtime 更新），它就可能含本地库没有的记录/备注，此时必须照读。
+_ANALYZER_PROBE = {"usable": None, "at": 0}
+ANALYZER_PROBE_TTL = 300          # 秒；与前端 /api/fetcher-health 轮询同量级
+
+
+def note_analyzer_usable(flag):
+    """发布一次探测结论（server 层调用）。`None` = 撤销提示、回到「尚未探测」。
+
+    带时间戳 —— 结论只在一小段时间内有效（见 `_analyzer_skippable()`）。
+    """
+    _ANALYZER_PROBE["usable"] = None if flag is None else bool(flag)
+    _ANALYZER_PROBE["at"] = int(time.time())
+
+
+def _analyzer_skippable():
+    """auto 模式下能否安全跳过 Analyzer 年表读取 —— 三条**同时**成立才行：
+
+    ① 最近一次探测结论是「不可达」；② 该结论未过期（`ANALYZER_PROBE_TTL`）；
+    ③ 主源库文件不比本地库更新（否则它可能含本地库没有的记录）。
+    任一条不成立都照读 —— **正确性优先于省一次 UNION**。
+
+    注意：阶段 0 迁移后「本地库 ⊇ Analyzer 记录、合并结果不变」只是**迁移那一刻**的时点
+    事实，不是不变量（运行期没有任何把 Analyzer 新数据回灌本地库的机制）—— 故本条不许
+    被当作长期等价关系使用。
+    """
+    if _ANALYZER_PROBE.get("usable") is not False:
+        return False
+    if int(time.time()) - int(_ANALYZER_PROBE.get("at") or 0) > ANALYZER_PROBE_TTL:
+        return False
+    try:
+        return os.path.getmtime(ANALYZER_DB) <= os.path.getmtime(LOCAL_DB)
+    except OSError:
+        return False               # mtime 读不到（文件缺失/无权限）→ 保守照读
+
+
 def load_raw_records():
     """读取数据源并按「数据源主开关」合并为 canonical derived 列表。
 
@@ -279,12 +325,20 @@ def load_raw_records():
     合并策略（mode=local）：只用本地 Finder 库。
     auto 会在 Analyzer 读不到记录时**自动降级本地**，并把 effective 记入 _LAST_SOURCE 供前端横幅提示。
     返回 list[dict]，每项含规则引擎所需字段 + 展示字段 + 聚合字段（session_count/first_view_at/kids）。
+
+    阶段 2：`mode=local`，或 `mode=auto` 且判定「主源这次读不读都一样」时
+    （`_analyzer_skippable()`，判据见其上），直接跳过 Analyzer 年表读取 —— 这两种情况下
+    它的结果本来就会被 `_pick_sources()` 丢弃。`mode=analyzer`（用户强制主源）不跳过。
     """
-    analyzer = _read_analyzer(ANALYZER_DB)
+    mode = get_source_mode()                      # 只读一次：同一函数内两次读可能拿到不同值（A8）
+    if mode == "local" or (mode == "auto" and _analyzer_skippable()):
+        analyzer = {}
+    else:
+        analyzer = _read_analyzer(ANALYZER_DB)
     local = _read_local(LOCAL_DB)
-    merged, effective = _pick_sources(get_source_mode(), analyzer, local)
+    merged, effective = _pick_sources(mode, analyzer, local)
     _LAST_SOURCE.update({
-        "requested": get_source_mode(),
+        "requested": mode,
         "effective": effective,
         "analyzer": len(analyzer),
         "local": len(local),
@@ -606,21 +660,28 @@ def derive_capabilities(probe):
     ana = conn.get("analyzer") if isinstance(conn.get("analyzer"), dict) else {}
     fin = conn.get("finder") if isinstance(conn.get("finder"), dict) else {}
     reachable = bool(ana.get("reachable"))
-    # 阶段 1 契约：finder.sessdata ∈ missing | present | unknown（**只本地判定、不联网**）。
-    # `present` 仅表示"config.json 里已填写"，**不代表有效** —— 真实探测属阶段 2 的 D 项。
+    # finder.sessdata 值域（阶段 1.5 ④ 扩展）：
+    #   missing —— config.json 未填写
+    #   present —— 已填写但**未联网验证**（周期路径恒为这个值，见 server._finder_sessdata_status）
+    #   valid / invalid —— 真实探测（GET /api/finder-session-check）后的结论
+    #   unknown —— 探测失败或结果不确定
+    # 兼容性硬约束：`present` 与 `valid` **都视为可用**（不改变阶段 1 已验证的语义），
+    # `invalid` 视为不可用并说明原因。
     fsess = fin.get("sessdata") or "unknown"
 
     caps = {}
     # fetch：写源库的抓取 —— 组合形态走 Analyzer 中继（凭证在 Analyzer）；
     # 独立形态走本地 collector，需要 Finder 自持凭证（与 R5 同一判据）。
-    # 只有 `present`（已填写）才给"可以抓"的乐观结论；`missing` / `unknown` 一律保守 ——
+    # 只有 `present` / `valid` 才给"可以抓"的结论；`missing` / `invalid` / `unknown` 一律保守 ——
     # 这一项决定"要不要让用户点一个会写源库的按钮"，探不出结论就不该让他点了再失败（D2）。
     if reachable:
         caps["fetch"] = _cap(True, "analyzer", "")
-    elif fsess == "present":
+    elif fsess in ("present", "valid"):
         caps["fetch"] = _cap(True, "finder", "")
     elif fsess == "missing":
         caps["fetch"] = _cap(False, "finder", "需要有效 SESSDATA（config.json 未填写）")
+    elif fsess == "invalid":
+        caps["fetch"] = _cap(False, "finder", "SESSDATA 已失效（联网验证不通过），请更新 config.json")
     else:
         caps["fetch"] = _cap(False, "finder", "无法确认本地凭证（Finder SESSDATA 未知）")
 
@@ -695,10 +756,10 @@ def decide_sync_plan(probe, policy, state):
 
     | 规则 | 条件（owner = `_plan_owner()`）                          | 产出          |
     | --- | ----------------------------------------------------- | ----------- |
-    | R5* | owner=finder **且** Finder 凭证非 `present`（即 missing / unknown） | `blocked`   |
+    | R5* | owner=finder **且** Finder 凭证不可用（missing / invalid / unknown） | `blocked`   |
     | 覆盖 | `policy.sync` 显式指定 full / incremental                  | 同名          |
     | R1  | 首次建基线（`last_success_at` 缺失 **或** 本地库为空）             | `full`      |
-    | R2  | 上次增量报「未找到本地历史记录」（缺基线）                                 | `full`      |
+    | R2  | 上次增量报「未找到本地历史记录」（缺基线）**且不在全量冷却内**              | `full`      |
     | R3  | 本地跨度比**历史峰值**少 > `gap_threshold_days` **且** 距上次全量 > `full_interval_days` | `full`      |
     | R4  | 距上次全量 < `full_cooldown_min`                           | `skip`      |
     | R6  | 默认                                                    | `incremental` |
@@ -706,14 +767,18 @@ def decide_sync_plan(probe, policy, state):
     > **对 D6 的两处实现说明（都是有意的）**
     > 1. **R5 提到规则表之前** —— 它是安全闸门，`sync` override 与 R1–R4 **都不应绕过它**
     >    （否则 `?full=1` 会在没凭证时发起一次必然失败的抓取）。
-    > 2. **R5 的判据从 D6 的「`prefer=local` 且凭证无效」收紧为「`owner=finder` 且凭证非 `present`」** ——
+    > 2. **R5 的判据从 D6 的「`prefer=local` 且凭证无效」收紧为「`owner=finder` 且凭证不可用」** ——
     >    ① 这样"独立形态下没有凭证"也被挡住，而不只是显式选了 local 时；
-    >    ② 它与 `derive_capabilities()` 的 `fetch` 项**共用同一判据**（只有 `present` 放行），
+    >    ② 它与 `derive_capabilities()` 的 `fetch` 项**共用同一判据**（阶段 1.5 ④ 后为
+    >       `present` / `valid` 放行，`missing` / `invalid` / `unknown` 挡住），
     >       避免出现"能力说不能抓、策略说可以增量"的自相矛盾。
     >
     > R3 的判据是"**本地库丢过数据**"（当前跨度 vs 历史峰值），**不是**"主源比本地长多少" ——
     > 后者是 B站接口只保留近三个月造成的**结构性差异**，拿它当判据会让本条在任何状态下命中、
     > 每 `full_interval_days` 白跑一次全量（实测教训，见下面代码注释）。
+    >
+    > 3. **R2 与 R4 的判据共用**（阶段 2 修正 A1）—— 「缺基线」在冷却期内不再升级为全量，
+    >    否则该标记一旦粘住，每次点击都会跑一次全量、且冷却形同不存在。
 
     返回 `{"mode": "full|incremental|skip|blocked", "reason": "...", "owner": "analyzer|finder"}`。
     """
@@ -736,11 +801,13 @@ def decide_sync_plan(probe, policy, state):
 
     # ---- R5（安全闸门，前置）----
     # 判据与 `derive_capabilities()` 的 fetch 项**完全一致**（一处判断、两处消费）——
-    # 否则会出现"能力说不能抓、策略说可以增量"的自相矛盾。只有 `present` 放行。
-    if owner == "finder" and fsess != "present":
+    # 否则会出现"能力说不能抓、策略说可以增量"的自相矛盾。`present` / `valid` 放行
+    # （阶段 1.5 ④：`valid` 是联网验证通过；`present` 是"已填写、未验证"的乐观结论）。
+    if owner == "finder" and fsess not in ("present", "valid"):
         return {"mode": "blocked", "owner": "finder",
                 "reason": "需要有效 SESSDATA（config.json %s，无法本地抓取）"
-                          % ("未填写" if fsess == "missing" else "状态未知")}
+                          % ("未填写" if fsess == "missing"
+                             else ("已验证失效" if fsess == "invalid" else "状态未知"))}
 
     # ---- 显式覆盖（policy.sync —— Q3 的隐藏 override，不进 UI）----
     ov = policy.get("sync")
@@ -751,6 +818,9 @@ def decide_sync_plan(probe, policy, state):
 
     last_success = state.get("last_success_at")
     last_full = state.get("last_full_at")
+    # 冷却判据**前置**计算：R2 也要用它收敛，见下（A1 的加重项 —— 原先 R2 排在 R4 之前，
+    # 冷却对「缺基线」这条路完全不起作用）。
+    cooling = last_full is not None and (now - int(last_full)) < full_cd
 
     # ---- R1 首次建基线 ----
     if not last_success or not int(state.get("local_count") or 0):
@@ -759,6 +829,11 @@ def decide_sync_plan(probe, policy, state):
 
     # ---- R2 缺基线自动升级（= 现有 /api/fetcher-trigger 回退逻辑的判据）----
     if state.get("last_incremental_no_baseline"):
+        # 收敛（A1）：冷却期内刚全量过 → 这次不必再全量（缺基线要么已被那次全量解决，
+        # 要么那次全量的成功会清掉本标记，见 server._note_full_success）。
+        if cooling:
+            return {"mode": "skip", "owner": owner,
+                    "reason": "缺基线，但 %d 秒前刚跑过全量，冷却中" % (now - int(last_full))}
         return {"mode": "full", "owner": owner, "reason": "缺基线，自动升级为全量"}
 
     # ---- R3 长尾缺口修复 ----
@@ -780,7 +855,7 @@ def decide_sync_plan(probe, policy, state):
                     "reason": "修复长尾缺口（本地跨度比历史峰值少 %d 天）" % drop}
 
     # ---- R4 防连点 ----
-    if last_full is not None and (now - int(last_full)) < full_cd:
+    if cooling:
         return {"mode": "skip", "owner": owner,
                 "reason": "刚刚跑过（%d 秒前），冷却中" % (now - int(last_full))}
 
@@ -960,6 +1035,32 @@ def save_skip(kid, manual_skip=None, auto_exempt=None, archived=None):
             (kid, ms, ae, ar),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_skip_states(kids):
+    """删除侧状态库中指定 kid 的 `skip_state` 行（阶段 1.5 ③：删本地记录时同步清孤儿状态）。
+
+    **只写自己的侧状态库**（data/canonical_state.db），不触碰任何源库 —— 与文件头
+    「源库只读」的契约一致。返回实际清理行数；单事务、失败回滚。
+    """
+    kids = [str(k) for k in (kids or []) if k is not None and str(k).strip()]
+    if not kids:
+        return 0
+    conn = _state_conn()
+    try:
+        _ensure_state_schema(conn)
+        n = 0
+        for i in range(0, len(kids), 500):   # 分片：避开 sqlite 变量上限（默认 999）
+            part = kids[i:i + 500]
+            q = "DELETE FROM skip_state WHERE kid IN (%s)" % ",".join("?" * len(part))
+            n += conn.execute(q, part).rowcount
+        conn.commit()
+        return n
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

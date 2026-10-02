@@ -22,6 +22,13 @@ Finder 自动改发全量 `/fetch/bili-history`（对齐开源 Frontend 的回�
   用例2 基线正常(ok)      → 不得回退（只有 realtime 一个请求）
   用例3 其它错误(非该消息) → 不得回退（证明不是「任何 error 都回退」）
 
+阶段 2 起回退抽成共享 helper（`_analyzer_incremental_with_fallback`），「同步数据」按钮
+（`POST /api/sync`）也走它；**附加组**对 `/api/sync` 用同款假 Analyzer 再断言一次
+（用例A 缺基线必回退 / 用例B 正常不回退），证明收敛后行为一致。
+**新增组（A1）**再用**默认策略**跑两条：缺基线 + 冷却内 → skip（不发请求、原因可达前端）；
+缺基线 + 已过冷却 → 全量成功后 `no_baseline` **必须被清**、`last_full_at` 被记 ——
+附加组因为加了 `policy.sync` override（把 R2 短路）抓不到这两件事。
+
 不启动对外服务（只绑 127.0.0.1 临时端口）、不读写历史数据、不连 B站。
 """
 
@@ -35,6 +42,7 @@ import socketserver
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -78,6 +86,22 @@ def _mk_srv(handler_cls):
 
 def _get(port, path, timeout=30):
     req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path), method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode("utf-8", "replace"))
+        except Exception:
+            return e.code, None
+
+
+def _post(port, path, body=None, timeout=30):
+    data = json.dumps(body).encode("utf-8") if body is not None else b""
+    req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path),
+                                 data=data, method="POST")
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read().decode("utf-8", "replace"))
@@ -217,6 +241,149 @@ def main():
         mock_srv.shutdown()
         mock_srv.server_close()
 
+    # ---------------- 附加组：POST /api/sync 走同一份回退 helper ----------------
+    # 阶段 2 把回退从 /api/fetcher-trigger 抽成 _analyzer_incremental_with_fallback，
+    # 「同步数据」按钮（/api/sync）现在也走它 —— 本组证明收敛后行为一致。
+    # 判据改由 probe + decide_sync_plan 决定：用 policy override 把 owner 钉在 analyzer、
+    # mode 钉在 incremental（**仅内存替换 load_policy，零写盘**）；probe 仍真实（打假 /health）。
+    print("\n" + "-" * 74)
+    print("  附加组：POST /api/sync（「同步数据」）—— 同款回退判据（阶段 2 收敛验证）")
+    print("-" * 74)
+    orig_load_policy = server.store.load_policy
+    server.store.load_policy = lambda: {
+        "prefer": "auto", "sync": "incremental",
+        "rules": dict(server.store.POLICY_DEFAULT["rules"])}
+    sync_cases = [
+        ("sync 用例A 缺基线", mock_mod.NO_BASELINE, True,
+         "Analyzer 增量报「未找到本地历史记录」", "必须回退 → 2 个请求(增量→全量)"),
+        ("sync 用例B 基线正常", {"status": "ok", "message": "增量完成"}, False,
+         "增量返回正常 ok", "不得回退 → 1 个请求(仅增量)"),
+    ]
+    s_passed = 0
+    try:
+        for name, inc_body, expect_fb, desc, expect_req in sync_cases:
+            server.sync_state["no_baseline"] = False
+            pulled.clear()
+            H, hits = _make_handler(
+                mock_mod, inc_body,
+                "增量 → %s" % json.dumps(inc_body, ensure_ascii=False)[:34])
+            mock_srv = _mk_srv(H)
+            mport = mock_srv.server_address[1]
+            threading.Thread(target=mock_srv.serve_forever, daemon=True).start()
+
+            server.FETCHER_OVERRIDE["base"] = "http://127.0.0.1:%d" % mport
+            httpd = _mk_srv(server.Handler)
+            aport = httpd.server_address[1]
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+            st, resp = _post(aport, "/api/sync")
+
+            got_fb = (resp or {}).get("fallback_to_full") is True
+            seq = list(hits)
+            req_ok = seq == (["增量", "全量"] if expect_fb else ["增量"])
+            ok = (st == 200) and (got_fb == expect_fb) and req_ok
+            s_passed += 1 if ok else 0
+
+            print("\n[%s] %s" % ("PASS" if ok else "FAIL", name))
+            print("      场景   : %s" % desc)
+            print("      期望   : %s" % expect_req)
+            print("      HTTP   : %d" % st)
+            print("      engine : %s / mode %s / started %s"
+                  % ((resp or {}).get("engine"), (resp or {}).get("mode"),
+                     (resp or {}).get("started")))
+            print("      回退   : fallback_to_full = %s（期望 %s）" % (got_fb, expect_fb))
+            print("      假后端收到: %s" % (seq if seq else "（无）"))
+
+            httpd.shutdown()
+            httpd.server_close()
+            mock_srv.shutdown()
+            mock_srv.server_close()
+        # ---------------- 新增组：A1 —— `no_baseline` 不再粘住 / 冷却收敛 ----------------
+        # **为什么必须新增**：用例A/B 用 `policy.sync="incremental"` 把 R2 短路了
+        # （override 排在 R1–R4 之前），所以「缺基线标记一旦粘住，此后每次都全量」这个
+        # 真缺陷**根本测不出来** —— 本组改用**默认策略**（不加 override），真正走 R2 / R4。
+        print("\n" + "-" * 74)
+        print("  新增组（A1）：缺基线标记的清除与冷却收敛 —— 默认策略，不短路 R2")
+        print("-" * 74)
+        server.store.load_policy = lambda: dict(server.store.POLICY_DEFAULT)
+        orig_plan_state = server._sync_plan_state
+
+        def _plan_state_with(**kw):
+            base = {"now": int(time.time()),
+                    "last_success_at": int(time.time()) - 3600,
+                    "last_full_at": int(time.time()) - 86400 * 30,
+                    "local_count": 999,
+                    "last_incremental_no_baseline": False,
+                    "span_peak_days": None}
+            base.update(kw)
+            return lambda: dict(base)
+
+        def _run_sync_case(label, plan_state, full_status, note):
+            """起一对假后端 + Finder，POST /api/sync，返回 (http, resp, hits)。"""
+            server._sync_plan_state = plan_state
+            if full_status is not None:
+                mock_mod.FULL_STATUS = full_status
+            H, hits = _make_handler(mock_mod, mock_mod.NO_BASELINE, note)
+            msrv = _mk_srv(H)
+            mport = msrv.server_address[1]
+            threading.Thread(target=msrv.serve_forever, daemon=True).start()
+            server.FETCHER_OVERRIDE["base"] = "http://127.0.0.1:%d" % mport
+            hsrv = _mk_srv(server.Handler)
+            aport = hsrv.server_address[1]
+            threading.Thread(target=hsrv.serve_forever, daemon=True).start()
+            try:
+                st, resp = _post(aport, "/api/sync")
+            finally:
+                hsrv.shutdown()
+                hsrv.server_close()
+                msrv.shutdown()
+                msrv.server_close()
+            return st, resp, list(hits)
+
+        orig_full_status = mock_mod.FULL_STATUS
+        a1_passed = 0
+        try:
+            # A1-1：缺基线 + **冷却期内**（100 秒前刚全量过）→ 必须 skip，且不发任何请求
+            server.sync_state["no_baseline"] = True
+            st, resp, hits = _run_sync_case(
+                "A1-1", _plan_state_with(last_incremental_no_baseline=True,
+                                         last_full_at=int(time.time()) - 100),
+                None, "不应被调用")
+            last = server.sync_state.get("last") or {}
+            ok1 = (st == 200 and (resp or {}).get("skipped") is True and hits == []
+                   and "冷却" in str(last.get("err") or "")
+                   and server.sync_state["no_baseline"] is True)
+            a1_passed += 1 if ok1 else 0
+            print("\n[%s] A1-1 缺基线 + 冷却内 → skip（不发起请求）" % ("PASS" if ok1 else "FAIL"))
+            print("      HTTP    : %d ｜ skipped=%s ｜ 假后端收到=%s"
+                  % (st, (resp or {}).get("skipped"), hits or "（无）"))
+            print("      reason  : %s" % (resp or {}).get("reason"))
+            print("      sync_state['last'].err: %s" % last.get("err"))
+            print("      期望   : 不重跑全量；原因能经 GET /api/sync 的 last 到达前端（A4）")
+
+            # A1-2：缺基线 + **已过冷却** → 走全量；全量成功后标记**必须被清**
+            server.sync_state["no_baseline"] = True
+            server.sync_state["last_full_at"] = 0
+            st, resp, hits = _run_sync_case(
+                "A1-2", _plan_state_with(last_incremental_no_baseline=True),
+                200, "全量（mock 200）")
+            ok2 = (st == 200 and hits == ["全量"]
+                   and server.sync_state["no_baseline"] is False
+                   and int(server.sync_state.get("last_full_at") or 0) > 0)
+            a1_passed += 1 if ok2 else 0
+            print("\n[%s] A1-2 缺基线 + 已过冷却 → 全量成功即清标记" % ("PASS" if ok2 else "FAIL"))
+            print("      假后端收到: %s（期望 ['全量']）" % (hits or "（无）"))
+            print("      no_baseline  : %s（期望 False）" % server.sync_state["no_baseline"])
+            print("      last_full_at : %s（期望 > 0 —— R4 冷却对 Analyzer 才生效）"
+                  % server.sync_state.get("last_full_at"))
+        finally:
+            mock_mod.FULL_STATUS = orig_full_status
+            server._sync_plan_state = orig_plan_state
+
+    finally:
+        server.store.load_policy = orig_load_policy
+        server.sync_state["no_baseline"] = False
+
     after = _snapshot()
     print("\n" + "=" * 74)
     print("  零污染核对")
@@ -230,11 +397,13 @@ def main():
     shutil.rmtree(server.RUN_DIR, ignore_errors=True)
     _restore_proxy()
 
+    total = len(cases) + len(sync_cases) + 2
+    passed_total = passed + s_passed + a1_passed
     print("\n总体：%s（%d/%d 通过%s）" % (
-        "全部通过" if (passed == len(cases) and same) else "存在失败",
-        passed, len(cases),
+        "全部通过" if (passed_total == total and same) else "存在失败",
+        passed_total, total,
         "，零污染" if same else "，⚠️ 有污染"))
-    return 0 if (passed == len(cases) and same) else 1
+    return 0 if (passed_total == total and same) else 1
 
 
 if __name__ == "__main__":

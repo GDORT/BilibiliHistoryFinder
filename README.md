@@ -171,18 +171,19 @@ BilibiliHistoryFinder/
 
 **源码副本（只读参考，非文档）**：`doc/BilibiliHistoryFetcher-master/`（Analyzer/Fetcher 后端源码）· `doc/BiliHistoryFrontend-master/`（开源前端，Tauri/Vue3）—— **说明与状态见 `doc/README.md` §6**，本节不复述。
 
-**开发工具（`dev/`，非文档，共 6 个脚本）**：用途 / 跑法 / 共同安全约定与写新脚本的经验见 **`dev/README.md`**（测试资产手册）。一句话定位：
+**开发工具（`dev/`，非文档，共 7 个脚本）**：用途 / 跑法 / 共同安全约定与写新脚本的经验见 **`dev/README.md`**（测试资产手册）。一句话定位：
 
 | 脚本 | 定位 |
 | --- | --- |
-| `test_capabilities.py` | 「连接即模式」阶段 1 的**纯函数单测**（零 IO、秒级）；`--live` 追加一次端点冒烟 |
+| `test_capabilities.py` | 「连接即模式」阶段 1 的**纯函数单测**（零 IO、秒级，196 项）；`--live` 追加一次端点冒烟（226 项） |
 | `regression_restart.py` | **⑥ 重启链路的常驻回归**（42/42/42 ＋ 旧设计 `0/0/0` 对照） |
-| `regression_fallback.py` | **② 增量 → 全量自动回退**的端到端回归 |
-| `verify_riskfix.py` | **风险审查修复的自动化验收**（60 项断言；整进程隔离副本） |
+| `regression_fallback.py` | **② 增量 → 全量自动回退**的端到端回归（7 项，含缺基线标记的清除与冷却收敛） |
+| `verify_riskfix.py` | **风险审查修复的自动化验收**（67 项断言；整进程隔离副本） |
 | `mock_analyzer.py` | **假 Analyzer** —— 离线复现 ② 回退分支；`set BHF_MOCK_FULL=200` 可放行全量 |
 | `stub_fetcher.py` | **假控制后端** —— 真实 Analyzer 不在时验证控制流闭合 |
+| `migrate_p2.py` | **阶段 0 · P2 一次性数据迁移**（Analyzer 长尾 / 缺口 → 本地库）；默认 `--dry-run`，`--apply` 才写 |
 
-六个脚本**只绑 `127.0.0.1` 随机端口、不启动对外服务、不读写任何历史数据**，写盘全部重定向到临时目录。
+其中六个**测试**脚本**只绑 `127.0.0.1` 随机端口、不启动对外服务、不读写任何历史数据**，写盘全部重定向到临时目录；`migrate_p2.py` 是**唯一会写真实本地库**的脚本（数据操作，需手动 `--apply`）。
 
 **归档溯源（`doc/archive/`，19 份，冻结不动）**：三轴方案原稿（`方案-后端与数据源` / `方案-前端` / `方案-油猴D`）、`方案-连接即模式`、`方案-Finder轻量化`、拆分前定稿、架构 / 规则 / 验证报告、源码评估、评估期与原型期原始文档等。**逐份清单（19 份全覆盖）见 [`doc/README.md`](doc/README.md) §2.1**。
 
