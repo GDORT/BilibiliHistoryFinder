@@ -21,6 +21,12 @@
   C-M1  纯空白体       `"   "` → 400（旧行为是静默当空体 → 退化成空操作）
   C-H2  单一写盘语义   改 mode 后，配置文件里**其它键（如 `policy`）必须留存**
   C-M2  span/meta 留痕  库文件损坏 → 留痕；库不存在 → 不记（与 N-H1 同一口径）
+  ---- 阶段 3 新增 ----
+  G-P   门控纯函数   抗抖动：滞回（连续 2 次才拦）／恢复不对称（1 次成功即解封）／
+                    记账过期放行／**绝不 fail-closed**（从未探测一律放行）
+  G-E   门控端到端   Analyzer 不可达时 7 个 Analyzer-only 端点返 **409**（含 capability 字段），
+                    而非 502 转发失败；**且不得误伤** 6 个本地/探测端点（尤其
+                    `/api/fetcher-health` —— 它是真相来源，门控它会导致死锁）
 
 用法：`python dev/verify_riskfix.py`
 """
@@ -67,6 +73,53 @@ def free_port():
     p = s.getsockname()[1]
     s.close()
     return p
+
+
+class _FakeAnalyzer:
+    """阶段 3 门控测试专用的**可控假后端**（只绑回环、只听本脚本）。
+
+    为什么必须有它：门控要验的是「后端**业务**不可用 → 409」，而门控的记账判据是
+    `ok and reachable` —— 真实的 Analyzer 若健康着（`/health` 返 200），门控**理应不拦**。
+    若把测试建立在「本机 Analyzer 恰好没跑」上，结果会随用户是否开着服务而漂移
+    （实测：本机 8899 有真实服务 → 门控正确地不拦 → 用例反而 FAIL）。
+    故自己起一个**能精确控制健康/故障**的后端，让断言与外部环境无关。
+
+    `mode`：`"ok"` 全返 200；`"fail"` 统一返 **502**（连得上但业务失败 ——
+    正是 `_forward_fetcher` 会判 `reachable=True` 的那种，最能体现门控的业务级判据）。
+    """
+
+    def __init__(self, mode="ok"):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        self.mode = mode
+        self.hits = []
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def _reply(self):
+                outer.hits.append((self.command, self.path))
+                body = b'{"code":0,"data":{"ok":true}}' if outer.mode == "ok" \
+                    else b'{"detail":"upstream connect failed"}'
+                self.send_response(200 if outer.mode == "ok" else 502)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = do_POST = lambda self: self._reply()
+
+            def log_message(self, *a):
+                pass                      # 静音
+
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def base(self):
+        return "http://127.0.0.1:%d" % self.port
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
 
 
 def http(method, url, body=None, timeout=8):
@@ -440,6 +493,130 @@ def main():
         check(st == 200 and d.get("blocked") is not True,
               "  独立形态下**放行**（这才是本端点的有效场景）",
               "HTTP %s %s" % (st, json.dumps(d, ensure_ascii=False)[:110]))
+
+        # ---------- 阶段 3：409 能力门控 ----------
+        # 沙箱的 ANALYZER_DB 指向**幽灵库**且 8899 无服务 → 每个 Analyzer-only 端点转发必失败
+        # → 天然的门控测试床。**全程不触达真实 Analyzer、不发任何抓取请求。**
+        print("\n-- 阶段 3 · 门控纯函数：抗抖动（滞回 + 滞回不对称）")
+        store._ANALYZER_GATE.update({"ok": True, "streak": 0, "at": 0})
+        check(store.analyzer_gate_blocked() is False,
+              "  从未探测 → **放行**（绝不 fail-closed）")
+        store.note_analyzer_gate_probe(False)
+        check(store.analyzer_gate_blocked() is False,
+              "  失败 1 次 → 放行（单次抖动不足以定性）")
+        store.note_analyzer_gate_probe(False)
+        check(store.analyzer_gate_blocked() is True,
+              "  连续失败 2 次 → 拦截（滞回生效）")
+        store.note_analyzer_gate_probe(True)
+        check(store.analyzer_gate_blocked() is False,
+              "  恢复 1 次成功 → **立刻**放行（恢复不对称，无需等 TTL）")
+        store.note_analyzer_gate_probe(False)
+        store.note_analyzer_gate_probe(False)
+        store._ANALYZER_GATE["at"] = int(time.time()) - (store.ANALYZER_PROBE_TTL + 60)
+        check(store.analyzer_gate_blocked() is False,
+              "  记账过期 → 放行（陈旧结论不得永久挡住用户）")
+        store._ANALYZER_GATE.update({"ok": True, "streak": 0, "at": 0})
+        for _ in range(5):
+            store.note_analyzer_gate_probe(False)
+        check(store.analyzer_gate_blocked() is True,
+              "  连续 5 次失败 → 仍拦截（不因次数多而动摇）")
+        check(store.ANALYZER_GATE_STREAK == 2,
+              "  滞回阈值 = 2（1 次不拦、2 次才拦）", str(store.ANALYZER_GATE_STREAK))
+        store._ANALYZER_GATE.update({"ok": True, "streak": 0, "at": 0})
+
+        print("\n-- 阶段 3 · 门控端到端：Analyzer 不可用时返 409（而非 502 转发失败）")
+        # 自足假后端：mode="fail" = **连得上但业务失败**（返 502）——
+        # 这正是 `_forward_fetcher` 判 `reachable=True` 的那种，最能验证「业务级」记账。
+        fa = _FakeAnalyzer(mode="fail")
+        try:
+            # 用**产品自己的**切换端点（写 FETCHER_OVERRIDE，内存最高优先级）——
+            # 比直接改 data/fetcher_config.json 可靠：后者要经启动期快照才生效。
+            st, txt = http("POST", base + "/api/fetcher-config", {"base": fa.base()})
+            check(st == 200, "  后端已切到自足假后端（返 502 = 连得上但业务失败）",
+                  "HTTP %s %s" % (st, txt[:80]))
+            # 记账只发生在 `/api/fetcher-health`（不被门控的通路）→ 这里必须打它来推进 streak
+            st, _ = http("GET", base + "/api/fetcher-health")
+            check(st == 200, "  第 1 次探测失败 → 放行（滞回未满，旧行为）",
+                  "HTTP %s" % st)
+            st, txt = http("GET", base + "/api/fetcher-check")
+            d = json.loads(txt) if txt else {}
+            check(st in (200, 502),
+                  "  被门控的端点此刻仍放行（只失败 1 次，证据不足）",
+                  "HTTP %s" % st)
+            st, _ = http("GET", base + "/api/fetcher-health")   # 第 2 次 → streak 满 2
+            # ⭐ 审查 ①②（2026-10-03）：`/api/capabilities` 走 `probe_connection()`，与
+            # `/api/fetcher-health` 看的是**同一个** `/health` 观测 —— 必须用同一（业务级）判据
+            # 记账。此前它传传输层 `reachable`（502 也判 True），会把上面攒的 streak 清零，
+            # 于是「连得上但业务 502」时门控永不触发。回归护栏就是紧接着的那条 409 断言。
+            st, txt = http("GET", base + "/api/capabilities")
+            cap = json.loads(txt) if txt else {}
+            check(st == 200, "  `/api/capabilities` 本身不被门控 → 200", "HTTP %s" % st)
+            cc = cap.get("capabilities") or {}
+            check(cc.get("remark", {}).get("available") is False,
+                  "   业务 502：能力表判 remark 不可用（与门控同一判据，审查 ②）",
+                  json.dumps(cc.get("remark"), ensure_ascii=False))
+            check(cap.get("mode") == "standalone",
+                  "   业务 502：mode 判 standalone（不再被传输层 reachable 掩盖）", cap.get("mode"))
+            st, txt = http("GET", base + "/api/fetcher-check")
+            d = json.loads(txt) if txt else {}
+            check(st == 409 and d.get("capability") == "integrity" and d.get("ok") is False,
+                  "  连续失败后 → **409** ＋ 声明能力项", "HTTP %s %s" % (st, txt[:110]))
+            check(d.get("available") is False and d.get("owner") is None and bool(d.get("error")),
+                  "  响应体含 available/owner/error（前端阶段 4 可直接消费）", txt[:110])
+            # 门控一旦生效，**后端不应再收到请求**（这才是「前置检查」的意义）
+            n_before = len(fa.hits)
+            st, txt = http("GET", base + "/api/fetcher-trigger")
+            d = json.loads(txt) if txt else {}
+            check(st == 409 and d.get("capability") == "fetch",
+                  "  抓取入口 `/api/fetcher-trigger` → 409（capability=fetch）",
+                  "HTTP %s %s" % (st, txt[:110]))
+            check(len(fa.hits) == n_before,
+                  "   门控在**转发之前**生效（后端零请求，不是先打再拒）",
+                  "新增 %d 次" % (len(fa.hits) - n_before))
+            st, _ = http("GET", base + "/api/export/db")
+            check(st == 409, "  二进制下载 `/api/export/db` → 409（不再是 502）",
+                  "HTTP %s" % st)
+            st, _ = http("POST", base + "/api/remark",
+                         {"bvid": "BV1", "view_at": 1, "remark": "x"})
+            check(st == 409, "  写操作 `/api/remark` → 409（不半途写库）", "HTTP %s" % st)
+            st, _ = http("POST", base + "/api/images/start", {})
+            check(st == 409, "  `/api/images/start` → 409", "HTTP %s" % st)
+
+            # **解封**：后端恢复 → `/api/fetcher-health` 那一轮就会 streak 归零 → 立刻放行。
+            # 这条专门验「死锁陷阱」已被避开：被拦路径上的端点自身**不能**负责解封。
+            fa.mode = "ok"
+            st, _ = http("GET", base + "/api/fetcher-health")
+            check(st == 200, "  后端恢复后 `/api/fetcher-health` 仍 200", "HTTP %s" % st)
+            st, _ = http("GET", base + "/api/fetcher-check")
+            check(st == 200, "  **立刻**放行（一次成功即解封，不等 TTL、不靠被拦端点）",
+                  "HTTP %s" % st)
+            st, _ = http("GET", base + "/api/fetcher-check")
+            check(st == 200, "  继续放行（streak 已归零）", "HTTP %s" % st)
+        finally:
+            fa.close()
+            http("POST", base + "/api/fetcher-config", {"base": "http://127.0.0.1:1"})
+        store._ANALYZER_GATE.update({"ok": True, "streak": 0, "at": 0})
+
+        print("\n-- 阶段 3 · 门控**不得**误伤：非 Analyzer-only 端点必须照常")
+        st, _ = http("GET", base + "/api/history")
+        check(st == 200, "  `/api/history`（本地读）→ 200 不受影响", "HTTP %s" % st)
+        st, _ = http("GET", base + "/api/capabilities")
+        check(st == 200, "  `/api/capabilities` → 200 不受影响", "HTTP %s" % st)
+        st, _ = http("GET", base + "/api/export/local/db")
+        check(st in (200, 404),
+              "  `/api/export/local/db`（本地出口）→ 不被门控", "HTTP %s" % st)
+        st, _ = http("GET", base + "/api/backups")
+        check(st == 200, "  `/api/backups`（本地备份）→ 200 不受影响", "HTTP %s" % st)
+        st, _ = http("GET", base + "/api/fetcher-health")
+        check(st == 200,
+              "  `/api/fetcher-health`（探测端点本身）→ **不门控**，否则查不到真相",
+              "HTTP %s" % st)
+        st, _ = http("POST", base + "/api/backup", {})
+        check(st in (200, 400, 409),
+              "  `/api/backup`（本地备份，Finder 自有）→ 不因门控而 409", "HTTP %s" % st)
+        st, _ = http("POST", base + "/api/query", {"q": "x"})
+        check(st == 200, "  `/api/query`（本地查询）→ 200 不受影响", "HTTP %s" % st)
+        store._ANALYZER_GATE.update({"ok": True, "streak": 0, "at": 0})
 
         # ---------- N-H1 失败可观测 ----------
         print("\n-- N-H1 失败可观测（收窄版：只覆盖源读取 + 配置写入）")

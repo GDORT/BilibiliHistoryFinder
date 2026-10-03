@@ -1049,6 +1049,53 @@ def _forward_fetcher(rel_path, timeout=30, method="GET", params=None):
                 "error": f"无法连接 Analyzer/Fetcher 后端（{base}）：{reason}"}
 
 
+def _gate_note(result):
+    """阶段 3：把一次 `/health` 探测折算成门控用的「可用/不可用」并记账。
+
+    ⚠️ **不能直接用 `result["reachable"]`** —— 那是 `_forward_fetcher` 的传输层语义
+    （「连得上吗」），实测它把 **HTTP 502 也算 reachable**（`except HTTPError` 分支
+    明确写着 `"reachable": True`）。若拿它记账，会出现「Analyzer 活着但业务全面失败
+    （如上游抓取失败、代理 502）→ 门控仍认为可用 → 一个 409 都不会发」。
+
+    故这里用**业务级**判据：`ok and reachable` 才算可用 —— 任一为假都记一次失败，
+    交给 `store` 的滞回去定性。返回值即该判据。
+
+    **调用方是两条「不被门控」的探测通路**：`_health_payload()`（`/api/fetcher-health`）
+    与 `probe_connection()`（`/api/capabilities` / `/api/sync`）—— 原因（死锁陷阱）见
+    `_gate_guard()` 的说明。两者看的是**同一个 `/health` 观测**，必须用**同一判据**记账：
+    否则业务级攒起的 streak 会被传输层判据清零，门控永不触发（2026-10-03 审查 ①）。
+    """
+    ok = bool(result.get("ok")) and bool(result.get("reachable"))
+    store.note_analyzer_gate_probe(ok)
+    return ok
+
+
+def _gate_guard(handler, capability):
+    """阶段 3 · 能力门控（D4）：Analyzer-only 端点在**确定不可用**时返 409 而非 502。
+
+    判定完全委托 `store.analyzer_gate_blocked()`（纯函数、零 IO）—— 本函数**不自己探网络**。
+
+    ⚠️ **死锁陷阱（本设计的核心约束，改这块前必读）**
+    门控一旦生效，就在**入口**返回 409，请求**根本不会被转发** → 被拦路径上的任何记账
+    都不会再执行 → streak 永远不清零 → **门控再也无法自动解封**，只能等 TTL。
+    故记账权**只给 `/health` 这一条不被门控的通路**（`_health_payload` / `probe_connection`），
+    它是周期性前端轮询的端点，天然持续刷新结论：
+      · 「Analyzer 回来了」由它立刻反映 → streak 归零 → 门控自动解封（不等 TTL）；
+      · 「Analyzer 又挂了」同样由它发现，不依赖用户是否点过抓取按钮。
+
+    绝不 fail-closed：`store` 侧拿不到确定结论（从未探测 / 记账过期 / 只失败一次）时
+    一律返回 `False` ＝ 放行，行为与阶段 3 之前完全一致（转发失败 → 502）。
+
+    返回值：`True` = 已发 409，调用方必须立即 `return`；`False` = 放行。
+    """
+    if not store.analyzer_gate_blocked():
+        return False
+    reason = store._NEED_ANALYZER
+    handler._send(409, {"ok": False, "error": reason, "reason": reason,
+                        "capability": capability, "available": False, "owner": None})
+    return True
+
+
 def _analyzer_interaction_status():
     """Step4（数据自检）真正的『Analyzer 交互测试』：探测 Analyzer 是否可达 + 本服务已只读读到的 Analyzer 主源条数。
     与 Finder 自己的 collector（POST /api/sync）完全无关——那部分违反本文件设计（只读转发、不持有凭证），
@@ -1171,6 +1218,14 @@ def _health_payload(with_sessdata=True):
     # 天然充当 store 侧缓存的心跳；否则该结论只有 `/api/capabilities`（前端从不调）会刷新。
     try:
         store.note_analyzer_usable(res.get("reachable"))
+    except Exception:
+        pass
+    # 阶段 3：门控记账的**唯一权威来源**（见 `_gate_guard()` 的「死锁陷阱」）。
+    # 必须是本端点而不是被门控的那些 —— 本端点不被门控、且前端每 `SRC_POLL_MS` 必轮询一次，
+    # 于是「Analyzer 恢复了」在**一轮轮询内**就能把 streak 清零、门控自动解封（不必等 TTL）。
+    # 用业务级判据（`ok and reachable`）：HTTP 502 属「连得上但业务不可用」，也要记失败。
+    try:
+        _gate_note(res)
     except Exception:
         pass
     if with_sessdata and res.get("reachable"):
@@ -1328,6 +1383,11 @@ def probe_connection(with_sessdata=True):
     base, _key = _fetcher_cfg()
     # 阶段 2：把本次探测结论发布给 store —— `load_raw_records()` 据此在独立形态下跳过 Analyzer 年表。
     store.note_analyzer_usable(reachable)
+    # 阶段 3：同一个观测**顺带**给 409 门控记账（不额外发请求 —— `/health` 已经是权威结论）。
+    # 判据是**业务级** `ok and reachable`，与能力层、策略层共用（2026-10-03 审查 ①②）——
+    # 此前这里传的是传输层 `reachable`，会把 `/api/fetcher-health` 用业务判据攒起来的
+    # streak 清零，导致「连得上但业务 502」时门控永不触发。
+    analyzer_ok = _gate_note(health)
 
     try:
         diag = store.analyzer_db_diagnosis()
@@ -1378,7 +1438,10 @@ def probe_connection(with_sessdata=True):
     return {
         "connection": {
             "analyzer": {
+                # `reachable` = 传输层可达（保留：§2.4「跳过读主源」与旧端点超集兼容要用）；
+                # `ok` = 业务级可用 —— **能力层 / 策略层 / 409 门控的唯一判据**（2026-10-03 审查 ②）。
                 "reachable": reachable,
+                "ok": analyzer_ok,
                 "base": base,
                 "health_status": health.get("status"),
                 "error": health.get("error"),
@@ -1428,8 +1491,9 @@ def capabilities_payload(with_sessdata=True):
     ana = probe["connection"]["analyzer"]
     return {
         "ok": True,
-        # 只读结论：Analyzer 可达 → 组合形态；不可达 → 独立形态
-        "mode": "combined" if ana.get("reachable") else "standalone",
+        # 只读结论：Analyzer **可用（业务级）** → 组合形态；否则 → 独立形态。
+        # 判据与能力层 / 策略层 / 409 门控同一处（`analyzer.ok`）—— 见 2026-10-03 审查 ②。
+        "mode": "combined" if ana.get("ok") else "standalone",
         "connection": probe["connection"],
         "data": probe["data"],
         "policy": policy,
@@ -1450,11 +1514,19 @@ def _analyzer_integrity_check():
     """Step④ 数据自检（重新实现）：真正调用 Analyzer 的完整性校验子系统
     POST /data_sync/check（JSON↔DB diff）+ GET /data_sync/report（markdown 报告）。
     与 Finder 自己的 collector（POST /api/sync）完全无关——不读 sync_progress.json，
-    因此不再出现陈旧 -101。返回结构化结果供前端展示。"""
+    因此不再出现陈旧 -101。返回结构化结果供前端展示。
+
+    ⚠️ 阶段 3：**此处刻意不做门控记账**。
+    记账只认 `/health`（`_health_payload` / `probe_connection`）这一条权威观测 ——
+    原因见 `_gate_guard()` 的「死锁」注释：若本函数也记账，一旦门控在入口拦下请求，
+    它就永远不被调用 → streak 永远不清零 → **门控再也无法自动解封**。
+    """
     health = _forward_fetcher("/health", timeout=5)
-    if not health.get("reachable"):
+    # 判据与门控 / 能力层同一处（业务级 `ok and reachable`）：HTTP 502 属「连得上但业务不可用」，
+    # 此时不该再去打 `/data_sync/check`（2026-10-03 审查 ②）。键名保留供前端兼容。
+    if not (health.get("ok") and health.get("reachable")):
         return {"ok": False, "reachable": False,
-                "error": "Analyzer 不可达，无法执行自检",
+                "error": "Analyzer 不可用（健康探测未通过），无法执行自检",
                 "health": health}
     # 1) 强制跑完整性校验（同步模式，避免异步轮询复杂度）
     chk = _forward_fetcher("/data_sync/check", timeout=90, method="POST",
@@ -1844,6 +1916,9 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
         if path == "/api/fetcher-trigger":
+            # 阶段 3 门控：这是**写源库**的抓取入口（最常见的失败入口）→ 不可用时先讲清原因
+            if _gate_guard(self, "fetch"):
+                return
             # 触发 Analyzer 重新拉取/分析：?mode=full 走全量，默认增量
             mode = flat.get("mode") or ""
             # sync_deleted：默认同步删除记录（保持与 B 站一致）；前端可传 0 跳过
@@ -1864,6 +1939,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/fetcher-check":
             # Step④ 数据自检（重新实现）：真正调用 Analyzer 完整性校验 + 报告
+            if _gate_guard(self, "integrity"):
+                return
             self._send(200, _analyzer_integrity_check())
             return
         if path == "/api/backups":
@@ -1875,6 +1952,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         # ---- #25 导出中继（对齐 Frontend：自己不生成文件，全部转发 Analyzer /export/*）----
         if path == "/api/export/db":
+            if _gate_guard(self, "export"):
+                return
             st, ct, cd, blob, err = _fetch_binary("/export/download_db")
             if err:
                 self._send(502, {"ok": False, "error": err})
@@ -1883,6 +1962,8 @@ class Handler(BaseHTTPRequestHandler):
                        {"Content-Disposition": cd} if cd else None)
             return
         if path.startswith("/api/export/excel/"):
+            if _gate_guard(self, "export"):
+                return
             fn = urllib.parse.unquote(path[len("/api/export/excel/"):])
             st, ct, cd, blob, err = _fetch_binary(
                 "/export/download_excel/" + urllib.parse.quote(fn))
@@ -2084,6 +2165,8 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- #25 导出中继：生成 Excel（转发 Analyzer，不自己写 xlsx）----
         if parsed.path == "/api/export/excel":
+            if _gate_guard(self, "export"):
+                return
             q = {k: v[0] for k, v in qs.items() if k in ("year", "month", "start_date", "end_date")}
             r = _forward_fetcher("/export/export_history", timeout=180, method="POST", params=q)
             self._send(200 if r.get("ok") else 502, r)
@@ -2091,6 +2174,8 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- #24 remark 编辑中继（写 Analyzer 主库；Finder 不落第三份数据）----
         if parsed.path == "/api/remark":
+            if _gate_guard(self, "remark"):
+                return
             bvid = (body.get("bvid") or "").strip()
             view_at = body.get("view_at")
             remark = body.get("remark")
@@ -2110,6 +2195,8 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- #23 图片批量下载中继（start/stop/clear 会写盘，故前端默认走 use_sessdata=false 冒烟）----
         if parsed.path in ("/api/images/start", "/api/images/stop", "/api/images/clear"):
+            if _gate_guard(self, "images"):
+                return
             action = parsed.path.rsplit("/", 1)[-1]
             q = {k: v[0] for k, v in qs.items() if k in ("year", "use_sessdata")}
             r = _forward_fetcher("/images/" + action, timeout=30, method="POST", params=q)

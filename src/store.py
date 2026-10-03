@@ -287,6 +287,12 @@ def _fold_latest_by_bvid(records):
 _ANALYZER_PROBE = {"usable": None, "at": 0}
 ANALYZER_PROBE_TTL = 300          # 秒；与前端 /api/fetcher-health 轮询同量级
 
+# 阶段 3 · 409 门控的滞回参数：**连续失败几次才判「Analyzer 不可用」**。
+# 取 2 的理由：1 次失败无法区分「真挂」与「超时擦边/启动中/GC 停顿」；
+# 而 3 次以上会让真实故障的用户多等两轮才看到明确提示。恢复不对称（见 note_analyzer_gate_probe）。
+ANALYZER_GATE_STREAK = 2
+_ANALYZER_GATE = {"ok": True, "streak": 0, "at": 0}
+
 
 def note_analyzer_usable(flag):
     """发布一次探测结论（server 层调用）。`None` = 撤销提示、回到「尚未探测」。
@@ -295,6 +301,53 @@ def note_analyzer_usable(flag):
     """
     _ANALYZER_PROBE["usable"] = None if flag is None else bool(flag)
     _ANALYZER_PROBE["at"] = int(time.time())
+
+
+def note_analyzer_gate_probe(ok):
+    """阶段 3 门控专用：**连续性**探测记账（server 层每个 Analyzer-only 请求前调用）。
+
+    与 `note_analyzer_usable()` 分开记账，互不干扰：
+      · 后者回答「最近一次探测说了什么」（单点结论，供 `_analyzer_skippable()` 用）；
+      · 本函数回答「最近**连续**几次都不可达」（供 409 门控用）。
+
+    为什么必须连续计数（阶段 3 设计要求「结论确定、不被干扰」）：
+      单次网络失败 ≠ 服务不可用。Analyzer 启动中、GC 停顿、5s 超时擦边、风控回包，
+      都会产生一次假阴性。若据此就返 409，用户会看到「Analyzer 不可用」而它其实好好的
+      —— 结论会**随抖动摆动**，正是要避免的。
+    """
+    f = bool(ok)
+    st = _ANALYZER_GATE
+    st["ok"] = f
+    st["streak"] = 0 if f else int(st.get("streak") or 0) + 1
+    st["at"] = int(time.time())
+    return st["streak"]
+
+
+def analyzer_gate_blocked():
+    """阶段 3：**Analyzer-only 端点该不该返 409**（纯函数、零 IO、零网络）。
+
+    判据（全部满足才拦）：
+      ① 已连续 `ANALYZER_GATE_STREAK` 次探测失败（滞回，单次抖动不足以定性）；
+      ② 该记账未超过 `ANALYZER_PROBE_TTL`（过期即放行 —— 宁可让用户看到 502，
+         也不要被一个陈旧结论永久挡住）；
+      ③ `note_analyzer_gate_probe()` 曾被调用过（**尚未探测 = 未知 = 放行**）。
+
+    滞回是**不对称**的：连续 2 次失败才拦，但**只要 1 次成功立刻解除**（`streak` 归零）。
+    这与「连续失败要攒证据、恢复要立刻生效」的自然语义一致，也让 Analyzer 一起来就自动解封，
+    不需要人工干预或等 TTL 过期。
+
+    绝不 fail-closed：拿不到确定结论时一律放行，把选择权交回调用方（原行为是 502 转发失败）。
+    """
+    st = _ANALYZER_GATE
+    if not st.get("at"):
+        return False                                   # ③ 从未探测
+    if st.get("ok") is True:
+        return False                                   # 最近一次是成功（streak==0 已覆盖，此处兜底）
+    if int(st.get("streak") or 0) < ANALYZER_GATE_STREAK:
+        return False                                   # ① 抖动，证据不足
+    if int(time.time()) - int(st.get("at") or 0) > ANALYZER_PROBE_TTL:
+        return False                                   # ② 结论过期
+    return True
 
 
 def _analyzer_skippable():
@@ -646,7 +699,10 @@ def _cap(available, owner, reason, **extra):
     return d
 
 
-_NEED_ANALYZER = "需要 Analyzer 连接（当前不可达）"
+# Analyzer 不可用时的**统一文案**（能力表与 409 门控共用同一句）。
+# 措辞必须同时覆盖两种失败形态：①传输层不可达；②连得上但 `/health` 未通过（如代理 502）。
+# 旧文案写死「当前不可达」，在 ② 时是**错的**（2026-10-03 审查 ③，与已修的 A7 同类）。
+_NEED_ANALYZER = "需要 Analyzer 可用（当前探测未通过）"
 
 
 def derive_capabilities(probe):
@@ -659,7 +715,11 @@ def derive_capabilities(probe):
     conn = probe.get("connection") if isinstance(probe.get("connection"), dict) else {}
     ana = conn.get("analyzer") if isinstance(conn.get("analyzer"), dict) else {}
     fin = conn.get("finder") if isinstance(conn.get("finder"), dict) else {}
-    reachable = bool(ana.get("reachable"))
+    # Analyzer 可用性**唯一判据（业务级）**：`ok` = `/health` HTTP 成功 **且** 可达。
+    # `reachable` 只是传输层可达（`_forward_fetcher` 把 HTTP 502 也判 `reachable=True`）→
+    # **不可**单独用于能力判断，否则会出现「能力表说可用、端点却返 409」
+    # （2026-10-03 审查 ②：与 409 门控 `analyzer_gate_blocked()` 共用同一判据）。
+    usable = bool(ana.get("ok"))
     # finder.sessdata 值域（阶段 1.5 ④ 扩展）：
     #   missing —— config.json 未填写
     #   present —— 已填写但**未联网验证**（周期路径恒为这个值，见 server._finder_sessdata_status）
@@ -674,7 +734,7 @@ def derive_capabilities(probe):
     # 独立形态走本地 collector，需要 Finder 自持凭证（与 R5 同一判据）。
     # 只有 `present` / `valid` 才给"可以抓"的结论；`missing` / `invalid` / `unknown` 一律保守 ——
     # 这一项决定"要不要让用户点一个会写源库的按钮"，探不出结论就不该让他点了再失败（D2）。
-    if reachable:
+    if usable:
         caps["fetch"] = _cap(True, "analyzer", "")
     elif fsess in ("present", "valid"):
         caps["fetch"] = _cap(True, "finder", "")
@@ -689,11 +749,11 @@ def derive_capabilities(probe):
     caps["sync"] = _cap(True, "finder", "")
 
     # remark / export / images / integrity：全是 Analyzer-only 中继。
-    caps["remark"] = _cap(reachable, "analyzer", _NEED_ANALYZER)
-    caps["export"] = _cap(reachable, "analyzer", _NEED_ANALYZER,
-                          formats=["excel", "db"] if reachable else [])
-    caps["images"] = _cap(reachable, "analyzer", _NEED_ANALYZER)
-    caps["integrity"] = _cap(reachable, "analyzer", _NEED_ANALYZER)
+    caps["remark"] = _cap(usable, "analyzer", _NEED_ANALYZER)
+    caps["export"] = _cap(usable, "analyzer", _NEED_ANALYZER,
+                          formats=["excel", "db"] if usable else [])
+    caps["images"] = _cap(usable, "analyzer", _NEED_ANALYZER)
+    caps["integrity"] = _cap(usable, "analyzer", _NEED_ANALYZER)
 
     # backup：Finder 自己的快照动作，不依赖 Analyzer。
     caps["backup"] = _cap(True, "finder", "")
@@ -740,13 +800,17 @@ def span_advisory(span):
 
 
 def _plan_owner(probe, policy):
-    """本次抓取由谁执行（纯函数）：`prefer=local` 或 Analyzer 不可达 → finder。"""
+    """本次抓取由谁执行（纯函数）：`prefer=local` 或 Analyzer **不可用（业务级）** → finder。
+
+    判据与能力层、409 门控同一处（`analyzer.ok`）—— 三处若各判各的，就会出现
+    「能力表说不可用、plan 却仍派 analyzer 去抓」这类自相矛盾（2026-10-03 审查 ②）。
+    """
     probe = probe if isinstance(probe, dict) else {}
     conn = probe.get("connection") if isinstance(probe.get("connection"), dict) else {}
     ana = conn.get("analyzer") if isinstance(conn.get("analyzer"), dict) else {}
     if isinstance(policy, dict) and policy.get("prefer") == "local":
         return "finder"
-    return "analyzer" if ana.get("reachable") else "finder"
+    return "analyzer" if ana.get("ok") else "finder"
 
 
 def decide_sync_plan(probe, policy, state):

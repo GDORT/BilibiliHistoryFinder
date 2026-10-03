@@ -2,7 +2,7 @@
 
 > 状态：活跃
 > 性质：导览
-> 最后核对：2026-10-02 @77bd3a9
+> 最后核对：2026-10-03 @484ab9e
 
 > 位置：`BilibiliHistoryFinder/dev/` ｜ 整理：2026-09-26
 > 定位：**开发期测试资产**。`src/` 下的运行时代码**不 import 这里**，整目录删掉也不影响服务运行。
@@ -11,12 +11,12 @@
 
 | 文件 | 干什么 | 跑法 | 边界 |
 | --- | --- | --- | --- |
-| `test_capabilities.py` | **「连接即模式」阶段 1 的纯函数单测**（仓库**唯一**的断言式单测）：`normalize_policy` / `derive_capabilities` / `decide_sync_plan` / `span_advisory` / `load_policy`·`save_policy` / 跨度读取 / `_analyzer_skippable`（跳过主源读取的三条前置）。**默认 196 项**；`--live` 追加一次 `/api/capabilities` 端到端冒烟（8765 在跑就打它，否则**进程内自起临时实例**，**共 226 项**），并对照旧端点行为不变 | `python dev/test_capabilities.py`<br>`python dev/test_capabilities.py --live` | 默认**零 IO**（只 import `store`）；临时 sqlite/json 全在 `tempfile.mkdtemp()` 里；`--live` 只发**只读 GET** 且带 `?sessdata=0`（连 B站都不打） |
+| `test_capabilities.py` | **「连接即模式」阶段 1 的纯函数单测**（仓库**唯一**的断言式单测）：`normalize_policy` / `derive_capabilities` / `decide_sync_plan` / `span_advisory` / `load_policy`·`save_policy` / 跨度读取 / `_analyzer_skippable`（跳过主源读取的三条前置）· `analyzer_gate_blocked`（阶段 3 门控的滞回 / 恢复不对称 / 绝不 fail-closed）。**默认 226 项**；`--live` 追加一次 `/api/capabilities` 端到端冒烟（8765 在跑就打它，否则**进程内自起临时实例**，**共 256 项**），并对照旧端点行为不变 | `python dev/test_capabilities.py`<br>`python dev/test_capabilities.py --live` | 默认**零 IO**（只 import `store`）；临时 sqlite/json 全在 `tempfile.mkdtemp()` 里；`--live` 只发**只读 GET** 且带 `?sessdata=0`（连 B站都不打） |
 | `regression_restart.py` | **⑥ 重启链路的常驻回归**。真起 `ThreadingHTTPServer` + 主线程 `serve_forever` + 工作线程发起重启（**生产拓扑**），连跑 3 次断言退出码均为哨兵 `42`；另含看门狗超时（`shutdown` 卡死 30s → 3s 顶出）、`_safe_print` 冻结对照、**旧设计对照**（`0/0/0`，线上 bug 的复现） | `python dev/regression_restart.py` | 只绑 `127.0.0.1:0`；写盘全部重定向临时目录 |
 | `regression_fallback.py` | **② 自动回退（增量 → 全量）的端到端回归**。真起 `server.Handler` 发 HTTP GET；三条用例互相对照（缺基线**必须**回退 / 基线正常**不得**回退 / 其它错误**不得**回退）；**附加组**对 `POST /api/sync` 再断言一次（阶段 2 判据收敛）；**新增组（A1）**用**默认策略**跑两条 —— 缺基线＋冷却内 → `skip` 不发请求、原因落到 `sync_state["last"]`，缺基线＋已过冷却 → 全量成功后 `no_baseline` **必须被清**。**共 7 项** | `python dev/regression_fallback.py` | 同上；**base 走内存覆盖，`data/fetcher_config.json` 一字节不动** |
 | `mock_analyzer.py` | **假 Analyzer**：增量接口固定回「未找到本地历史记录」以逼出回退分支；全量默认 `503`（→ Finder 判 `ok=false` → 不触发 `post`，**零副作用**）。`set BHF_MOCK_FULL=200` 可放行全量 | `python dev/mock_analyzer.py`（默认 `127.0.0.1:8790`） | 只绑 `127.0.0.1`；不连 B站、不读写真实历史库 |
 | `stub_fetcher.py` | **假控制后端**（端口 `8899`）：真实 Analyzer 未开时，验证「实时更新」按钮 → 转发 → 刷新的**控制流闭合**。不真拉数据 | `python dev/stub_fetcher.py` | 只绑 `127.0.0.1:8899` |
-| `verify_riskfix.py` | **风险审查修复的自动化验收**（2026-10-01）：第一批 `F-H1` 只绑回环 · `F-H3` 脏 body 返 400 · `F-H2` 坏路径被拒且不落盘 · `N-H1` 失败留痕（`FileNotFoundError` 不记）· `N-L3` 原子写；`log/2026-09-30-代码设计与风险审查.md` §8 收尾 `C-H1` body 上限 413 · `C-M1` 纯空白 400 · `C-H2` 同一配置文件的字段不被互相清掉 · `C-M2` span/meta 读失败留痕。**2026-10-02 追加 `A3` / `A5`**：主源为 Analyzer 时 `/api/local/delete` 必须 `blocked`（独立形态放行）· `/api/export/local/db` 返回有效 sqlite（magic 头）且临时快照不残留。**共 67 项断言** | `python dev/verify_riskfix.py` | 把 `src/` **整目录复制**到临时目录后**原样启动** `python <tmp>/src/server.py`（不 patch、不 mock `main()`）；`ANALYZER_DB` 指向沙箱内不存在的路径 → **不读真实 Analyzer 库**；用 `netstat` 独立核对监听地址；C-H1 用**裸 socket** 手搓「声称 5 MB、不发送 body」的请求（`urllib` 会按 data 长度自动填，捏不出来） |
+| `verify_riskfix.py` | **风险审查修复的自动化验收**（2026-10-01）：第一批 `F-H1` 只绑回环 · `F-H3` 脏 body 返 400 · `F-H2` 坏路径被拒且不落盘 · `N-H1` 失败留痕（`FileNotFoundError` 不记）· `N-L3` 原子写；`log/2026-09-30-代码设计与风险审查.md` §8 收尾 `C-H1` body 上限 413 · `C-M1` 纯空白 400 · `C-H2` 同一配置文件的字段不被互相清掉 · `C-M2` span/meta 读失败留痕。**2026-10-02 追加 `A3` / `A5`**：主源为 Analyzer 时 `/api/local/delete` 必须 `blocked`（独立形态放行）· `/api/export/local/db` 返回有效 sqlite（magic 头）且临时快照不残留。**2026-10-03 追加阶段 3 门控组 `G-P`/`G-E`**：抗抖动滞回（连续 2 次才拦）· 恢复不对称（1 次成功即解封）· 记账过期放行 · 绝不 fail-closed；7 个 Analyzer-only 端点在假后端连发 502 时返 409 ＋ `capability`，且**门控在转发之前生效**（后端零请求）· 7 个本地/探测端点**不得误伤**（尤其 `/api/fetcher-health`）。假后端由脚本自建（`_FakeAnalyzer`，可切换 200/502），**结果不依赖本机 Analyzer 是否在跑**。**共 97 项断言** | `python dev/verify_riskfix.py` | 把 `src/` **整目录复制**到临时目录后**原样启动** `python <tmp>/src/server.py`（不 patch、不 mock `main()`）；`ANALYZER_DB` 指向沙箱内不存在的路径 → **不读真实 Analyzer 库**；用 `netstat` 独立核对监听地址；C-H1 用**裸 socket** 手搓「声称 5 MB、不发送 body」的请求（`urllib` 会按 data 长度自动填，捏不出来） |
 | `migrate_p2.py` | **阶段 0 · P2 一次性数据迁移脚本** —— 把 Analyzer 主库的长尾 / 缺口导入本地库（**不是测试，是数据操作**；放这里是因为它只在开发期手动跑一次）。默认 `--dry-run` 预演，**`--apply` 才写** | `python dev/migrate_p2.py`<br>`python dev/migrate_p2.py --apply` | 会**写** `data/bilibili_history.db`（本地库）→ 跑前先备份；**不碰** Analyzer 主库（只读） |
 
 ### 关系图
@@ -105,7 +105,7 @@ python dev\test_capabilities.py           rem 阶段1 纯函数单测（零 IO�
 python dev\test_capabilities.py --live    rem 追加 /api/capabilities 端到端冒烟
 python dev\regression_restart.py          rem ⑥ 重启链路（42/42/42 + 旧设计 0/0/0 对照）
 python dev\regression_fallback.py         rem ② 自动回退（7/7 + 零污染核对）
-python dev\verify_riskfix.py              rem 风险审查修复验收（67 项，真进程 + 隔离副本）
+python dev\verify_riskfix.py              rem 风险审查修复验收（97 项，真进程 + 隔离副本）
 
 rem 想亲眼看回退过程时（手工版，记得还原 base）：
 python dev\mock_analyzer.py
@@ -144,7 +144,7 @@ curl --noproxy "*" -X POST -H "Content-Type: application/json" -d "{\"base\":\"h
 | 优先 | 缺口 | 为什么 | 建议落点 |
 | --- | --- | --- | --- |
 | 1 | **`engine.py`（续看规则引擎）零单测** | 它被显式设计为**纯逻辑模块**（零依赖、不碰库 / 网络，见 `doc/现状.md` §2.2）—— **最该也最容易**补；现在改规则只能靠手点网页验证 | 扩 `test_capabilities.py`，或新增 `dev/test_engine.py`（纯函数，零 IO） |
-| 2 | **Finder 自身全量路径零覆盖** | `run_sync_background()`（`server.py` L795，调用点 L2249）要**真跑 `collector.py` 子进程**，且需**有效 SESSDATA**（当前 `invalid`，见 `doc/现状.md` §10 / `O4`）→ `dev/` 现有手段够不到。**A1 修复补的 `_note_full_success()` 之一正落在此路径内，无自动断言**。注意它与 `owner=analyzer` 的直连全量**不是同一条路径**，后者已被 `regression_fallback.py` A1-2 组覆盖。**这是一处诚实的覆盖缺口，不假装已测** | 待有可用 SESSDATA 后扩 `regression_fallback.py`（沙箱 Finder ＋ 假 collector）；在那之前靠手测 |
+| 2 | **Finder 自身全量路径零覆盖** | `run_sync_background()`（`server.py` L795，调用点 L2249）要**真跑 `collector.py` 子进程** + 真发 B站请求 → `dev/` 现有手段够不到（沙箱无 collector 假件）。此前还受「SESSDATA 无效」制约；**该制约已于 2026-10-03 解除**（现已有效，见 `doc/现状.md` §10 / `O4`），**但自动覆盖缺口仍在**。**A1 修复补的 `_note_full_success()` 之一正落在此路径内，无自动断言**。注意它与 `owner=analyzer` 的直连全量**不是同一条路径**，后者已被 `regression_fallback.py` A1-2 组覆盖。**这是一处诚实的覆盖缺口，不假装已测** | 待补「沙箱 Finder ＋ 假 collector」后扩 `regression_fallback.py`；在那之前靠手测 |
 | 3 | **前端零回归** | 前端交互逻辑没有任何自动化覆盖 | **推迟到阶段 4**（见 6.4） |
 | 4 | **无统一 runner** | 七个脚本各跑各的，收尾靠人记 | 一个 `dev/run_all.py`（顺序跑 + 汇总退出码） |
 

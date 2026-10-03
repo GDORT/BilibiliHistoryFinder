@@ -68,11 +68,17 @@ def sec(title):
 # ---------------------------------------------------------------- 工厂
 
 def mk_probe(reachable=True, fsess="present", a_days=None, l_days=None,
-             a_count=0, l_count=0, merged=0, effective=None, diag=None):
-    """构造一个 probe（形状与 server.probe_connection() 的产出一致）。"""
+             a_count=0, l_count=0, merged=0, effective=None, diag=None, ok=None):
+    """构造一个 probe（形状与 server.probe_connection() 的产出一致）。
+
+    `ok` = **业务级可用**（`/health` HTTP 成功 **且** 可达）—— 能力层 / 策略层 /
+    409 门控的**唯一判据**（2026-10-03 审查 ②）。缺省 = `reachable`（传输级），
+    显式传 `ok=False, reachable=True` 即模拟「连得上但业务 502」。
+    """
+    ok = reachable if ok is None else ok
     return {
         "connection": {
-            "analyzer": {"reachable": reachable, "base": "http://localhost:8899",
+            "analyzer": {"reachable": reachable, "ok": ok, "base": "http://localhost:8899",
                          "health_status": "running" if reachable else None,
                          "db_count": a_count,
                          "diagnosis": diag or {"level": "ok", "code": "ok"}},
@@ -190,6 +196,22 @@ def t2_derive_capabilities():
     check(store.derive_capabilities({})["fetch"]["available"] is False, "空 probe → fetch 不可用")
     check(store.derive_capabilities(None)["sync"]["available"] is True, "None probe → 不炸")
 
+    # ⭐ 判据统一（2026-10-03 审查 ②）：`ok=False, reachable=True` 模拟「连得上但业务 502」——
+    # 能力层必须与 409 门控、策略层给出**同一个**结论，否则会出现「按钮亮着、点了 409」。
+    c = store.derive_capabilities(mk_probe(reachable=True, ok=False))
+    for k in ("remark", "export", "images", "integrity"):
+        check(c[k]["available"] is False,
+              "业务 502：%s 判不可用（不再被传输层 reachable 掩盖）" % k, c[k])
+    eq(c["remark"]["reason"], store._NEED_ANALYZER, "业务 502：reason 用统一文案")
+    check("不可达" not in c["remark"]["reason"],
+          "业务 502：文案不再谎称「当前不可达」（审查 ③）", c["remark"]["reason"])
+    check(c["fetch"]["available"] is True and c["fetch"]["owner"] == "finder",
+          "业务 502：fetch 降到 finder（sessdata=present）", c["fetch"])
+    eq(store._plan_owner(mk_probe(reachable=True, ok=False), {}), "finder",
+       "业务 502：_plan_owner 同样判 finder（与能力层一致）")
+    eq(store._plan_owner(mk_probe(reachable=True, ok=True), {}), "analyzer",
+       "可用时 _plan_owner 仍判 analyzer")
+
 
 # ---------------------------------------------------------------- T2.2 接口码表
 
@@ -280,6 +302,68 @@ def t26_analyzer_skippable(tmp):
         store.ANALYZER_DB, store.LOCAL_DB = oa, ol
         store.ANALYZER_PROBE_TTL = ottl
         store._ANALYZER_PROBE.update(oprobe)
+
+
+def t27_analyzer_gate():
+    sec("T2.7 analyzer_gate_blocked —— 阶段 3 门控：滞回 + 恢复不对称 + 绝不 fail-closed")
+    ogate = dict(store._ANALYZER_GATE)
+    ottl = store.ANALYZER_PROBE_TTL
+    ostreak = store.ANALYZER_GATE_STREAK
+    try:
+        def reset():
+            store._ANALYZER_GATE.update({"ok": True, "streak": 0, "at": 0})
+
+        # ---- 绝不 fail-closed：拿不到确定结论一律放行 ----
+        reset()
+        eq(store.analyzer_gate_blocked(), False, "从未探测 → 放行（未知 ≠ 不可用）")
+        reset()
+        store._ANALYZER_GATE["at"] = int(time.time()) - (ottl + 60)
+        store._ANALYZER_GATE.update({"ok": False, "streak": 9})
+        eq(store.analyzer_gate_blocked(), False,
+           "记账过期 → 放行（陈旧结论不得永久挡住用户）")
+
+        # ---- 滞回：连续 N 次才拦 ----
+        eq(ostreak, 2, "默认滞回阈值 = 2（可用常量调整，但须 >1）")
+        reset()
+        eq(store.note_analyzer_gate_probe(False), 1, "第 1 次失败 → streak=1")
+        eq(store.analyzer_gate_blocked(), False, "只失败 1 次 → 放行（抖动不足以定性）")
+        eq(store.note_analyzer_gate_probe(False), 2, "第 2 次失败 → streak=2")
+        eq(store.analyzer_gate_blocked(), True, "连续失败达阈值 → 拦截")
+
+        # ---- 恢复不对称：1 次成功立刻解封 ----
+        eq(store.note_analyzer_gate_probe(True), 0, "1 次成功 → streak 立刻归零")
+        eq(store.analyzer_gate_blocked(), False, "恢复不对称：不等 TTL 即放行")
+
+        # ---- streak 单调累加，不因次数多而动摇 ----
+        reset()
+        for i in range(1, 6):
+            eq(store.note_analyzer_gate_probe(False), i, "连续失败第 %d 次 → streak=%d" % (i, i))
+        eq(store.analyzer_gate_blocked(), True, "连续 5 次失败 → 仍拦截（结论稳定）")
+
+        # ---- 边界：at=0 但 streak>0（记账被清空过的畸形状态）不得误拦 ----
+        store._ANALYZER_GATE.update({"ok": False, "streak": 3, "at": 0})
+        eq(store.analyzer_gate_blocked(), False, "at=0（从未记账）→ 放行，哪怕 streak 非零")
+
+        # ---- `ok` 严格取 True 才算成功（避免非 bool 真值误判为「可用」）----
+        # 注意：这些用例必须**同时保留足够的 streak**，否则会先被「证据不足」那条判据放行，
+        # 测不到 `ok` 的比较方式 —— 那正是最初写错的地方（造了一组恒真的断言）。
+        for truthy in (1, "yes", [1], "True"):
+            reset()
+            store.note_analyzer_gate_probe(False)
+            store.note_analyzer_gate_probe(False)
+            store._ANALYZER_GATE.update({"ok": truthy, "at": int(time.time())})
+            eq(store.analyzer_gate_blocked(), True,
+               "ok=%r 非 bool True → **不**算成功，仍拦截（严格比较）" % (truthy,))
+        reset()
+        store.note_analyzer_gate_probe(False)
+        store.note_analyzer_gate_probe(False)
+        store._ANALYZER_GATE.update({"ok": True, "at": int(time.time())})
+        eq(store.analyzer_gate_blocked(), False,
+           "ok=True（唯一的成功形态）→ 放行，即使 streak 已满（恢复优先）")
+    finally:
+        store.ANALYZER_PROBE_TTL = ottl
+        store.ANALYZER_GATE_STREAK = ostreak
+        store._ANALYZER_GATE.update(ogate)
 
 
 def t3_decide_sync_plan():
@@ -692,6 +776,7 @@ def main():
     t22_api_code_table()
     t25_span_advisory()
     t3_decide_sync_plan()
+    t27_analyzer_gate()
 
     tmp = tempfile.mkdtemp(prefix="bhf_test_")
     try:
