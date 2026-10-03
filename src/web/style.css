@@ -96,6 +96,8 @@ body {
 .sync-step { font-size: 12px; color: var(--sub); white-space: nowrap; }
 .sync-done { font-size: 13px; color: #1aad19; font-weight: 600; white-space: nowrap; }
 .sync-done.sync-fail { color: #e64340; }
+/* 阶段 4：`skip`（策略有意跳过，如冷却中）与失败**分开呈现** —— 用中性琥珀色，不再是红色告警 */
+.sync-done.sync-skip { color: #b7791f; }
 .sync-meta { font-size: 12px; color: var(--sub); margin-left: auto; white-space: nowrap; }
 .sync-meta b { color: var(--text); font-weight: 600; }
 
@@ -619,3 +621,52 @@ body.lock-scroll { overflow: hidden; }
   font-style: italic;
 }
 .remark-row .remark-text.sys:hover { background: #eef0f3; border-color: #b9bec6; }
+
+/* ====== 阶段 4 · 能力置灰（`方案.md` D7 / `T2-A` 只置灰不隐藏） ======
+ * `.cap-disabled` 由 `app.js` 的 `applyCapabilities()` 施加。
+ * ⚠️ 它**不是** `:disabled` —— gray 模式下我们要保留元素可点击（点了给提示），
+ *    所以用「降低对比 + 斜线底纹 + not-allowed 光标」表达不可用，而非禁用。
+ * 视觉语言沿用既有的 `.btn-ghost:disabled { opacity:.5 }`，保持一致。 */
+.cap-disabled {
+  opacity: .5;
+  cursor: not-allowed !important;
+  filter: grayscale(.6);
+}
+button.cap-disabled:hover { background: inherit; }
+/* 按钮类：斜线底纹进一步区分「不可用」与「只是灰」 */
+button.cap-disabled {
+  background-image: repeating-linear-gradient(
+    45deg, transparent, transparent 4px,
+    rgba(0, 0, 0, .06) 4px, rgba(0, 0, 0, .06) 8px);
+}
+/* 卡片内的备注：不可用时连 hover 高亮都不给（否则像是可以点） */
+.remark-row .remark-text.cap-disabled:hover { background: #fff7fa; border-color: #f3cdda; }
+.remark-row .remark-text.cap-disabled.cap-empty:hover,
+.remark-row .remark-text.empty.cap-disabled:hover { background: transparent; border-color: var(--border); }
+
+/* ====== 阶段 4 · 只读形态卡（替代原三态下拉框） ======
+ * `fld-readonly` 不是输入控件：形态由 `analyzer.ok` 决定，用户**不能手切**
+ * （手切值 `analyzer` 正是 `effective` 谎报的来源 → 待办 #39）。
+ * 视觉上要「明显是只读」：浅底 ＋ 虚线边 ＋ 常态等宽字重。 */
+.fld-readonly {
+  font-size: 13px; line-height: 1.6; padding: 8px 10px;
+  background: #f7f8fa; color: #4b5563;
+  border: 1px dashed var(--border); border-radius: 6px;
+}
+.fld-readonly b.ok { color: #2bbf5a; }
+.fld-readonly b.bad { color: #e24b4a; }
+
+/* ====== 阶段 4 · 隐藏覆盖区（「全量重建」收进此处，`方案.md` §4） ======
+ * `?full=1` 由「顶栏常驻按钮」降为**隐藏 override**：正常同步由后端策略决定增量/全量，
+ * 顶栏那个按钮会让用户以为「同步 = 增量、全量重建 = 另一件事」，其实后者才是重校准存档标记的手段。 */
+.adv-overrides { margin-top: 4px; }
+.adv-overrides > summary {
+  cursor: pointer; list-style: none; user-select: none;
+  display: flex; align-items: center; gap: 6px;
+}
+.adv-overrides > summary::-webkit-details-marker { display: none; }
+.adv-overrides > summary::before {
+  content: "▸"; font-size: 10px; color: #9aa0a6; transition: transform .12s;
+}
+.adv-overrides[open] > summary::before { transform: rotate(90deg); }
+.adv-overrides[open] > summary { margin-bottom: 4px; }

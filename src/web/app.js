@@ -5,6 +5,121 @@ let offset = 0;
 let total = 0;
 let loading = false;
 
+/* ======================================================================
+ * 阶段 4 · 能力渲染（`方案.md` D2 / D7）
+ * ====================================================================== */
+
+/** 「置灰 → 隐藏」的单点常量（`方案.md` D7）：`T2-A` 已定为**只置灰、不隐藏**
+ *  （保留全部入口的可见性，让用户随时看得到「这个功能现在用不了、为什么」）。
+ *  阶段 6 若要改为隐藏，**只需改这一行**。 */
+const UNAVAILABLE_MODE = "gray";
+
+/** 能力 → DOM 清单（**唯一映射表**）。定稿于 2026-10-03（`T14`）——
+ *  逐个选择器对着 `index.html` 实际 96 个 `id` 校验过存在性。
+ *  ⚠️ **任何改动都必须重跑 `dev/test_capabilities.py` 的 `T2.8` 选择器校验** ——
+ *  历史教训：老版示例的 `#selfCheckBtn` 与 `.tab-analysis` 都指向不存在的 DOM，
+ *  会**静默失效**（`querySelectorAll` 返回空集、不报错）。 */
+const CAP_DOM = {
+  // ⚠️ **`fetch` 故意是空集**（2026-10-03 用户裁定「Finder 自己能抓」）。
+  //   独立形态下 `derive_capabilities()` 判 `fetch.available=true, owner="finder"`
+  //   （理由：Finder 自己能抓）—— 这是**对的**，但它**不意味着 Analyzer 的中继按钮该亮着**。
+  //   「抓取」在独立形态下由 `POST /api/sync` 承担（走 collector，见 `方案.md` D3），
+  //   那个入口是 `#syncBtn`（归 `sync`，恒可用）→ 故 `fetch` 无需挂任何 DOM。
+  //   曾经把 `#anRealtimeBtn`/`#anFullBtn` 挂在这里，导致：按钮亮着、点了必 409
+  //   （它们打的是 Analyzer-only 的 `/api/fetcher-trigger`）—— 见 `ANALYZER_ONLY_DOM`。
+  fetch:     [],
+  sync:      [],                  // 恒可用（纯本地读源库 + 独立形态下的 collector 抓取）→ 恒不置灰
+  remark:    [],                  // ⚠️ 动态渲染，见 `updateRemarkAvailability()`
+  // ⚠️ **不含 `#anLocalExportBtn`** —— 它是「独立形态下唯一还能用的导出出口」，
+  //    随 `export` 一起置灰等于把刚加的逃生通道堵死（D7 的「先灰」在这里必须破例）。
+  //    故它**不进能力表**、**不参与门控**，恒可用。
+  export:    ["#anExportBtn", "#anDbBtn"],
+  images:    ["#anImgBtn", "#anImgStartBtn", "#anImgStopBtn"],
+  integrity: ["#anDataBtn"],
+  backup:    [],                  // 恒可用（Finder 自有快照）
+};
+
+/** **端点归属**维度：物理上依赖 Analyzer 服务在线的 DOM（与「能力」是两回事）。
+ *
+ * 为什么要单独一维（2026-10-03 审查 §七.1 的教训）：
+ *   能力表回答「**这件事**能不能做」，而这一维回答「**这个按钮打的端点**在不在 Analyzer 上」。
+ *   二者会交叉出「能力说可用、端点却 409」的矛盾 —— 独立形态 + Finder 凭证有效时
+ *   `fetch.available=true`（Finder 自己能抓）但 `#anRealtimeBtn` 必 409。
+ *   把它们混在一张表里就必然出错，故**拆开**：`CAP_DOM` 管能力，本表管端点归属。
+ *
+ * 判据用 `connection.analyzer.ok`（**业务级** ＝ `/health` HTTP 成功且可达），
+ * 与后端 409 门控**同一判据** → 不会再出现「按钮亮着、点了必失败」。
+ */
+const ANALYZER_ONLY_DOM = ["#anRealtimeBtn", "#anFullBtn"];
+const ANALYZER_ONLY_HINT = "该入口转发给 Analyzer（/api/fetcher-trigger）—— Analyzer 不可用时无法使用。"
+  + "独立形态下请改用顶部「同步数据」（走 Finder 自己的采集）";
+
+/** 置灰时的 `title` 提示：让用户知道「为什么灰」＋「怎么才能用上」。
+ *  ⚠️ **无 `fetch` 条目** —— `CAP_DOM.fetch` 是空集，抓取入口的提示走 `ANALYZER_ONLY_HINT`。 */
+const CAP_HINT = {
+  remark:    "备注写回 Analyzer 主库 —— Analyzer 不可用时无法保存",
+  export:    "导出 Excel / 整库走 Analyzer；独立形态下请改用「本地库」按钮",
+  images:    "图片批量下载由 Analyzer 执行 —— Analyzer 不可用时无法使用",
+  integrity: "数据自检由 Analyzer 执行 —— Analyzer 不可用时无法使用",
+};
+
+/** 最近一次拿到的能力表（供卡片渲染层判断 `remark`）。 */
+let CAPS = {};
+
+/** 把「不可用」按 `UNAVAILABLE_MODE` 施加到一组元素。 */
+function _applyTo(selectors, available, hint) {
+  (selectors || []).forEach((sel) => {
+    document.querySelectorAll(sel).forEach((el) => {
+      if (available) {
+        el.classList.remove("cap-disabled");
+        el.removeAttribute("aria-disabled");
+        el.title = el.dataset.capOriginTitle || "";
+        if (UNAVAILABLE_MODE === "hide") el.classList.remove("hidden");
+      } else {
+        // 首次置灰时把原 title 存下来，恢复时才能还原（否则提示会被覆盖丢失）
+        if (!el.dataset.capOriginTitle) el.dataset.capOriginTitle = el.title || "";
+        el.classList.add("cap-disabled");
+        el.setAttribute("aria-disabled", "true");
+        el.title = hint || "";
+        if (UNAVAILABLE_MODE === "hide") el.classList.add("hidden");
+      }
+    });
+  });
+}
+
+/** 表驱动应用能力表（`方案.md` D7）。`caps` 取 `GET /api/capabilities` 的 `capabilities`。 */
+function applyCapabilities(caps, analyzerOk) {
+  CAPS = caps || {};
+  Object.keys(CAP_DOM).forEach((cap) => {
+    const info = CAPS[cap] || { available: false, reason: "能力未知（尚未探测）" };
+    _applyTo(CAP_DOM[cap], !!info.available, CAP_HINT[cap] || info.reason || "");
+  });
+  // 端点归属维度：**业务级**判据（`analyzer.ok`），与后端 409 门控同源。
+  // ⚠️ 不能用 `caps.fetch.available` —— 独立形态下它为 true（Finder 自己能抓），
+  //    但这些按钮打的是 Analyzer 中继 → 会「亮着但必 409」。这正是审查 §七.1 指出的缺陷。
+  if (analyzerOk !== undefined) {
+    _applyTo(ANALYZER_ONLY_DOM, !!analyzerOk, ANALYZER_ONLY_HINT);
+  }
+  updateRemarkAvailability();   // `remark` 动态渲染，单独处理
+}
+
+/** `remark` 单独处理：每次列表渲染时新生成，不在 `CAP_DOM` 的固定选择器里。 */
+function updateRemarkAvailability() {
+  const info = CAPS["remark"] || { available: false, reason: "" };
+  document.querySelectorAll(".remark-text").forEach((el) => {
+    if (info.available) {
+      el.classList.remove("cap-disabled");
+      el.removeAttribute("aria-disabled");
+      el.title = el.dataset.capOriginTitle || "";
+    } else {
+      if (!el.dataset.capOriginTitle) el.dataset.capOriginTitle = el.title || "";
+      el.classList.add("cap-disabled");
+      el.setAttribute("aria-disabled", "true");
+      el.title = CAP_HINT["remark"] || info.reason || "";
+    }
+  });
+}
+
 // 当前筛选状态
 const state = {
   biz: "",       // tab: 综合/视频/直播/专栏
@@ -304,6 +419,7 @@ function render(data) {
   statsEl.textContent = `共 ${total} 条，已显示 ${Math.min(offset, total)}`;
   loadMoreEl.classList.toggle("hidden", offset >= total);
   if (batchMode) updateBatchEligibility();
+  updateRemarkAvailability();   // 阶段 4：新插入的卡片也要按 `remark` 能力置灰
 }
 
 async function load(reset) {
@@ -332,6 +448,30 @@ function toast(msg) {
   t.textContent = msg; t.classList.remove("hidden");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.add("hidden"), 2500);
+}
+
+/* ====== 409 统一消费（阶段 4 · `T10`） ======
+ * 阶段 3 起，Analyzer-only 端点在「确定不可用」时返 **409**（而非转发失败 502），
+ * 响应体形如 `{ok:false, error, reason, capability, available:false, owner:null}`。
+ * 此前各调用点各自 `toast` → 同一句「需要 Analyzer」会在十几处各写一遍。
+ * 故统一到这一个函数：**按 `capability` 给出对应提示，并顺手把该能力的入口置灰**
+ * （点了必失败的按钮当场变灰，比只弹一句提示更符合「确定」的直觉）。 */
+function handleApiError(status, payload) {
+  const p = payload || {};
+  if (status === 409) {
+    const cap = p.capability || "";
+    const msg = p.error || p.reason || "当前能力不可用（Analyzer 未通过探测）";
+    if (cap) {
+      // 立刻把这一项标成不可用（本地乐观更新，不必等下一轮轮询）
+      CAPS[cap] = { available: false, owner: null, reason: p.reason || msg };
+      _applyTo(CAP_DOM[cap], false, CAP_HINT[cap] || msg);
+      if (cap === "remark") updateRemarkAvailability();
+    }
+    toast(msg);
+    return msg;
+  }
+  if (status === 502) return "Analyzer 转发失败（" + (p.error || "无详情") + "）";
+  return p.error || ("HTTP " + status);
 }
 
 /* ====== Tab 切换（综合/视频/直播/专栏）===== */
@@ -1276,6 +1416,20 @@ function applySyncStatus(s) {
         ? `✓ 同步完成（${s.last.fetched} 条${m}）`
         : "✓ 同步完成";
       pollRuleStatus();   // 同步后：更新『脏』角标（可能有新记录命中规则）
+    } else if (s.last && s.last.plan_mode === "skip") {
+      // 阶段 4：`skip` 是**策略有意跳过**（如刚跑过全量、冷却中），**不是失败** —— 后端
+      // `_note_plan_not_started()` 对 blocked / skip 都会写 `ok:false`，故必须靠 `plan_mode`
+      // 区分，否则「有意跳过」会被渲染成红色失败（`方案.md` §4 阶段 4 的既有子项）。
+      progressEl.classList.add("hidden");
+      doneEl.className = "sync-done sync-skip";
+      doneEl.classList.remove("hidden");
+      doneEl.textContent = "• 本次跳过同步：" + (s.last.err || "策略判定无需执行");
+    } else if (s.last && s.last.plan_mode === "blocked") {
+      // 阻断（凭证闸门 R5）—— 是「没开始」，得把原因讲清楚而不是笼统的「未完成」
+      progressEl.classList.add("hidden");
+      doneEl.className = "sync-done sync-fail";
+      doneEl.classList.remove("hidden");
+      doneEl.textContent = "⚠ 同步被阻断：" + (s.last.err || "当前不可执行，请检查设置");
     } else if (s.last && !s.last.ok) {
       progressEl.classList.add("hidden");
       doneEl.className = "sync-done sync-fail";
@@ -1310,10 +1464,14 @@ $("fullBtn").addEventListener("click", () => {
 function applyFetcherHealth(s) {
   const dot = $("fetcherDot");
   if (!dot) return;
-  const ok = !!(s && s.ok && s.reachable);
+  // 阶段 4：判据由 `s.reachable`（传输层）改为**业务级** `analyzer.ok`
+  // —— 后端已把 `reachable` 的顶层值换成业务级（见 `refreshSourceHealth` 的注释），
+  // 这里读它即可；但若传进来的原始响应带 `connection`，优先取 `connection.analyzer.ok`。
+  const ana = (s && s.connection && s.connection.analyzer) || {};
+  const ok = (ana.ok !== undefined) ? !!ana.ok : !!(s && s.reachable);
   dot.classList.toggle("on", ok);
   dot.classList.toggle("off", !ok);
-  dot.title = ok ? "Analyzer 已连接" : ("Analyzer 未连接：" + ((s && s.error) || "8899 不可达"));
+  dot.title = ok ? "Analyzer 已连接" : ("Analyzer 不可用：" + ((s && s.error) || (ana.error) || "8899 探测未通过"));
 }
 function checkFetcher() {
   // ?sessdata=0：这里只管「连通性」，不触发 Analyzer 去调 B站 /login/check（省一次外网往返）。
@@ -1356,11 +1514,19 @@ $("diagClose").addEventListener("click", () => $("diagModal").classList.add("hid
 $("diagModal").addEventListener("click", (e) => { if (e.target === $("diagModal")) $("diagModal").classList.add("hidden"); });
 
 function anCall(btn, url, title) {
+  // 阶段 4：置灰的按钮**不发起请求**（点了必失败不如直接给提示）——
+  // `cap-disabled` 的元素在 gray 模式下只是变灰，浏览器不会阻止 click，故要显式拦。
+  if (btn && btn.classList.contains("cap-disabled")) {
+    toast(btn.title || "当前能力不可用");
+    return;
+  }
   if (btn) btn.disabled = true;
   toast("请求 Analyzer：" + title + " …");
   fetch(url)
-    .then((r) => r.json())
-    .then((s) => {
+    .then((r) => r.json().then((body) => ({ status: r.status, body })))
+    .then(({ status, body: s }) => {
+      // 阶段 4（T10）：409 走统一消费 —— 弹出后端给的原因，并把对应入口置灰
+      if (status === 409) { handleApiError(409, s); showDiag(title + " — 不可用", s); return; }
       showDiag(title + " — 响应", s);
       checkFetcher();
       if (title.indexOf("拉取") >= 0) setTimeout(() => load(true), 3000);
@@ -2087,60 +2253,99 @@ function srcBannerDismiss(sig) {
   try { sessionStorage.setItem(SRC_BANNER_KEY, sig); } catch (e) {}
 }
 
-/* 依据 /api/fetcher-health 的 reachable + sessdata + source 计算横幅状态（3 态） */
-function renderSourceBanner(s) {
+/* 阶段 4 · `T3-A`：横幅由 6 分支收敛为**两档**（`方案.md` §6.2.2）。
+ *
+ *   ① 不可用（bad）＝ 原 1 不可达 ＋ 2 凭证失效 ＋ 4 #37 路径诊断 error
+ *   ② 降级  （warn）＝ 原 3 local 模式 ＋ 5 #37 库为空 ＋ 6 auto 降级
+ *
+ * ⚠️ 收敛的**关键不是「砍掉 4 条」，而是「档内要把原因拼出来」** ——
+ * `#37` 的路径诊断是有价值提示（配错库路径时不响横幅会白折腾很久），
+ * 所以每条原分支的具体文案都保留，只是按档分组。
+ * `sig` 由单个分支名改为**档内原因列表**，保证 dismiss（sessionStorage 记忆）
+ * 不会因为「先看到 A、后看到 B」而反复重弹。
+ *
+ * @param s  视图对象（`reachable` 已被 `refreshSourceHealth` 换成业务级 `analyzer.ok`）
+ * @param raw 原始 `/api/capabilities` 响应（`sessdata` / `source` 在 `connection` 之外）
+ */
+function renderSourceBanner(s, raw) {
   const box = $("srcBanner");
   if (!box) return;
-  const reachable = !!(s && s.ok && s.reachable);
-  const sess = (s && s.sessdata) || {};
-  const src = (s && s.source) || {};
+  const srcRaw = raw || s || {};
+  const sess = (srcRaw.sessdata) || (s && s.sessdata) || {};
+  const src = (srcRaw.source) || {};
   const diag = src.diagnosis || {};   // #37：Analyzer 库路径诊断（error=路径配错 / warn=库为空）
-  let level = "ok", sig = "ok", text = "", act = "";
+  const reachable = !!(s && s.reachable);
+
+  // 逐条判据先算出来，再按档归类（顺序与原 6 分支一致：bad 优先于 warn）
+  const reasons = { bad: [], warn: [] };
 
   if (!reachable) {
-    level = "bad"; sig = "unreachable";
-    text = "Analyzer 不可达（8899）—— 主源离线。" +
-           (src.effective === "local" ? "已降级为本地库 " + (src.local || 0) + " 条。" : "");
-    act = "打开设置";
-  } else if (sess.state === "invalid") {
-    level = "bad"; sig = "sessdata-invalid";
-    text = "Analyzer 凭证已失效（-101）—— 抓取/更新会失败，请更新 config/config.yaml 的 SESSDATA。";
-    act = "打开设置";
-  } else if (src.requested === "local") {
-    level = "warn"; sig = "mode-local";
-    text = "当前为「自身模式（local）」：只用本地 Finder 库 " + (src.local || 0) + " 条，历史深度可能不足。";
-    act = "打开设置";
-  } else if (diag.level === "error") {
+    reasons.bad.push("Analyzer 不可达（8899）—— 主源离线"
+      + (src.effective === "local" ? "，已降级为本地库 " + (src.local || 0) + " 条" : ""));
+  }
+  if (reachable && sess.state === "invalid") {
+    reasons.bad.push("Analyzer 凭证已失效（-101）—— 抓取会失败，请更新 config/config.yaml 的 SESSDATA");
+  }
+  if (diag.level === "error") {
     /* #37：路径配错 / 不是 Analyzer 库 / 打不开 —— 必须与「Analyzer 确实没有数据」区分开。
        否则 auto 静默降级成 local 时，你会以为 Analyzer 没数据而去白折腾一遍。 */
-    level = "bad"; sig = "src-diag-" + (diag.code || "error");
-    text = diag.message || "Analyzer 库配置有问题（见设置 ⚙ 的数据源段）。";
-    act = "打开设置";
-  } else if (diag.level === "warn") {
-    level = "warn"; sig = "src-diag-" + (diag.code || "warn");
-    text = diag.message || "Analyzer 库里没有记录。";
-    act = "打开设置";
-  } else if (src.effective === "local" && src.requested === "auto") {
-    level = "warn"; sig = "auto-degraded";
-    text = "auto 模式未能从 Analyzer 读到数据，已自动降级为本地库 " + (src.local || 0) + " 条。";
-    act = "打开设置";
+    reasons.bad.push(diag.message || "Analyzer 库配置有问题（见设置 ⚙ 的数据源段）");
+  }
+  if (src.requested === "local") {
+    reasons.warn.push("当前为「自身模式（local）」：只用本地 Finder 库 "
+      + (src.local || 0) + " 条，历史深度可能不足");
+  }
+  if (diag.level === "warn") {
+    reasons.warn.push(diag.message || "Analyzer 库里没有记录");
+  }
+  if (src.effective === "local" && src.requested === "auto") {
+    reasons.warn.push("auto 模式未能从 Analyzer 读到数据，已自动降级为本地库 "
+      + (src.local || 0) + " 条");
   }
 
+  const level = reasons.bad.length ? "bad" : (reasons.warn.length ? "warn" : "ok");
+  const list = level === "ok" ? [] : reasons[level];
+  // `sig` = 档位 ＋ **档内原因全文**（`T3-A` 的原始口径）—— 只有「完全相同的状态」才沿用
+  // 上次的收起；原因一变就再次提示，与 `#srcClose` 的 title「状态变化后会再次提示」一致。
+  // （曾误用「档位＋条数」：同档同条数但原因不同的新状态会被静默吞掉。）
+  const sig = level + ":" + list.join("|");
   if (level === "ok" || srcBannerDismissed(sig)) { box.classList.add("hidden"); return; }
+
   box.className = "src-banner " + level;
-  $("srcText").textContent = text;
+  // 档内多条原因用「；」拼接，一条横幅承载全部信息
+  $("srcText").textContent = list.join("；") + "。";
   const a = $("srcAct");
-  a.classList.toggle("hidden", !act);
+  a.classList.toggle("hidden", level !== "bad");   // 只有「不可用」才值得引导去设置
   const dot = $("srcDot");
   dot.className = "src-dot " + level;
   box.dataset.sig = sig;
   box.classList.remove("hidden");
 }
 
+/** 阶段 4：**轮询切到 `/api/capabilities`**（`方案.md` D2 / 排序约束「切换点 2」）。
+ *
+ * 为什么必须切（这是本轮最容易做错的一处）：
+ *  · `/api/fetcher-health` 的顶层 `ok` 来自 `_forward_fetcher` —— 语义是
+ *    「**HTTP 请求成功**」，而 `except HTTPError` 分支里 HTTP 502 也返 `ok=False` 但
+ *    `reachable=True`；更关键的是它**没有**「业务级可用」这个字段。
+ *  · 真正的判据是 `/api/capabilities` 的 `connection.analyzer.ok`
+ *    （＝ `/health` HTTP 成功**且**可达），与后端能力层/策略层/409 门控**同一判据**。
+ *    若前端继续用 `s.reachable`，会出现「横幅说连着、按钮全灰」（`现状.md` §8.4 问题 2）。
+ *  · **超集兼容**：新端点顶层原样带 `reachable`/`status`/`source`/`sessdata`
+ *    （`方案.md` 排序约束 #2）→ 下面两处消费方**不必改**。
+ */
 function refreshSourceHealth() {
-  fetch("/api/fetcher-health")
+  fetch("/api/capabilities")
     .then((r) => r.json())
-    .then((s) => { applyFetcherHealth(s); renderSourceBanner(s); })
+    .then((s) => {
+      // 业务级判据：从 connection.analyzer.ok 取；取不到则退回旧的传输层（保守：视为不可用）
+      const ana = (s && s.connection && s.connection.analyzer) || {};
+      const ok = (ana.ok !== undefined) ? !!ana.ok : !!(s && s.reachable);
+      const view = Object.assign({}, s, { reachable: ok, analyzerOk: ok });
+      applyCapabilities(s.capabilities, ok);             // 表驱动置灰（能力 ＋ 端点归属两维）
+      applyFetcherHealth(view);                    // 连接状态点
+      renderSourceBanner(view, s);                 // 横幅（T3-A 两档）
+    })
     .catch(() => {});
 }
 
@@ -2153,50 +2358,67 @@ $("srcAct").addEventListener("click", () => { openSettings(); });
 
 /* 设置面板里的数据源三选一：读取当前 + 保存 */
 function loadSourceCfg() {
-  fetch("/api/data-source").then((r) => r.json()).then((d) => {
-    const sel = $("srcMode");
-    if (sel && d && d.mode) sel.value = d.mode;
+  // 阶段 4：改读 `/api/capabilities`（`mode` 已是能力层的输出，不是手切输入）
+  fetch("/api/capabilities").then((r) => r.json()).then((d) => {
+    // 形态：只读展示（不再是下拉框）—— 由 `analyzer.ok` 决定，见 `方案.md` D1
+    const box = $("srcModeBox");
+    if (box) {
+      const combined = d && d.mode === "combined";
+      box.innerHTML = combined
+        ? '<b class="ok">组合形态</b>（combined）—— Analyzer 主源 ＋ 本地补齐'
+        : '<b class="bad">独立形态</b>（standalone）—— 只用本地 Finder 库';
+      box.dataset.mode = d && d.mode ? d.mode : "";
+    }
     const st = $("srcStatus");
-    if (st && d && d.status) {
-      const s = d.status;
-      st.textContent = "当前实际生效：" + (s.effective || "未加载") +
+    const s = (d && d.data) || {};
+    if (st) {
+      st.textContent = "当前实际生效：" + ((d && d.source && d.source.effective) || "未加载") +
         "（Analyzer " + (s.analyzer || 0) + " 条 / 本地 " + (s.local || 0) + " 条 → 合并 " + (s.merged || 0) + " 条）";
       st.className = "fld-status";
     }
   }).catch(() => {});
 }
 $("srcSave").addEventListener("click", () => {
-  const mode = $("srcMode").value;
+  // 阶段 4：**不再提交 mode**（形态由连接决定）—— 只保存 Analyzer 主库路径。
+  // 排序约束（`方案.md` §4）：前端先停用三态手切，后端才收紧端点，否则用户会看到「切换失败」。
   const db = $("srcAnalyzerDb").value.trim();
   const st = $("srcStatus");
-  st.textContent = "正在切换…"; st.className = "fld-status";
+  if (!db) {
+    // label 写的是「留空则用当前值」→ 留空是**合法**输入，不是错误。早先这里把它当错误拦下，
+    // 而 `loadSourceCfg()` 并**不回填**当前路径（`/api/capabilities` 也不暴露 analyzer_db）
+    // → 每次打开设置输入框都是空的 → 保存按钮实际永远点不动。
+    st.textContent = "● 未填写主库路径 —— 沿用当前值，未做任何修改（形态由连接自动决定，无需手切）";
+    st.className = "fld-status";
+    return;
+  }
+  st.textContent = "正在保存…"; st.className = "fld-status";
   fetch("/api/data-source", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(db ? { mode: mode, analyzer_db: db } : { mode: mode }),
-  }).then((r) => r.json()).then((s) => {
-    if (s && s.ok) {
-      const x = s.status || {};
-      const msg = "已切换为 " + s.mode + "（实际生效 " + (x.effective || "?") +
-        "，合并 " + (x.merged || 0) + " 条）";
-      // C-H3（2026-10-01 复核修）：后端已如实回报 persisted，前端此前只判顶层 ok →
-      // 写盘失败时界面照报"已保存"，F-H2 补的落盘结果成了**死数据**。
-      // 注意这里**不能**当成"切换失败"：模式已在内存生效、reload 也成功了，
-      // 只是没写进 data/source_config.json —— 重启后会退回旧值，必须这么说清楚。
-      if (s.persisted === false) {
-        st.textContent = "● " + msg + "，但配置未写入文件（重启后会退回旧值）";
-        st.className = "fld-status bad";
+    body: JSON.stringify({ analyzer_db: db }),
+  }).then((r) => r.json().then((body) => ({ status: r.status, body })))
+    .then(({ status, body: s }) => {
+      if (status === 409) { st.textContent = "● " + handleApiError(409, s); st.className = "fld-status bad"; return; }
+      if (s && s.ok) {
+        const x = s.status || {};
+        const msg = "已保存主库路径（实际生效 " + (x.effective || "?") +
+          "，合并 " + (x.merged || 0) + " 条）";
+        // C-H3（2026-10-01 复核修）：后端已如实回报 persisted，前端此前只判顶层 ok →
+        // 写盘失败时界面照报"已保存"，F-H2 补的落盘结果成了**死数据**。
+        if (s.persisted === false) {
+          st.textContent = "● " + msg + "，但配置未写入文件（重启后会退回旧值）";
+          st.className = "fld-status bad";
+        } else {
+          st.textContent = "● " + msg;
+          st.className = "fld-status ok";
+        }
+        refreshSourceHealth();
+        load(true);
       } else {
-        st.textContent = "● " + msg;
-        st.className = "fld-status ok";
+        st.textContent = "● " + ((s && s.error) || "保存失败");
+        st.className = "fld-status bad";
       }
-      refreshSourceHealth();
-      load(true);
-    } else {
-      st.textContent = "● " + ((s && s.error) || "切换失败");
-      st.className = "fld-status bad";
-    }
-  }).catch((e) => { st.textContent = "● 切换失败：" + e.message; st.className = "fld-status bad"; });
+    }).catch((e) => { st.textContent = "● 保存失败：" + e.message; st.className = "fld-status bad"; });
 });
 
 refreshSourceHealth();
@@ -2205,11 +2427,19 @@ window.addEventListener("focus", () => refreshSourceHealth());
 
 /* ====== ⑧⑨⑩⑪ 导出 / 整库 / 图片批量下载 —— 测试入口（#25 / #23）====== */
 function postCall(btn, url, title) {
+  // 同 `anCall`：置灰的按钮不发起请求（gray 模式下浏览器不会阻止 click）
+  if (btn && btn.classList.contains("cap-disabled")) {
+    toast(btn.title || "当前能力不可用");
+    return;
+  }
   if (btn) btn.disabled = true;
   toast("请求 Analyzer：" + title + " …");
   fetch(url, { method: "POST" })
-    .then((r) => r.json())
-    .then((s) => { showDiag(title + " — 响应", s); checkFetcher(); })
+    .then((r) => r.json().then((body) => ({ status: r.status, body })))
+    .then(({ status, body: s }) => {
+      if (status === 409) { handleApiError(409, s); showDiag(title + " — 不可用", s); return; }
+      showDiag(title + " — 响应", s); checkFetcher();
+    })
     .catch((e) => showDiag(title + " — 错误", { error: e.message }))
     .finally(() => { if (btn) btn.disabled = false; });
 }
@@ -2242,6 +2472,45 @@ $("anExportBtn").addEventListener("click", () => {
 $("anDbBtn").addEventListener("click", () => {
   if (!confirm("将下载 Analyzer 整库 .db。\n注意：这是 Analyzer 的原始数据库快照，下载后请自行妥善保管。\n\n确认下载？")) return;
   window.location.href = "/api/export/db";
+});
+
+/* ⬇ 本地库导出（阶段 4 新增）：**不转发 Analyzer**，直读本地 Finder 库。
+ * 这是「独立形态下唯一还能用的导出出口」→ 故它不进 `CAP_DOM`、不参与门控、恒可用。
+ * 错误处理走 `handleApiError()`（409 统一消费，`T10`）。 */
+$("anLocalExportBtn").addEventListener("click", () => {
+  const btn = $("anLocalExportBtn");
+  if (btn.classList.contains("cap-disabled")) {
+    toast(CAP_HINT["export"] || "当前不可用");
+    return;
+  }
+  if (!confirm("将下载**本地 Finder 库**的快照（bilibili_history.db）。\n"
+             + "注意：这是本地浏览库的副本，与 Analyzer 整库不是同一份数据。\n\n确认下载？")) return;
+  btn.disabled = true;
+  toast("正在导出本地库…");
+  // 用 fetch 先探一次状态（而不是直接改 location）—— 404/409 时能给出可读提示，
+  // 成功才触发浏览器下载流。
+  fetch("/api/export/local/db")
+    .then(async (r) => {
+      if (!r.ok) {
+        let msg = "HTTP " + r.status;
+        try { const j = await r.json(); msg = j.error || msg; } catch (e) { /* 非 JSON 体，保留状态码 */ }
+        return Promise.reject(new Error(msg));
+      }
+      return r.blob();
+    })
+    .then((blob) => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "bilibili_history_local.db";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      toast("已导出本地库（" + (blob.size / 1024).toFixed(0) + " KB）");
+    })
+    .catch((e) => toast("本地库导出失败：" + e.message))
+    .finally(() => { btn.disabled = false; });
 });
 
 /* ⑩ 图片状态（只读） */

@@ -46,8 +46,7 @@
           <span id="ruleDirty" class="badge-num hidden" title="自上次应用以来可能命中规则却未标记的新记录"></span>
         </button>
         <button id="batchBtn" class="btn-sm btn-ghost" title="进入批量勾选模式：可批量跳过或恢复视频">批量</button>
-        <button id="syncBtn" class="btn-sm" title="同步数据（增量拉取最新历史）">同步数据</button>
-        <button id="fullBtn" class="btn-sm btn-ghost" title="强制全量重新拉取：重新校准“仅本地存档”标记并刷新封面（增量同步不捕获删除，需偶尔全量）">全量重建</button>
+        <button id="syncBtn" class="btn-sm" title="同步数据（增量拉取最新历史；由后端策略决定增量/全量）">同步数据</button>
         <span id="fetcherDot" class="conn-dot off" title="Analyzer 连接状态"></span>
         <button id="fetcherBtn" class="btn-sm btn-ghost" title="触发 Analyzer 重新拉取/分析（需本机 Analyzer 后台运行；未运行则提示不可达）">实时更新</button>
         <button id="settingsBtn" class="btn-icon" title="设置" aria-label="设置">
@@ -66,6 +65,7 @@
         <button id="anApplyBtn" class="btn-sm btn-test" title="POST /api/apply：唯一入口——自动比对启动快照与磁盘：改了数据层就热重载（~0.1s 不重启），改了 server.py 就自动重启（~1-2s，由 start.bat 拉起），只改前端则提示刷新即可。无需你判断改了哪些文件">⑥ 应用变更<span id="codeBadge" class="code-badge hidden">0</span></button>
         <button id="anExportBtn" class="btn-sm btn-test" title="POST /api/export/excel → 转发 Analyzer /export/export_history 生成 Excel，再经 /api/export/excel/{file} 下载。Finder 自己不写 xlsx，保证与 Analyzer 同一口径">⑧ 导出 Excel</button>
         <button id="anDbBtn" class="btn-sm btn-test" title="GET /api/export/db → 转发 Analyzer /export/download_db 下载整库 .db（与 Frontend「下载数据库」同源）">⑨ 下载整库</button>
+        <button id="anLocalExportBtn" class="btn-sm btn-ghost" title="GET /api/export/local/db → **不转发**，直读本地 Finder 库（走 sqlite3 在线快照，抓取正在写库也不会取到不一致副本）。Analyzer 不可达时的独立形态出口">⬇ 本地库</button>
         <button id="anImgBtn" class="btn-sm btn-test" title="GET /api/images/status → 转发 Analyzer /images/status，查看封面/头像的批量下载进度（只读，不触发下载）">⑩ 图片状态</button>
         <button id="anImgStartBtn" class="btn-sm btn-ghost" title="POST /api/images/start：触发 Analyzer 批量下载封面+头像。默认 use_sessdata=false（公开内容无需凭证）并限定当前年，属写盘操作，会先二次确认">⑪ 下载图片</button>
         <button id="anImgStopBtn" class="btn-sm btn-ghost" title="POST /api/images/stop：停止正在进行的图片下载任务">停止</button>
@@ -256,15 +256,16 @@
         <input id="fetcherKey" class="fld-input" type="password" placeholder="可选" autocomplete="off" />
         <p class="fld-hint">密钥经 server.py 代理转发，不暴露到浏览器。保存后即时生效并持久化到本地。</p>
         <hr class="fld-sep" />
-        <label class="fld-label" for="srcMode">数据源模式（主开关，切换即时生效）</label>
-        <select id="srcMode" class="fld-input">
-          <option value="auto">auto — 自动：Analyzer 优先，读不到时降级本地库</option>
-          <option value="analyzer">analyzer — 强制 Analyzer 为主源（推荐 / 计划A）</option>
-          <option value="local">local — 强制只用本地 Finder 库（模式B：自身抓取）</option>
-        </select>
+        <div class="fld-label">当前形态（由连接自动决定，不可手切）</div>
+        <div id="srcModeBox" class="fld-readonly">正在探测…</div>
+        <p class="fld-hint">
+          形态不再是手动开关：<b>Analyzer 可用 → 组合形态</b>（Analyzer 主源 ＋ 本地补齐）；
+          <b>不可用 → 独立形态</b>（只用本地库，抓取需 Finder 的有效 SESSDATA）。
+          阶段 4 起取消手切值 <code>analyzer</code> —— 它正是「<code>effective</code> 会谎报」的来源（待办 <code>#39</code>）。
+        </p>
         <label class="fld-label" for="srcAnalyzerDb">Analyzer 主库路径（留空则用当前值）</label>
         <input id="srcAnalyzerDb" class="fld-input" placeholder="…\BilibiliHistoryAnalyzer\output\bilibili_history.db" autocomplete="off" />
-        <p class="fld-hint">凭证统一由 Analyzer 的 <code>config/config.yaml</code> 持有；只有 local 模式才需要 Finder <code>config.json</code> 的有效 SESSDATA。</p>
+        <p class="fld-hint">凭证统一由 Analyzer 的 <code>config/config.yaml</code> 持有；独立形态下才需要 Finder <code>config.json</code> 的有效 SESSDATA。</p>
         <div class="modal-actions">
           <button id="srcSave" class="btn-sm btn-primary">保存数据源设置</button>
         </div>
@@ -274,6 +275,17 @@
           <button id="fetcherSave" class="btn-sm btn-primary">保存</button>
         </div>
         <div id="fetcherCfgStatus" class="fld-status"></div>
+        <hr class="fld-sep" />
+        <details class="adv-overrides">
+          <summary class="fld-label">高级覆盖（调试用，日常不需要）</summary>
+          <p class="fld-hint">
+            正常同步由**后端策略**决定增量还是全量（见顶部「同步数据」）。
+            下面两项是绕过策略的手动覆盖，仅在「增量同步捕获不到删除记录」这类场景偶尔需要。
+          </p>
+          <div class="modal-actions">
+            <button id="fullBtn" class="btn-sm btn-ghost" title="强制全量重新拉取：重新校准「仅本地存档」标记并刷新封面（增量同步不捕获删除，需偶尔全量）">强制全量重建</button>
+          </div>
+        </details>
       </div>
     </div>
   </div>

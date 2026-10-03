@@ -374,14 +374,16 @@ def _analyzer_skippable():
 def load_raw_records():
     """读取数据源并按「数据源主开关」合并为 canonical derived 列表。
 
-    合并策略（mode=auto/analyzer）：以 kid 为键，**Analyzer 优先**；本地库补齐 Analyzer 没有的。
-    合并策略（mode=local）：只用本地 Finder 库。
-    auto 会在 Analyzer 读不到记录时**自动降级本地**，并把 effective 记入 _LAST_SOURCE 供前端横幅提示。
+    合并策略（`mode=auto`，**唯一默认路径**）：以 kid 为键，**Analyzer 优先**；本地库补齐
+    Analyzer 没有的；Analyzer 读不到记录时**自动降级**为纯本地，并把 effective 记入
+    `_LAST_SOURCE` 供前端横幅提示。
+    合并策略（`mode=local`）：只用本地 Finder 库（`adr/0005` 保留该手切值）。
     返回 list[dict]，每项含规则引擎所需字段 + 展示字段 + 聚合字段（session_count/first_view_at/kids）。
 
     阶段 2：`mode=local`，或 `mode=auto` 且判定「主源这次读不读都一样」时
     （`_analyzer_skippable()`，判据见其上），直接跳过 Analyzer 年表读取 —— 这两种情况下
-    它的结果本来就会被 `_pick_sources()` 丢弃。`mode=analyzer`（用户强制主源）不跳过。
+    它的结果本来就会被 `_pick_sources()` 丢弃。
+    阶段 4（D1）：`mode=analyzer` 已删，故不再有「用户强制主源 → 不跳过」这条分支。
     """
     mode = get_source_mode()                      # 只读一次：同一函数内两次读可能拿到不同值（A8）
     if mode == "local" or (mode == "auto" and _analyzer_skippable()):
@@ -418,10 +420,15 @@ def get_raw():
 
 
 # ===================== 数据源主开关（#21，见 doc/archive/说明-主备架构与数据模式.md §3） =====================
-# auto     ：Analyzer 有数据 → 以 Analyzer 为主源、本地库补齐；Analyzer 空/不可达 → 自动降级本地只读
-# analyzer ：强制 Analyzer 为主源（本地仅补齐）
-# local    ：强制只用本地 Finder 库（模式 B：自身抓取，需有效 SESSDATA）
-SOURCE_MODES = ("auto", "analyzer", "local")
+# auto  ：Analyzer 可用（业务级 `analyzer.ok`，＝ /health HTTP 成功且可达）→ 以 Analyzer 为主源、
+#         本地库补齐；不可用/读不到 → **自动降级**本地只读。**这是唯一的默认路径。**
+# local ：强制只用本地 Finder 库（`adr/0005`：**保留**，界面以人话呈现；独立形态即由此而来）
+#
+# ⚠️ 阶段 4（D1）：**手切值 `analyzer` 已删除**（2026-10-03）。
+#    它是「`effective` 会谎报」的根源（待办 `#39`）：强制 analyzer 时若 Analyzer 实际不可用，
+#    `effective` 仍报 analyzer 而数据其实来自本地库 —— 该状态已随 D1 消解，**`#39` 关闭**。
+#    另：删三态是**阶段 4 排序约束的前半段**（前端先停用下拉框 → 后端才收紧），见 `方案.md` §4。
+SOURCE_MODES = ("auto", "local")
 SOURCE = {"mode": "auto"}
 # effective 初始为 None：表示「尚未加载过」，避免在 main() 的首次 reload 之前
 # 对外谎报 effective=auto（前端据此显示"未加载"而非"Analyzer 主力"）。
@@ -429,9 +436,30 @@ _LAST_SOURCE = {"requested": "auto", "effective": None,
                 "analyzer": 0, "local": 0, "merged": 0}
 
 
-def set_source_mode(mode):
-    """设置数据源模式（运行时生效，持久化由 server 层负责）。"""
+# ⚠️ 旧配置兼容：`data/source_config.json` 里可能仍存着 `{"mode": "analyzer"}`（手切值已删）。
+# 读到时**按 `auto` 处理**（语义最接近：Analyzer 为主源 + 本地补齐），并由 server 层回报
+# 「已迁移」，避免用户升级后主源静默变成本地库。
+LEGACY_SOURCE_MODES = ("analyzer",)
+
+
+def normalize_source_mode(mode):
+    """把手切遗留值折算成现行二态之一（`auto` / `local`）。**纯函数。**
+
+    为什么要这一步而不是直接报错：旧配置文件里 `mode=analyzer` 是**已落盘的合法历史值**，
+    直接判错会让服务起不来；折算成 `auto` 则行为等价且不必用户手改文件。
+    """
     m = (mode or "").strip().lower()
+    if m in LEGACY_SOURCE_MODES:
+        return "auto", True          # (归一值, 是否发生迁移)
+    return m, False
+
+
+def set_source_mode(mode):
+    """设置数据源模式（运行时生效，持久化由 server 层负责）。
+
+    阶段 4：只接受 `auto` / `local`；`analyzer` 作为遗留值折算为 `auto`（不报错）。
+    """
+    m, migrated = normalize_source_mode(mode)
     if m not in SOURCE_MODES:
         raise ValueError("mode 必须是 %s 之一" % (SOURCE_MODES,))
     SOURCE["mode"] = m
@@ -455,14 +483,17 @@ def _merge_records(analyzer, local, with_local_backfill=True):
 def _pick_sources(mode, analyzer, local):
     """按模式决定合并策略，返回 (records_dict, effective_mode)。
 
-    auto 的降级判据用「Analyzer 是否读到记录」而非「库文件是否存在」——
+    auto 的降级判据用「Analyzer 是否**读到记录**」而非「库文件是否存在」——
     与 doc/archive/说明-主备架构与数据模式.md §6 的提醒一致：路径配错时不会假装有数据。
+
+    ⚠️ 阶段 4（D1）：**`analyzer` 分支已删**。原分支「强制 Analyzer 为主源」在 Analyzer
+    实际不可用时会把 `effective` 报成 `analyzer` 而数据其实来自本地库 —— 那正是待办
+    `#39`「`effective` 会谎报」。删掉它之后：`auto` 读到就以 Analyzer 为主、读不到就
+    **如实**降级为 `local`，**`effective` 再也不会撒谎**（`#39` 消解）。
     """
     if mode == "local":
         return dict(local), "local"
-    if mode == "analyzer":
-        return _merge_records(analyzer, local, True), "analyzer"
-    # auto
+    # auto（唯一默认路径）
     if analyzer:
         return _merge_records(analyzer, local, True), "analyzer"
     return dict(local), "local"

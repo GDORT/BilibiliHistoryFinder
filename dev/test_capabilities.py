@@ -366,6 +366,165 @@ def t27_analyzer_gate():
         store._ANALYZER_GATE.update(ogate)
 
 
+def t28_cap_dom():
+    sec("T2.8 阶段 4 · CAP_DOM —— 每个选择器必须真实存在（T14 教训的自动化护栏）")
+    import re
+    # `SRC` = <repo>/src，而前端在 `src/web/` → 直接用它拼，勿取父目录
+    web = os.path.join(SRC, "web")
+    html = open(os.path.join(web, "index.html"), encoding="utf-8").read()
+    js = open(os.path.join(web, "app.js"), encoding="utf-8").read()
+    css = open(os.path.join(web, "style.css"), encoding="utf-8").read()
+
+    ids = set(re.findall(r'id="([^"]+)"', html))
+    classes = set()
+    for m in re.findall(r'class="([^"]+)"', html):
+        classes.update(m.split())
+
+    # 取 CAP_DOM 的字面量（前端常量是纯 JSON 风格，可直接正则抓）
+    m = re.search(r"const CAP_DOM = \{(.*?)\n\};", js, re.S)
+    if not m:
+        eq(False, True, "app.js 里能定位到 CAP_DOM 定义")
+        return
+    eq(True, True, "app.js 里能定位到 CAP_DOM 定义")
+    body = m.group(1)
+    # 能力名 → 选择器列表
+    cap_sels = {}
+    for line in body.splitlines():
+        mm = re.match(r'\s*(\w+):\s*\[(.*)\]', line)
+        if mm:
+            cap_sels[mm.group(1)] = re.findall(r'"([^"]+)"', mm.group(2))
+
+    eq(len(cap_sels) >= 6, True, "CAP_DOM 覆盖 ≥6 项能力（实际 %d 项）" % len(cap_sels))
+    # ⚠️ 先留一份**原始 CAP_DOM** 快照：下面会把端点维度的选择器并进 `cap_sels`
+    #    用于存在性校验，若用它断言「某选择器不在 CAP_DOM 里」会恒为假（自己并进去的）。
+    cap_dom_only = dict((k, list(v)) for k, v in cap_sels.items())
+    allsels = [s for v in cap_sels.values() for s in v]
+
+    # 端点归属维度也纳入存在性校验（否则新维度同样会静默失效）
+    m_ano = re.search(r"const ANALYZER_ONLY_DOM = \[(.*?)\];", js, re.S)
+    ano_sels = re.findall(r'"([^"]+)"', m_ano.group(1)) if m_ano else []
+    for sel in ano_sels:
+        cap_sels.setdefault("_ANALYZER_ONLY", []).append(sel)
+
+    # 逐个选择器验证存在性 —— **这就是 T14 教训的护栏**
+    missing = []
+    for cap, sels in sorted(cap_sels.items()):
+        for sel in sels:
+            if sel.startswith("#"):
+                ok = sel[1:] in ids
+            elif sel.startswith("."):
+                ok = (sel[1:] in classes) or (("." + sel[1:]) in css)
+            else:
+                ok = sel in ids
+            if not ok:
+                missing.append("%s:%s" % (cap, sel))
+    eq(missing == [], True, "CAP_DOM 每个选择器都在真实 DOM/样式里（无静默失效）｜失效: %s" % (missing or "无"))
+
+    # 已知必须存在的锚点（防止有人把关键入口从表里删掉）
+    for cap, sel in [("export", "#anExportBtn"), ("export", "#anDbBtn"),
+                     ("images", "#anImgBtn"), ("images", "#anImgStartBtn"),
+                     ("images", "#anImgStopBtn"), ("integrity", "#anDataBtn")]:
+        eq(sel in cap_sels.get(cap, []), True, "%s 应含 %s（实际 %s）" % (cap, sel, cap_sels.get(cap)))
+
+    # ---- 端点归属维度（2026-10-03 审查 §七.1 的修法）----
+    # `fetch` 必须是**空集**：独立形态下 `fetch.available=true`（Finder 自己能抓），
+    # 但 `#anRealtimeBtn`/`#anFullBtn` 打的是 Analyzer 中继 → 挂这里会「亮着但必 409」。
+    eq(cap_sels.get("fetch"), [], "CAP_DOM.fetch 是空集（抓取入口按端点归属，不按能力）")
+    eq(cap_sels.get("sync"), [], "CAP_DOM.sync 是空集（恒可用）")
+    eq(cap_sels.get("backup"), [], "CAP_DOM.backup 是空集（恒可用）")
+
+    m2 = re.search(r"const ANALYZER_ONLY_DOM = \[(.*?)\];", js, re.S)
+    eq(m2 is not None, True, "app.js 定义了 ANALYZER_ONLY_DOM（端点归属维度）")
+    ano = re.findall(r'"([^"]+)"', m2.group(1)) if m2 else []
+    eq(sorted(ano), ["#anFullBtn", "#anRealtimeBtn"],
+       "ANALYZER_ONLY_DOM ＝ 两个 Analyzer 中继按钮（实际 %s）" % (ano,))
+    # 关键护栏：这两个按钮**不得**同时出现在 CAP_DOM 里（否则回到「亮着但必 409」）
+    for sel in ano:
+        eq(sel not in [x for v in cap_dom_only.values() for x in v], True,
+           "%s 不在 CAP_DOM 内（避免能力/端点两维混淆）" % sel)
+    # 判据必须是业务级 analyzer.ok —— 断言 applyCapabilities 真的收第二个参数
+    sig = re.search(r"function applyCapabilities\(([^)]*)\)", js)
+    args = sig.group(1) if sig else ""
+    eq("analyzerOk" in args, True, "applyCapabilities 接收 analyzerOk（业务级判据）")
+    eq("_applyTo(ANALYZER_ONLY_DOM" in js, True,
+       "端点归属维度由 analyzerOk 驱动（不是 caps.fetch）")
+    # 旧坑：不得用 caps.fetch.available 给 Analyzer 中继置灰
+    eq(re.search(r"_applyTo\(ANALYZER_ONLY_DOM,\s*!!\s*\(?caps", js) is None, True,
+       "ANALYZER_ONLY_DOM 判据**不是** caps.fetch（那正是 §七.1 的缺陷）")
+
+    # ⚠️ 不该出现的两个历史坏选择器（T14 的原坑）
+    eq("#selfCheckBtn" not in allsels, True, "不含坏选择器 #selfCheckBtn（页面无此 id）")
+    eq(".tab-analysis" not in allsels, True, "不含坏选择器 .tab-analysis（tab 用 data-biz）")
+
+    # 置灰样式必须已定义（引用了不存在的 class 同样会静默失效）
+    eq(".cap-disabled" in css, True, "`.cap-disabled` 样式已定义（否则置灰无视觉）")
+
+    # 本地导出入口：必须在 HTML 与 app.js 同时存在，且**不进 CAP_DOM**（独立形态唯一出口）
+    eq("anLocalExportBtn" in ids, True, "本地导出按钮 `#anLocalExportBtn` 在 HTML 里")
+    eq("anLocalExportBtn" in js, True, "app.js 引用了本地导出按钮")
+    eq("#anLocalExportBtn" not in [x for v in cap_dom_only.values() for x in v], True,
+       "本地导出**不进 CAP_DOM**（否则独立形态下唯一出口被堵死）")
+
+    # 阶段 4 审查（2026-10-03）补的护栏：`blocked` / `skip` 必须**分开渲染**。
+    # 后端 `_note_plan_not_started()` 对两者都写 `ok:false` → 前端只能靠 `plan_mode` 区分；
+    # 这一段曾「文档声称已落地、代码其实没做」（有意跳过被渲染成红色失败），故加静态护栏。
+    eq('plan_mode === "skip"' in js, True, "同步状态用 `plan_mode==='skip'` 区分「有意跳过」")
+    eq('plan_mode === "blocked"' in js, True, "同步状态用 `plan_mode==='blocked'` 区分「阻断」")
+    eq("sync-skip" in css, True, "`.sync-skip` 样式已定义（跳过态不得渲染成红色失败）")
+    # 横幅 dismiss 的 `sig` 必须含**档内原因全文**：否则同档、同条数但原因不同的新状态会被
+    # 静默吞掉，与 `#srcClose` 的 title「状态变化后会再次提示」自相矛盾。
+    eq('list.join("|")' in js, True, "横幅 `sig` 含档内原因全文（状态一变即再提示）")
+
+
+def t29_source_modes():
+    sec("T2.9 阶段 4 · SOURCE_MODES 三态→二态（`#39` 的回归护栏）")
+    # 1) 现行值域：只剩 auto / local
+    eq(tuple(store.SOURCE_MODES), ("auto", "local"),
+       "SOURCE_MODES 只剩 auto/local（手切 analyzer 已删）")
+    eq("analyzer" in store.SOURCE_MODES, False, "手切值 analyzer 已从值域移除")
+
+    # 2) 遗留值折算：旧配置里的 mode=analyzer → auto，**不报错**
+    for legacy in ("analyzer", "Analyzer", " ANALYZER "):
+        m, migrated = store.normalize_source_mode(legacy)
+        eq((m, migrated), ("auto", True), "遗留值 %r → auto 且标记迁移" % legacy)
+    for good in ("auto", "local", "AUTO", " local "):
+        m, migrated = store.normalize_source_mode(good)
+        eq((m, migrated), (good.strip().lower(), False), "现行值 %r 原样通过" % good)
+    eq(store.normalize_source_mode("")[0], "", "空值不折算（交由上层判缺省）")
+
+    # 3) set_source_mode：接受二态、拒绝乱值、**不再抛错于 analyzer**（折算为 auto）
+    om = store.SOURCE["mode"]
+    try:
+        eq(store.set_source_mode("local"), "local", "set_source_mode('local') 生效")
+        eq(store.set_source_mode("auto"), "auto", "set_source_mode('auto') 生效")
+        eq(store.set_source_mode("analyzer"), "auto", "set_source_mode('analyzer') 折算为 auto（不抛异常）")
+        raised = False
+        try:
+            store.set_source_mode("nonsense")
+        except ValueError:
+            raised = True
+        eq(raised, True, "乱值仍抛 ValueError（不能什么都吞）")
+    finally:
+        store.SOURCE["mode"] = om
+
+    # 4) 关键：`#39` 的实质 —— `_pick_sources` 不得再有 analyzer 分支
+    import inspect
+    src = inspect.getsource(store._pick_sources)
+    eq('mode == "analyzer"' in src, False, "_pick_sources 已无 analyzer 分支（谎报根源已除）")
+    # auto 语义：读到就以 analyzer 为主、读不到就如实降级 local
+    m1, e1 = store._pick_sources("auto", {"k1": {"bvid": "B1"}}, {"k2": {"bvid": "B2"}})
+    eq((e1, len(m1)), ("analyzer", 2), "auto + Analyzer 有数据 → effective=analyzer（含本地补齐）")
+    m2, e2 = store._pick_sources("auto", {}, {"k2": {"bvid": "B2"}})
+    eq((e2, len(m2)), ("local", 1), "auto + Analyzer 读不到 → **如实** effective=local（不谎报）")
+    m3, e3 = store._pick_sources("local", {"k1": {"bvid": "B1"}}, {"k2": {"bvid": "B2"}})
+    eq((e3, len(m3)), ("local", 1), "local 强制只用本地（adr/0005 保留该手切值）")
+
+    # 5) 遗留配置加载：不得让服务起不来（`server._load_source_config` 折算）
+    import server
+    eq(hasattr(store, "LEGACY_SOURCE_MODES"), True, "LEGACY_SOURCE_MODES 已定义（旧配置兼容用）")
+    eq("analyzer" in store.LEGACY_SOURCE_MODES, True, "遗留表含 analyzer")
+
+
 def t3_decide_sync_plan():
     sec("T3 decide_sync_plan —— 规则表 R1–R6 + 覆盖（唯一决定增量/全量的地方）")
 
@@ -777,6 +936,8 @@ def main():
     t25_span_advisory()
     t3_decide_sync_plan()
     t27_analyzer_gate()
+    t28_cap_dom()
+    t29_source_modes()
 
     tmp = tempfile.mkdtemp(prefix="bhf_test_")
     try:

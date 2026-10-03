@@ -969,11 +969,29 @@ def _load_source_config():
         store.note_failure("server._load_source_config", e, "path=%s" % _source_cfg_path())
         d = {}
     m = (d.get("mode") or "auto").strip().lower()
-    if m in store.SOURCE_MODES:
+    # 阶段 4（D1）：旧配置里可能存着已删除的手切值 `analyzer` → **折算为 `auto`** 并留痕。
+    # ⚠️ 不能像原实现那样「不在 SOURCE_MODES 里就静默跳过」—— 那会让旧配置**无声失效**：
+    # 主源从 Analyzer 悄悄变成本地库，用户界面与预期全不一致，却什么提示都没有。
+    m2, migrated = store.normalize_source_mode(m)
+    if m2 in store.SOURCE_MODES:
         try:
-            store.set_source_mode(m)
+            store.set_source_mode(m2)
         except Exception:
             pass
+    if migrated:
+        # ⚠️ **不用 `store.note_failure()`** —— 那是「本应成功却失败」的口子，会进
+        # `recent_failures()`（`verify_riskfix` 对它有断言）且会往 stderr 打 `[warn]`。
+        # 「旧手切值被折算」是**预期的迁移**，不是失败 → 只在启动日志如实写一行。
+        try:
+            if sys.stderr is not None:
+                sys.stderr.write(
+                    "[BHF] 数据源配置：手切模式「%s」已于阶段 4 移除 → 按 auto 处理"
+                    "（形态改由连接自动决定，见 方案.md D1）\n" % m)
+                sys.stderr.flush()
+        except Exception:
+            pass
+        d["mode"] = m2                      # 让返回值也反映折算后的事实
+        d["_legacy_mode_migrated"] = m      # 供调用方（如启动横幅）如实告知用户
     db = (d.get("analyzer_db") or "").strip()
     if db:
         store.ANALYZER_DB = db
@@ -2215,9 +2233,25 @@ class Handler(BaseHTTPRequestHandler):
             # → 内存生效 → reload 失败则**回滚到旧值并重载**、且**不落盘** → 只有 reload 成功才持久化。
             mode = (body.get("mode") or "").strip().lower()
             db = (body.get("analyzer_db") or "").strip()
+            # ⚠️ 阶段 4（D1）：**手切 `analyzer` 已删除**。
+            #   前端已先停用下拉框（排序约束：前端先停、后端才收紧），故此处仍收到它时
+            #   **明确 400 拒绝**（而不是悄悄折算）—— 用户多半是在用旧缓存的页面，
+            #   静默折算会让他以为「强制 analyzer 生效了」，而那正是 `#39` 谎报的开始。
+            if mode in store.LEGACY_SOURCE_MODES:
+                self._send(400, {"ok": False,
+                                 "error": "手切模式「%s」已于阶段 4 移除（它会导致 effective 谎报，"
+                                          "即待办 #39）。形态现在由连接自动决定："
+                                          "Analyzer 可用 = 组合形态，不可用 = 独立形态。"
+                                          "请刷新页面后重试。" % mode,
+                                 "removed_mode": mode,
+                                 "modes": list(store.SOURCE_MODES),
+                                 "mode": store.get_source_mode(),
+                                 "status": store.source_status(with_diagnosis=True)})
+                return
             if mode and mode not in store.SOURCE_MODES:
                 self._send(400, {"ok": False,
-                                 "error": "mode 必须是 %s 之一" % (list(store.SOURCE_MODES),)})
+                                 "error": "mode 必须是 %s 之一（形态由连接自动决定，无需手切）"
+                                          % (list(store.SOURCE_MODES),)})
                 return
             if db:
                 # 只读探测候选路径：路径不存在 / 不是文件 / 打不开 / 读不到年表 → error
