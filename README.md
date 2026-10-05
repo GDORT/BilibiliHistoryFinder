@@ -175,7 +175,7 @@ BilibiliHistoryFinder/
 
 | 脚本 | 定位 |
 | --- | --- |
-| `test_capabilities.py` | 「连接即模式」阶段 1 的**纯函数单测**（零 IO、秒级，275 项）；`--live` 追加一次端点冒烟（305 项） |
+| `test_capabilities.py` | 「连接即模式」阶段 1 的**纯函数单测**（零 IO、秒级，273 项）；`--live` 追加一次端点冒烟（304 项） |
 | `regression_restart.py` | **⑥ 重启链路的常驻回归**（42/42/42 ＋ 旧设计 `0/0/0` 对照） |
 | `regression_fallback.py` | **② 增量 → 全量自动回退**的端到端回归（7 项，含缺基线标记的清除与冷却收敛） |
 | `verify_riskfix.py` | **风险审查修复的自动化验收**（97 项断言；整进程隔离副本） |

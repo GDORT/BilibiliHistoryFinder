@@ -1578,17 +1578,34 @@ BACKUP_ROOT = os.path.join(store.DATA_DIR, "backup")
 
 
 def _count_db_records(db_path):
-    """统计 DB 记录数：优先 bilibili_history_YYYY 年表，回退 history 单表（本地库）。"""
+    """统计 DB 记录数：优先 bilibili_history_YYYY 年表，回退 history 单表（本地库）。
+
+    ⚠️ 2026-10-05 修正：原先只认这两种表名 → **`canonical_state.db` 返回 0**
+    （它的表是 `skip_state`/`saved_views`/`lists`）。改为**兜底「所有非 fts 虚表的表」**，
+    这样侧状态库也能报出真实规模；`skip_state=6` 本该在备份 manifest 里可见。
+    """
     try:
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         cur = con.cursor()
         total = 0
+        matched = False
         for pat in ("bilibili_history_[0-9][0-9][0-9][0-9]", "history"):
             for (tb,) in cur.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB ?",
                 (pat,),
             ):
+                matched = True
                 total += cur.execute(f"SELECT COUNT(*) FROM {tb}").fetchone()[0]
+        if not matched:
+            # 兜底：所有真表（排除 fts 影子表与 sqlite 内部表）
+            for (tb,) in cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_fts%'"
+            ):
+                try:
+                    total += cur.execute(f"SELECT COUNT(*) FROM \"{tb}\"").fetchone()[0]
+                except Exception:
+                    pass
         con.close()
         return total
     except Exception:
@@ -1608,6 +1625,33 @@ def _backup_one(src, dst):
         con.close()
 
 
+def _sha12(path):
+    """文件 sha256 前 12 位（manifest 里的轻量校验和；不比全量哈希，避免大库卡顿）。"""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:12]
+
+
+# ⑤ 备份要额外纳入的**配置与状态文件**（2026-10-05 补全）。
+# 起因：原实现只备两个 `.db` → **手动跳过/搁置状态、规则配置、数据源配置全不在内**，
+# 回代后会「数据回去了、设置没了」。这些文件都是小 JSON，可直接复制。
+BACKUP_EXTRA_FILES = (
+    "rules.json",            # 续看规则配置
+    "source_config.json",    # 数据源形态 ＋ analyzer_db 路径
+    "fetcher_config.json",   # Analyzer 地址 ＋ API Key
+    "sync_result.json",      # 上次同步结果
+    "sync_progress.json",    # 同步进度
+    "auto_skip_progress.json",  # 规则应用进度
+)
+
+# 侧状态库（**手动跳过/搁置状态 ＋ 已保存视图 ＋ 名单**）—— 它不是 `.db` 命名那两个之一，
+# 但它是「我的整理成果」的载体，**漏了它等于备份只回得回数据、回不回状态**。
+BACKUP_EXTRA_DBS = ("canonical_state.db",)
+
+
 def _create_backup():
     os.makedirs(BACKUP_ROOT, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1620,17 +1664,134 @@ def _create_backup():
     }
     for label, db in (("analyzer", store.ANALYZER_DB), ("local", store.LOCAL_DB)):
         if os.path.exists(db):
-            dst = os.path.join(folder, os.path.basename(db))
+            # ⚠️ **2026-10-05 修正一个既存 bug**：原先用 `os.path.basename(db)` 命名，
+            #   而 `ANALYZER_DB` 与 `LOCAL_DB` **同名**（都是 `bilibili_history.db`，
+            #   实测 `basename` 相同 = True）→ **Analyzer 副本被后写的本地库覆盖**，
+            #   备份里实际只有一份库。改为**加 `label` 前缀**彻底区分。
+            dst = os.path.join(folder, "%s_%s" % (label, os.path.basename(db)))
             _backup_one(db, dst)
             manifest["items"].append({
                 "label": label,
-                "file": os.path.basename(db),
+                "file": os.path.basename(dst),          # ← 备份内文件名（带前缀）
+                "source": db,                            # ← 原位路径，回代要用
                 "size": os.path.getsize(dst),
                 "records": _count_db_records(db),
+                "sha256_12": _sha12(dst),
             })
+    # ---- 2026-10-05 补全：侧状态库（跳过状态/视图/名单）----
+    for fn in BACKUP_EXTRA_DBS:
+        src = os.path.join(store.DATA_DIR, fn)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(folder, "side_%s" % fn)   # 加前缀，避免与同名库混淆
+        _backup_one(src, dst)
+        manifest["items"].append({
+            "label": "side-state",
+            "file": os.path.basename(dst),
+            "source": src,                            # 原位路径，回代要用
+            "size": os.path.getsize(dst),
+            "records": _count_db_records(src),
+            "sha256_12": _sha12(dst),
+        })
+    # ---- 2026-10-05 补全：配置与状态 JSON（直接复制，体积小）----
+    manifest["config_files"] = []
+    for fn in BACKUP_EXTRA_FILES:
+        src = os.path.join(store.DATA_DIR, fn)
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(folder, fn)
+        try:
+            shutil.copy2(src, dst)          # copy2 保留 mtime
+        except Exception:
+            continue
+        manifest["config_files"].append({
+            "file": fn, "source": src,
+            "size": os.path.getsize(dst), "sha256_12": _sha12(dst),
+        })
+    # ---- 记录「刻意没备什么」，避免日后误以为备份是完整的 ----
+    covers = os.path.join(store.DATA_DIR, "covers")
+    if os.path.isdir(covers):
+        files = [f for f in os.listdir(covers) if os.path.isfile(os.path.join(covers, f))]
+        manifest["covers_skipped"] = {
+            "files": len(files),
+            "bytes": sum(os.path.getsize(os.path.join(covers, f)) for f in files),
+            "why": "体积大且可从 B站 重新下载 —— 有意不纳入",
+        }
+    # ⚠️ **无法备份的**：`sync_state`（`no_baseline` / `last_full_at`）是**进程内变量**，
+    # 重启即丢。**不影响正确性** —— `decide_sync_plan` 的 R1 读的是本地库 `meta.last_success_at`
+    # ＋ 实时 `local_count`，两者都在本备份里（实测 2026-10-05）。
+    manifest["not_backed_up"] = [
+        "sync_state（进程内变量，重启必丢；但 R1 判据依赖的落盘字段均已备份）",
+    ]
+    # 回代说明：让人日后不用回头翻文档就知道怎么还原
+    manifest["restore_hint"] = (
+        "先 stop.bat 停服务 → 覆盖回原位（analyzer 主源在 source_config.json 指向的路径）→ start.bat。"
+        "完整步骤见同目录 RESTORE.md。"
+    )
     with open(os.path.join(folder, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
+    _write_restore_doc(folder, manifest)
     return manifest
+
+
+def _write_restore_doc(folder, manifest):
+    """在备份目录里写一份**自解释**的回代说明（2026-10-05 补全时新增）。
+
+    为什么要写进备份内部而不是只写文档：备份目录会被单独拷走，
+    脱离了仓库上下文 —— 那时唯一能靠的就是它自己。
+    """
+    lines = [
+        "# 回代说明（自动生成 · %s）" % manifest.get("created_at", "?"),
+        "",
+        "> 本目录是一次**整机快照**（数据 ＋ 配置 ＋ 整理状态），由 ⑤ 备份按钮生成。",
+        "> 回代**必须先停服务**，否则可能回代出与运行态不一致的副本。",
+        "",
+        "## 步骤",
+        "",
+        "```bat",
+        ":: 1. 停服务（在项目根目录）",
+        "stop.bat",
+        "",
+        ":: 2. 覆盖回原位（源路径取自 meta.json 的 source 字段）",
+    ]
+    # ⚠️ 一律用 `.format()` —— `%~dp0` 里的 `%d` 会被 `str.__mod__` 当成格式符
+    #    （实测 `ValueError: unsupported format character '~'`）。
+    for it in manifest.get("items", []):
+        lines.append('copy /Y "%~dp0{f}" "{s}"'.format(f=it["file"], s=it.get("source", "…")))
+    for cf in manifest.get("config_files", []):
+        lines.append('copy /Y "%~dp0{f}" "{s}"'.format(f=cf["file"], s=cf.get("source", "…")))
+    lines += [
+        "",
+        ":: 3. 启动",
+        "start.bat",
+        "```",
+        "",
+        "## 覆盖了什么",
+        "",
+        "| 类别 | 文件 |",
+        "| --- | --- |",
+    ]
+    for it in manifest.get("items", []):
+        lines.append("| 库（{}） | `{}`（{} 条记录） |".format(
+            it.get("label", "?"), it["file"], it.get("records") or 0))
+    for cf in manifest.get("config_files", []):
+        lines.append("| 配置 | `%s` |" % cf["file"])
+    cs = manifest.get("covers_skipped")
+    if cs:
+        lines += ["", "## 刻意没备什么", "",
+                  "- **`covers/` 封面缓存**：{} 个文件 / {:.1f} MB —— {}".format(
+                      cs["files"], cs["bytes"] / 1024 / 1024, cs["why"])]
+    lines += ["", "## 无法备份的", ""]
+    for n in manifest.get("not_backed_up", []):
+        lines.append("- %s" % n)
+    lines += ["", "## 回代后再拉取会怎样", "",
+              "- **效果等同** ✅ —— `decide_sync_plan` 的 R1（首次建基线）读的是本地库"
+              " `meta.last_success_at` ＋ 实时 `local_count`，**两者都在本备份里**。",
+              "- 顶多重拉一遍（**幂等**：按 `kid`/`bvid` 折叠，不产生重复、不丢数据）。",
+              "- 唯一会丢的内存态（`no_baseline` / `last_full_at`）由 R1 兜住，**不会卡住**。",
+              ""]
+    with open(os.path.join(folder, "RESTORE.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
 def _after_data_pull(payload):
@@ -1924,14 +2085,18 @@ class Handler(BaseHTTPRequestHandler):
             # 周期路径 /api/capabilities 仍走本地判定（present），不受本端点影响。
             self._send(200, _finder_sessdata_status(probe=True))
             return
+        # ⚠️ `GET /api/data-source` 已于**阶段 5 退役**（2026-10-05）。
+        #   退役依据：前端**零调用**（`loadSourceCfg()` 在阶段 4 已改读 `GET /api/capabilities` 的
+        #   `mode` / `data` / `source`，见 `app.js::loadSourceCfg`），`POST`（保存主库路径）**仍在用**。
+        #   保留理由已不成立 —— 超集兼容期（本仓阶段 1 的承诺）到此结束。
+        #   ⚠️ 排序约束（`方案.md` §4）：**必须晚于**前端停用；此处已满足。
+        #   若外部仍有消费方（当前实测：无），可回滚此段 —— 纯删路由，不涉及数据。
         if path == "/api/data-source":
-            # #21 数据源主开关：读取当前模式 + 实际生效数据源（纯读）
-            self._send(200, {
-                "ok": True,
-                "mode": store.get_source_mode(),
-                "modes": list(store.SOURCE_MODES),
-                "status": store.source_status(with_diagnosis=True),
-            })
+            self._send(410, {"ok": False,
+                             "error": "GET /api/data-source 已于阶段 5 退役 —— 请改用 GET /api/capabilities"
+                                      "（超集兼容：顶层同样带 mode / source / data）",
+                             "moved_to": "/api/capabilities",
+                             "post_still_supported": True})
             return
         if path == "/api/fetcher-trigger":
             # 阶段 3 门控：这是**写源库**的抓取入口（最常见的失败入口）→ 不可用时先讲清原因

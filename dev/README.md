@@ -11,7 +11,7 @@
 
 | 文件 | 干什么 | 跑法 | 边界 |
 | --- | --- | --- | --- |
-| `test_capabilities.py` | **「连接即模式」阶段 1 的纯函数单测**（仓库**唯一**的断言式单测）：`normalize_policy` / `derive_capabilities` / `decide_sync_plan` / `span_advisory` / `load_policy`·`save_policy` / 跨度读取 / `_analyzer_skippable`（跳过主源读取的三条前置）· `analyzer_gate_blocked`（阶段 3 门控的滞回 / 恢复不对称 / 绝不 fail-closed）· `CAP_DOM` 选择器护栏（阶段 4 `T2.8`：逐个验存在性，**T14 教训的自动化**）· `SOURCE_MODES` 二值域 ＋ 遗留值折算 ＋ `_pick_sources` 无 analyzer 分支（阶段 4 `T2.9`，**`#39` 护栏**）。**默认 275 项**；`--live` 追加一次 `/api/capabilities` 端到端冒烟（8765 在跑就打它，否则**进程内自起临时实例**，**共 305 项**），并对照旧端点行为不变 | `python dev/test_capabilities.py`<br>`python dev/test_capabilities.py --live` | 默认**零 IO**（只 import `store`）；临时 sqlite/json 全在 `tempfile.mkdtemp()` 里；`--live` 只发**只读 GET** 且带 `?sessdata=0`（连 B站都不打） |
+| `test_capabilities.py` | **「连接即模式」阶段 1 的纯函数单测**（仓库**唯一**的断言式单测）：`normalize_policy` / `derive_capabilities` / `decide_sync_plan` / `span_advisory` / `load_policy`·`save_policy` / 跨度读取 / `_analyzer_skippable`（跳过主源读取的三条前置）· `analyzer_gate_blocked`（阶段 3 门控的滞回 / 恢复不对称 / 绝不 fail-closed）· `CAP_DOM` 选择器护栏（阶段 4 `T2.8`：逐个验存在性，**T14 教训的自动化**）· `SOURCE_MODES` 二值域 ＋ 遗留值折算 ＋ `_pick_sources` 无 analyzer 分支（阶段 4 `T2.9`，**`#39` 护栏**）。**默认 273 项**；`--live` 追加一次 `/api/capabilities` 端到端冒烟（8765 在跑就打它，否则**进程内自起临时实例**，**共 304 项**），并对照旧端点行为不变 | `python dev/test_capabilities.py`<br>`python dev/test_capabilities.py --live` | 默认**零 IO**（只 import `store`）；临时 sqlite/json 全在 `tempfile.mkdtemp()` 里；`--live` 只发**只读 GET** 且带 `?sessdata=0`（连 B站都不打） |
 | `regression_restart.py` | **⑥ 重启链路的常驻回归**。真起 `ThreadingHTTPServer` + 主线程 `serve_forever` + 工作线程发起重启（**生产拓扑**），连跑 3 次断言退出码均为哨兵 `42`；另含看门狗超时（`shutdown` 卡死 30s → 3s 顶出）、`_safe_print` 冻结对照、**旧设计对照**（`0/0/0`，线上 bug 的复现） | `python dev/regression_restart.py` | 只绑 `127.0.0.1:0`；写盘全部重定向临时目录 |
 | `regression_fallback.py` | **② 自动回退（增量 → 全量）的端到端回归**。真起 `server.Handler` 发 HTTP GET；三条用例互相对照（缺基线**必须**回退 / 基线正常**不得**回退 / 其它错误**不得**回退）；**附加组**对 `POST /api/sync` 再断言一次（阶段 2 判据收敛）；**新增组（A1）**用**默认策略**跑两条 —— 缺基线＋冷却内 → `skip` 不发请求、原因落到 `sync_state["last"]`，缺基线＋已过冷却 → 全量成功后 `no_baseline` **必须被清**。**共 7 项** | `python dev/regression_fallback.py` | 同上；**base 走内存覆盖，`data/fetcher_config.json` 一字节不动** |
 | `mock_analyzer.py` | **假 Analyzer**：增量接口固定回「未找到本地历史记录」以逼出回退分支；全量默认 `503`（→ Finder 判 `ok=false` → 不触发 `post`，**零副作用**）。`set BHF_MOCK_FULL=200` 可放行全量 | `python dev/mock_analyzer.py`（默认 `127.0.0.1:8790`） | 只绑 `127.0.0.1`；不连 B站、不读写真实历史库 |
@@ -145,10 +145,10 @@ curl --noproxy "*" -X POST -H "Content-Type: application/json" -d "{\"base\":\"h
 | --- | --- | --- | --- |
 | 1 | **`engine.py`（续看规则引擎）零单测** | 它被显式设计为**纯逻辑模块**（零依赖、不碰库 / 网络，见 `doc/现状.md` §2.2）—— **最该也最容易**补；现在改规则只能靠手点网页验证 | 扩 `test_capabilities.py`，或新增 `dev/test_engine.py`（纯函数，零 IO） |
 | 2 | **Finder 自身全量路径零覆盖** | `run_sync_background()`（`server.py` L795，调用点 L2249）要**真跑 `collector.py` 子进程** + 真发 B站请求 → `dev/` 现有手段够不到（沙箱无 collector 假件）。此前还受「SESSDATA 无效」制约；**该制约已于 2026-10-03 解除**（现已有效，见 `doc/现状.md` §10 / `O4`），**但自动覆盖缺口仍在**。**A1 修复补的 `_note_full_success()` 之一正落在此路径内，无自动断言**。注意它与 `owner=analyzer` 的直连全量**不是同一条路径**，后者已被 `regression_fallback.py` A1-2 组覆盖。**这是一处诚实的覆盖缺口，不假装已测** | 待补「沙箱 Finder ＋ 假 collector」后扩 `regression_fallback.py`；在那之前靠手测 |
-| 3 | **前端零回归** | 前端交互逻辑没有任何自动化覆盖 | **推迟到阶段 4**（见 6.4） |
+| 3 | **前端零回归** | 前端交互逻辑没有任何自动化覆盖 | ⚠️ **原标「推迟到阶段 4」，但阶段 4 已于 2026-10-03 完成 → 该标注已过期**（2026-10-05 核）。现状：阶段 4 落地时**补了静态护栏**（`T2.8` 验 `CAP_DOM` 选择器存在性 · `T2.9` 验三态已删），但**运行时交互仍零覆盖**。真要补需浏览器自动化（见 6.4），**待定** |
 | 4 | **无统一 runner** | 七个脚本各跑各的，收尾靠人记 | 一个 `dev/run_all.py`（顺序跑 + 汇总退出码） |
 
-### 6.4 浏览器冒烟需要什么（评估结论：**推迟到阶段 4**）
+### 6.4 浏览器冒烟需要什么（评估结论：⚠️ **原「推迟到阶段 4」已过期** —— 阶段 4 于 2026-10-03 完成）
 
 前端要自动冒烟，**前置有 5 项**，当前**缺最关键的一项**：
 

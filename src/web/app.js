@@ -20,14 +20,12 @@ const UNAVAILABLE_MODE = "gray";
  *  历史教训：老版示例的 `#selfCheckBtn` 与 `.tab-analysis` 都指向不存在的 DOM，
  *  会**静默失效**（`querySelectorAll` 返回空集、不报错）。 */
 const CAP_DOM = {
-  // ⚠️ **`fetch` 故意是空集**（2026-10-03 用户裁定「Finder 自己能抓」）。
-  //   独立形态下 `derive_capabilities()` 判 `fetch.available=true, owner="finder"`
-  //   （理由：Finder 自己能抓）—— 这是**对的**，但它**不意味着 Analyzer 的中继按钮该亮着**。
-  //   「抓取」在独立形态下由 `POST /api/sync` 承担（走 collector，见 `方案.md` D3），
-  //   那个入口是 `#syncBtn`（归 `sync`，恒可用）→ 故 `fetch` 无需挂任何 DOM。
-  //   曾经把 `#anRealtimeBtn`/`#anFullBtn` 挂在这里，导致：按钮亮着、点了必 409
-  //   （它们打的是 Analyzer-only 的 `/api/fetcher-trigger`）—— 见 `ANALYZER_ONLY_DOM`。
-  fetch:     [],
+  // `fetch` ＝ **写源库的抓取**。阶段 5 起它的入口是 `#anRealtimeBtn` / `#anFullBtn`
+  //   —— 二者已**改调 `POST /api/sync`**，由策略层按当前状态分派（`方案.md` D3）。
+  // ⚠️ 判据仍是 `fetch.available`：独立形态 ＋ Finder 凭证有效时它为 true（**Finder 自己能抓**），
+  //   **这是正确的** —— 策略层会把 `owner` 切成 `finder`，按钮真的能干活。
+  //   缺凭证时为 false → 置灰 ＋ 提示「需要有效 SESSDATA」，点不动（而非点了失败）。
+  fetch:     ["#anRealtimeBtn", "#anFullBtn"],
   sync:      [],                  // 恒可用（纯本地读源库 + 独立形态下的 collector 抓取）→ 恒不置灰
   remark:    [],                  // ⚠️ 动态渲染，见 `updateRemarkAvailability()`
   // ⚠️ **不含 `#anLocalExportBtn`** —— 它是「独立形态下唯一还能用的导出出口」，
@@ -41,22 +39,21 @@ const CAP_DOM = {
 
 /** **端点归属**维度：物理上依赖 Analyzer 服务在线的 DOM（与「能力」是两回事）。
  *
- * 为什么要单独一维（2026-10-03 审查 §七.1 的教训）：
- *   能力表回答「**这件事**能不能做」，而这一维回答「**这个按钮打的端点**在不在 Analyzer 上」。
- *   二者会交叉出「能力说可用、端点却 409」的矛盾 —— 独立形态 + Finder 凭证有效时
- *   `fetch.available=true`（Finder 自己能抓）但 `#anRealtimeBtn` 必 409。
- *   把它们混在一张表里就必然出错，故**拆开**：`CAP_DOM` 管能力，本表管端点归属。
+ * ⚠️ **阶段 5 后此项已清空** —— 原来列着 `#anRealtimeBtn` / `#anFullBtn`（它们曾打
+ * Analyzer-only 的 `/api/fetcher-trigger`）。这两个按钮现已**改调 `POST /api/sync`**，
+ * 而该端点**由策略层按状态分派**（`owner=analyzer` → 转发 A；`owner=finder` → 本地 collector）
+ * —— **独立形态下它们照样可用**，不再是「点了必 409」。
  *
- * 判据用 `connection.analyzer.ok`（**业务级** ＝ `/health` HTTP 成功且可达），
- * 与后端 409 门控**同一判据** → 不会再出现「按钮亮着、点了必失败」。
+ * 这正是本表存在的意义：**门控必须跟「按钮实际打的端点」走**，端点一变、表就得跟着变。
+ * 判据仍用 `connection.analyzer.ok`（**业务级**），与后端 409 门控**同一判据**；
+ * 一旦 ②③ 改回 Analyzer-only 端点，**必须把两个 id 加回这里**（`T2.8` 断言会拦）。
  */
-const ANALYZER_ONLY_DOM = ["#anRealtimeBtn", "#anFullBtn"];
-const ANALYZER_ONLY_HINT = "该入口转发给 Analyzer（/api/fetcher-trigger）—— Analyzer 不可用时无法使用。"
-  + "独立形态下请改用顶部「同步数据」（走 Finder 自己的采集）";
+const ANALYZER_ONLY_DOM = [];
+const ANALYZER_ONLY_HINT = "该入口转发给 Analyzer —— Analyzer 不可用时无法使用。";
 
-/** 置灰时的 `title` 提示：让用户知道「为什么灰」＋「怎么才能用上」。
- *  ⚠️ **无 `fetch` 条目** —— `CAP_DOM.fetch` 是空集，抓取入口的提示走 `ANALYZER_ONLY_HINT`。 */
+/** 置灰时的 `title` 提示：让用户知道「为什么灰」＋「怎么才能用上」。 */
 const CAP_HINT = {
+  fetch:     "抓取需要能执行的抓取方：Analyzer 可用时走 Analyzer；独立形态需在 config.json 配好有效 SESSDATA",
   remark:    "备注写回 Analyzer 主库 —— Analyzer 不可用时无法保存",
   export:    "导出 Excel / 整库走 Analyzer；独立形态下请改用「本地库」按钮",
   images:    "图片批量下载由 Analyzer 执行 —— Analyzer 不可用时无法使用",
@@ -1535,8 +1532,55 @@ function anCall(btn, url, title) {
     .finally(() => { if (btn) btn.disabled = false; });
 }
 $("anHealthBtn").addEventListener("click", () => anCall($("anHealthBtn"), "/api/fetcher-health", "① 健康探测 (/health)"));
-$("anRealtimeBtn").addEventListener("click", () => anCall($("anRealtimeBtn"), "/api/fetcher-trigger", "② 增量拉取 (/fetch/bili-history-realtime)"));
-$("anFullBtn").addEventListener("click", () => anCall($("anFullBtn"), "/api/fetcher-trigger?mode=full", "③ 全量拉取 (/fetch/bili-history)"));
+
+/* 阶段 5：②增量 / ③全量 **改调 `POST /api/sync`**（`方案.md` D3「抓取单入口」）。
+ *
+ * 为什么不打 `/api/fetcher-trigger` 了 —— 后端早已有策略层（阶段 2 落地），
+ * 它**按当前状态**决定调谁：`owner=analyzer`（A 可用 → 转发 Analyzer）／
+ * `owner=finder`（A 不可用 → 本地 collector）／`blocked`（无凭证 → 讲清原因不硬跑）。
+ * 前端**不再自己决定**「调 A 还是调本地」，那是策略层的职责。
+ *
+ * ⚠️ ②③ **不再传 `?full=1`** —— 增量/全量也归策略（`decide_sync_plan` 的 R1–R4）。
+ * 需要强制全量时用设置面板「高级覆盖」里的 `#fullBtn`（`方案.md` §4 的隐藏 override）。
+ *
+ * 二者现在与顶栏「同步数据」**调用同一个端点** → 前端三个按钮的差异只剩 label，
+ * 能力门控维度也随之改变（它们不再打 Analyzer-only 端点，见 `ANALYZER_ONLY_DOM` 注释）。
+ */
+$("anRealtimeBtn").addEventListener("click", () => syncViaStrategy($("anRealtimeBtn"), "② 增量同步"));
+$("anFullBtn").addEventListener("click", () => syncViaStrategy($("anFullBtn"), "③ 全量同步"));
+
+/** 走策略层的同步入口（`/api/sync`）。`label` 只用于 toast/诊断标题。 */
+function syncViaStrategy(btn, label) {
+  if (btn && btn.classList.contains("cap-disabled")) {
+    toast(btn.title || "当前能力不可用");
+    return;
+  }
+  if (btn) btn.disabled = true;
+  toast(label + "：正在按当前状态决定由谁执行 …");
+  fetch("/api/sync", { method: "POST" })
+    .then((r) => r.json().then((body) => ({ status: r.status, body })))
+    .then(({ status, body: s }) => {
+      if (status === 409) { handleApiError(409, s); return; }
+      // 响应带 `engine`（analyzer|finder）＋ `plan.reason` —— 直接把「谁在跑、为什么」讲清楚，
+      // 这是 D3 的核心收益：前端不需要知道策略，只需要显示一句话。
+      const who = s && s.engine === "analyzer" ? "Analyzer"
+               : (s && s.engine === "finder" ? "本地 Finder" : "");
+      if (s && s.started) {
+        toast(label + "：已由" + (who || "策略层") + "开始执行" +
+              ((s.plan && s.plan.reason) ? "（" + s.plan.reason + "）" : ""));
+      } else if (s && s.blocked) {
+        toast(label + "：已阻断 —— " + (s.reason || "当前不可执行"));
+      } else if (s && s.skipped) {
+        toast(label + "：本次跳过 —— " + (s.reason || "策略判定无需执行"));
+      } else {
+        toast(label + "：已受理");
+      }
+      pollSync();
+      refreshSourceHealth();
+    })
+    .catch((e) => toast(label + " 失败：" + e.message))
+    .finally(() => { if (btn) btn.disabled = false; });
+}
 $("anDataBtn").addEventListener("click", () => {
   const btn = $("anDataBtn");
   btn.disabled = true;

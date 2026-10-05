@@ -46,9 +46,7 @@
           <span id="ruleDirty" class="badge-num hidden" title="自上次应用以来可能命中规则却未标记的新记录"></span>
         </button>
         <button id="batchBtn" class="btn-sm btn-ghost" title="进入批量勾选模式：可批量跳过或恢复视频">批量</button>
-        <button id="syncBtn" class="btn-sm" title="同步数据（增量拉取最新历史；由后端策略决定增量/全量）">同步数据</button>
-        <span id="fetcherDot" class="conn-dot off" title="Analyzer 连接状态"></span>
-        <button id="fetcherBtn" class="btn-sm btn-ghost" title="触发 Analyzer 重新拉取/分析（需本机 Analyzer 后台运行；未运行则提示不可达）">实时更新</button>
+        <button id="syncBtn" class="btn-sm" title="同步数据（**后端策略**按当前状态决定：调 Analyzer 还是本地 Finder，以及增量/全量）">同步数据</button>
         <button id="settingsBtn" class="btn-icon" title="设置" aria-label="设置">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         </button>
@@ -57,8 +55,11 @@
       <!-- 分组 D：Analyzer 联调（逐一测试 Analyzer 接口；需本机 Analyzer 后台运行） -->
       <div class="tb-group tb-analyzer">
         <button id="anHealthBtn" class="btn-sm btn-test" title="GET /health：探测 Analyzer/Fetcher 后端是否可达">① 健康探测</button>
-        <button id="anRealtimeBtn" class="btn-sm btn-test" title="GET /fetch/bili-history-realtime：触发 Analyzer 增量重新拉取/分析">② 增量拉取</button>
-        <button id="anFullBtn" class="btn-sm btn-test" title="GET /fetch/bili-history：触发 Analyzer 全量重新拉取/分析">③ 全量拉取</button>
+        <!-- 阶段 5：「实时更新」从顶栏移入联调区 —— 它是**运维操作**（催 Analyzer 跑分析流程），不是日常续看入口。连同连接状态点一并迁到这里。 -->
+        <span id="fetcherDot" class="conn-dot off" title="Analyzer 连接状态"></span>
+        <button id="fetcherBtn" class="btn-sm btn-ghost" title="GET /api/fetcher-trigger：**只催 Analyzer 重新分析已有数据**（不拉新数据）。抓取请用顶部「同步数据」—— 那条会由后端策略自动决定调谁">实时更新（催分析）</button>
+        <button id="anRealtimeBtn" class="btn-sm" title="POST /api/sync（**不传 full**）：由**后端策略**按当前状态决定调谁 —— Analyzer 可用则转发 Analyzer，不可用则走本地 Finder（需有效 SESSDATA）；增量/全量也由策略判定（强刷见设置面板「高级覆盖」）">② 增量同步</button>
+        <button id="anFullBtn" class="btn-sm" title="POST /api/sync：与「② 增量同步」**同一个端点** —— 本按钮只是**不额外要求增量**（想要强制全量，请用设置面板「高级覆盖」里的「强制全量重建」，那才是真正的 override）">③ 重新同步</button>
         <button id="anDataBtn" class="btn-sm btn-test" title="GET /api/fetcher-check：真正调用 Analyzer 完整性校验（POST /data_sync/check）+ 报告，检测 JSON↔DB 是否一致">④ 数据自检</button>
         <button id="anBackupBtn" class="btn-sm btn-test" title="POST /api/backup：对 Finder 依赖的 Analyzer 主源 + 本地库做一致快照，作为轻量自主备份">⑤ 本地备份</button>
         <button id="anBackupListBtn" class="btn-sm btn-ghost" title="GET /api/backups：列出已生成的本地备份快照">查看备份</button>

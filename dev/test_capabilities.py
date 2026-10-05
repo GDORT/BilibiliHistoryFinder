@@ -429,15 +429,16 @@ def t28_cap_dom():
     # ---- 端点归属维度（2026-10-03 审查 §七.1 的修法）----
     # `fetch` 必须是**空集**：独立形态下 `fetch.available=true`（Finder 自己能抓），
     # 但 `#anRealtimeBtn`/`#anFullBtn` 打的是 Analyzer 中继 → 挂这里会「亮着但必 409」。
-    eq(cap_sels.get("fetch"), [], "CAP_DOM.fetch 是空集（抓取入口按端点归属，不按能力）")
+    eq(sorted(cap_sels.get("fetch", [])), ["#anFullBtn", "#anRealtimeBtn"],
+       "CAP_DOM.fetch ＝ ②增量/③全量（阶段 5：二者改调 /api/sync 后重新挂载）｜实际 %s" % (cap_sels.get("fetch"),))
     eq(cap_sels.get("sync"), [], "CAP_DOM.sync 是空集（恒可用）")
     eq(cap_sels.get("backup"), [], "CAP_DOM.backup 是空集（恒可用）")
 
     m2 = re.search(r"const ANALYZER_ONLY_DOM = \[(.*?)\];", js, re.S)
     eq(m2 is not None, True, "app.js 定义了 ANALYZER_ONLY_DOM（端点归属维度）")
     ano = re.findall(r'"([^"]+)"', m2.group(1)) if m2 else []
-    eq(sorted(ano), ["#anFullBtn", "#anRealtimeBtn"],
-       "ANALYZER_ONLY_DOM ＝ 两个 Analyzer 中继按钮（实际 %s）" % (ano,))
+    eq(ano, [],
+       "ANALYZER_ONLY_DOM 已清空（阶段 5：②③ 改调 /api/sync，不再打 Analyzer 中继端点）｜实际 %s" % (ano,))
     # 关键护栏：这两个按钮**不得**同时出现在 CAP_DOM 里（否则回到「亮着但必 409」）
     for sel in ano:
         eq(sel not in [x for v in cap_dom_only.values() for x in v], True,
@@ -815,8 +816,22 @@ def t7_live_smoke():
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def get(base, p):
-        with opener.open(base + p, timeout=40) as r:
-            return r.status, json.loads(r.read().decode("utf-8", "replace"))
+        """GET 并返回 `(status, body)`。**4xx/5xx 不抛异常** —— 端点退役类契约要断言的就是这些码
+        （如阶段 5 的 `GET /api/data-source` → 410），若在这里抛 `HTTPError` 会让整段崩掉、
+        看不到「是哪条契约变了」。"""
+        try:
+            with opener.open(base + p, timeout=40) as r:
+                raw = r.read().decode("utf-8", "replace")
+                try:
+                    return r.status, json.loads(raw)
+                except Exception:
+                    return r.status, {}
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            try:
+                return e.code, json.loads(raw)
+            except Exception:
+                return e.code, {}
 
     httpd = None
     base = "http://127.0.0.1:8765"
@@ -899,8 +914,13 @@ def t7_live_smoke():
                   "Analyzer 不可达 → 优雅降级体（不伪造 status）",
                   "键=%s" % sorted(old.keys()))
         st3, oldds = get(base, "/api/data-source")
-        eq(st3, 200, "旧 GET /api/data-source → 200（行为不变）")
-        check("modes" in oldds and "mode" in oldds, "旧端点仍含 mode/modes")
+        # 阶段 5（2026-10-05）：`GET /api/data-source` **已退役**（前端零调用）→ **410 Gone**。
+        # 契约要点：返 **410**（不是 404，要明确「已迁移」而非「不存在」）＋ 带 `moved_to` 指路。
+        eq(st3, 410, "旧 GET /api/data-source → 410 Gone（已退役，不是 404）")
+        # ⚠️ `get()` 已把 body **解析成 dict**（见其 docstring）—— 不要再 `json.loads` 一次
+        ds = oldds if isinstance(oldds, dict) else {}
+        eq(ds.get("moved_to"), "/api/capabilities", "410 响应带 moved_to=/api/capabilities（指路而非消失）")
+        eq(ds.get("post_still_supported"), True, "410 响应明说 POST 仍支持（保存主库路径还在用）")
 
         print("  摘要：mode=%s  plan=%s(%s)"
               % (body.get("mode"), (body.get("plan") or {}).get("mode"),
