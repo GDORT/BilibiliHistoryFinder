@@ -43,7 +43,7 @@
 仓库根目录已提供 `start.bat` / `stop.bat`：
 - 双击 **`start.bat`**：自动探测本机 Python（兼容无系统级 Python 的情况）、**以 supervised 模式**前台启动服务并持续打印状态（含续看规则「待应用 / 脏计数」）。
   > 「supervised」＝该窗口自己充当 supervisor：网页上点「⑥ 应用变更」触发重启时，服务会以退出码 42 退出，**窗口会自动把它重新拉起（≈3 秒）**，因此**改完代码无需关掉重开 bat**。
-- 双击 **`stop.bat`**：关闭 Finder 服务（正常停止，不会触发自动重启）。
+- 双击 **`stop.bat`**：关闭 Finder 服务（正常停止，不会触发自动重启）＋顺带关掉 `BilibiliHistoryAnalyzer.exe`（start.bat 拉起的那个）。**成功即自动关窗**，只有真出错（杀不掉进程）才 `pause`。
 - 浏览器打开 **http://127.0.0.1:8765**（**默认端口**；改过则以 `doc/现状.md` §3 为准）即可使用。
 - 改代码后如何生效 → 网页上**只需点一个按钮「⑥ 应用变更」**，不用你判断改了哪些文件：
   - 改了 `store.py` / `engine.py` / `rules.json` / 数据 → 自动**热重载**（约 0.1 s，不重启进程、不释放端口）；
@@ -122,7 +122,7 @@ BilibiliHistoryFinder/
 │   ├── backup/ · covers/    # ⑤ 备份快照 · 封面图片缓存
 │   └── run/                 # 重启记账 · 重启链路日志 · 退出握手标记
 ├── config.json           # ⚠️ 在**仓库根**（不在 data/ 下）：web_port ＋ collector 用 SESSDATA（遗留，当前已失效）
-├── start.bat / stop.bat  # 启动 / 关闭（自动探测 Python；start.bat 为 supervised 模式，可被网页「⑥ 应用变更」自动拉起）
+├── start.bat / stop.bat  # 启动 / 关闭（自动探测 Python；start.bat 为 supervised 模式，可被网页「⑥ 应用变更」自动拉起；会顺带拉起 Analyzer）
 ├── dev/                  # 测试资产（回归 / 单测 / 假后端桩）—— 手册见 dev/README.md
 └── doc/                  # 文档 —— 入口 doc/README.md（4 份活跃 ＋ adr/ ＋ log/ ＋ archive/ ＋ 两个第三方源码副本）
 ```
@@ -171,11 +171,18 @@ BilibiliHistoryFinder/
 
 **源码副本（只读参考，非文档）**：`doc/BilibiliHistoryFetcher-master/`（Analyzer/Fetcher 后端源码）· `doc/BiliHistoryFrontend-master/`（开源前端，Tauri/Vue3）—— **说明与状态见 `doc/README.md` §6**，本节不复述。
 
-**开发工具（`dev/`，非文档，共 7 个脚本）**：用途 / 跑法 / 共同安全约定与写新脚本的经验见 **`dev/README.md`**（测试资产手册）。一句话定位：
+**开发工具（`dev/`，非文档，共 17 个 `.py`）**：用途 / 跑法 / 共同安全约定与写新脚本的经验见 **`dev/README.md`**（测试资产手册）。一句话定位：
 
 | 脚本 | 定位 |
 | --- | --- |
-| `test_capabilities.py` | 「连接即模式」阶段 1 的**纯函数单测**（零 IO、秒级，273 项）；`--live` 追加一次端点冒烟（304 项） |
+| `run_all.py` | **⭐ 统一 runner** —— 本仓「全绿」的**单一权威出处**。顺序跑 **8 套** ×两种环境（加 `--with-a1` → **9 套**，含前端冒烟；**两种环境**＝带代理／无代理）＋ 汇总退出码 ＋ **「文档声明 ↔ 实跑」交叉校验** ＋ 零污染核对 ＋ 追加过程日志到 `dev/test_runs.md`。日常只跑它 |
+| `test_engine.py` | 规则引擎单测（零 IO，**114 项**）—— 2026-10-05 新增，此前 `engine.py` 零覆盖 |
+| `test_collector.py` | 采集器离线部分单测（47 项，临时库）—— 2026-10-05 新增 |
+| `test_api_contract.py` | 端点契约（**97 项**，沙箱 ＋ 自带假 Analyzer）—— 2026-10-05 新增 |
+| `test_finder_collect.py` | **Finder 自身抓取**常驻回归（22 项，沙箱 ＋ **假 B站**，零实网）—— 2026-10-06 新增 |
+| **`e2e/smoke_frontend.py`** ⭐ | **前端运行时冒烟**（**54 项**：G1 加载 / G2 能力→DOM / G3 横幅两档 / G4 同步四态 / **G5 `#42` 排序** / **G6 `#41` duration 边界**）—— 真开 Chromium ＋ 真读 DOM。⚠️ 需先`. dev\e2e\env.ps1`；`run_all.py --with-a1` 才会跑 |
+| `e2e/make_fixtures.py` | **确定性夹具生成器**（39 条，五分类 ＋ `duration` 长尾三段）—— A1 的数据源 |
+| `test_capabilities.py` | 「连接即模式」阶段 1 的**纯函数单测**（零 IO、秒级，289 项）；`--live` 追加一次端点冒烟（320 项） |
 | `regression_restart.py` | **⑥ 重启链路的常驻回归**（42/42/42 ＋ 旧设计 `0/0/0` 对照） |
 | `regression_fallback.py` | **② 增量 → 全量自动回退**的端到端回归（7 项，含缺基线标记的清除与冷却收敛） |
 | `verify_riskfix.py` | **风险审查修复的自动化验收**（97 项断言；整进程隔离副本） |
@@ -183,7 +190,7 @@ BilibiliHistoryFinder/
 | `stub_fetcher.py` | **假控制后端** —— 真实 Analyzer 不在时验证控制流闭合 |
 | `migrate_p2.py` | **阶段 0 · P2 一次性数据迁移**（Analyzer 长尾 / 缺口 → 本地库）；默认 `--dry-run`，`--apply` 才写 |
 
-其中六个**测试**脚本**只绑 `127.0.0.1` 随机端口、不启动对外服务、不读写任何历史数据**，写盘全部重定向到临时目录；`migrate_p2.py` 是**唯一会写真实本地库**的脚本（数据操作，需手动 `--apply`）。
+其中 **8 个常规测试脚本**（由 `run_all.py` 统一调度 ＋ `test_capabilities.py --live`；**加 `--with-a1` 共 9 套**）**只绑 `127.0.0.1` 随机端口、不启动对外服务、不读写任何历史数据**，写盘全部重定向到临时目录；`migrate_p2.py` 是**唯一会写真实本地库**的脚本（数据操作，需手动 `--apply`）。
 
 **归档溯源（`doc/archive/`，19 份，冻结不动）**：三轴方案原稿（`方案-后端与数据源` / `方案-前端` / `方案-油猴D`）、`方案-连接即模式`、`方案-Finder轻量化`、拆分前定稿、架构 / 规则 / 验证报告、源码评估、评估期与原型期原始文档等。**逐份清单（19 份全覆盖）见 [`doc/README.md`](doc/README.md) §2.1**。
 

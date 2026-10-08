@@ -48,7 +48,16 @@ DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "config.json")
 DEFAULT_DB = os.path.join(PROJECT_ROOT, "data", "bilibili_history.db")
 PROGRESS_FILE = os.path.join(PROJECT_ROOT, "data", "sync_progress.json")
 RESULT_FILE = os.path.join(PROJECT_ROOT, "data", "sync_result.json")
-API_URL = "https://api.bilibili.com/x/web-interface/history/cursor"
+API_BASE = os.environ.get("BHF_API_BASE", "").strip()
+API_URL = (API_BASE.rstrip("/") if API_BASE else "https://api.bilibili.com") \
+    + "/x/web-interface/history/cursor"
+# ⚠️ `BHF_API_BASE` **只为测试而存在**（2026-10-06 闭合评估稿 A2「Finder 自身抓取路径
+#   无常驻自动覆盖」）。缺它时 `collector.py` 只能真连 B站，于是这条链路**只能靠一次性
+#   `test_b2_live.py` 验证**（消耗风控额度、需用户授权、不可回归）。
+#   有了它，`dev/regression_fallback.py` 能在沙箱里起一个**假 B站**（`HTTPServer` 返
+#   构造的历史 JSON），把「Analyzer 不可达 → 策略派 finder → 起子进程 → 落库 → 标完成」
+#   这条链路做成**常驻自动回归**，零实网、零凭证。
+#   ⚠️ 它**只影响 URL 拼接**，不改变任何解析/落库逻辑；且拼的是一个用户显式给的基址。
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 REFERER = "https://www.bilibili.com"

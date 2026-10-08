@@ -129,6 +129,62 @@ def _rec_key(d):
     return f"{kid}_{va}"
 
 
+# ===================== duration overlay（#40 补全，2026-10-05） =====================
+# 背景：Analyzer 2020–2025 六个年表的 `duration` 整列为 0（当年采集器未落盘该字段），
+# 而 `history/cursor` 只回近三个月、`video_library.db` 从未建成 → 源侧无法直接取回。
+# B3 实测：B站详情接口 `/x/web-interface/view?bvid=` **无需 SESSDATA**、可按 bvid 补时长
+# （363 条 10/10 dry-run 通过），故按 bvid 补成一份 **overlay**，由本模块在读取时叠加。
+#
+# ⚠️ **为什么是 overlay 而不是改库**（两条硬约束）：
+#   ① `_merge_records` 的口径是「Analyzer 优先，本地仅补齐 Analyzer 没有的 kid」，
+#      2020–2025 的 kid 在 Analyzer 侧**存在**（只是 duration=0）→ 补进本地库会被 0 盖掉；
+#   ② Finder 对 Analyzer **只读**（`adapter_analyzer` 只有 `read_analyzer_records`），
+#      写主库属破例。
+#
+# 语义：**只补缺失，不覆盖真实值** —— 源库 `duration` 为 0/None 时才用 overlay 里的值。
+# 删除 `data/duration_backfill.json` 即**完全回退**。
+DURATION_OVERLAY_FILE = os.path.join(DATA_DIR, "duration_backfill.json")
+_DURATION_OVERLAY = None      # 进程内缓存（首次读后固化，改文件需重启）
+
+
+def _duration_overlay():
+    """读 duration overlay → {bvid: duration}；文件不存在/坏 → `{}`（不抛、不记失败）。"""
+    global _DURATION_OVERLAY
+    if _DURATION_OVERLAY is not None:
+        return _DURATION_OVERLAY
+    m = {}
+    try:
+        if os.path.exists(DURATION_OVERLAY_FILE):
+            with open(DURATION_OVERLAY_FILE, encoding="utf-8") as f:
+                raw = json.load(f)
+            m = raw.get("map") or {}
+            if not isinstance(m, dict):
+                m = {}
+    except Exception:
+        m = {}          # 坏文件不该拖垮读取 —— overlay 缺失只是退回原行为
+    _DURATION_OVERLAY = m
+    return m
+
+
+def _apply_duration_overlay(recs):
+    """把 overlay 叠到 Analyzer 记录上：**只补缺失**（源库 0/None 才写）。返回补了多少条。"""
+    m = _duration_overlay()
+    if not m:
+        return 0
+    n = 0
+    for d in recs.values():
+        try:
+            if not d.get("duration"):          # 0 / None / 缺字段 → 视为缺失
+                v = m.get(d.get("bvid"))
+                if v:
+                    d["duration"] = int(v)
+                    d["_duration_from_overlay"] = 1
+                    n += 1
+        except Exception:
+            continue
+    return n
+
+
 def _read_analyzer(db_path):
     """read-only 跨年 UNION 读取 Analyzer 全量记录 → {kid: canonical dict}。
 
@@ -161,6 +217,8 @@ def _read_analyzer(db_path):
                     d["source"] = "analyzer"
                     d["kid"] = _rec_key(d)  # 覆盖无效 kid 列，统一复合键
                     recs[d["kid"]] = d
+            # #40：把按 bvid 补的 duration 叠进来（**只补缺失，不覆盖源库真实值**）
+            _apply_duration_overlay(recs)
             return recs
         finally:
             con.close()

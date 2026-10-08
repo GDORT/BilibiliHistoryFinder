@@ -46,7 +46,19 @@ echo ---------------------------------------------------
 rem Tell the server it is supervised, so the web UI can offer one-click restart.
 set "BHF_SUPERVISED=1"
 
+rem --- start Analyzer too (one line). Placed AFTER the PID check above on purpose:
+rem     if Finder is already running we goto MONITOR, so re-double-clicking start.bat
+rem     never launches a 2nd Analyzer (it would fight the 1st one for port 8899).
+rem     NOTE: the 1st quoted arg of START is the window TITLE - the "" is required,
+rem           otherwise cmd takes the exe path as a title and starts nothing.
+start "" /min "D:\Program Files (x86)\BilibiliHistoryAnalyzer\BilibiliHistoryAnalyzer.exe"
+
+echo ---------------------------------------------------
+
 :RUN
+rem Clear a stale stop.flag before each launch: only a flag written by stop.bat
+rem DURING this run may silence the crash pause below.
+del /q "%~dp0data\run\stop.flag" >nul 2>&1
 "%PYEXE%" "%~dp0src\server.py"
 set "RC=%errorlevel%"
 
@@ -59,6 +71,17 @@ rem    so this check must not depend on %RC% alone).
 if exist "%~dp0data\run\relaunch.flag" goto RESTART
 rem 2) Legacy signal: exit code 42.
 if "%RC%"=="42" goto RESTART
+
+rem 3) stop.bat writes stop.flag BEFORE killing us. That stop was deliberate, so
+rem    close this window immediately - pausing would ask the user to acknowledge
+rem    a message they already caused. Anything else = genuine crash, keep the
+rem    window open so the traceback above stays readable.
+if exist "%~dp0data\run\stop.flag" (
+    del /q "%~dp0data\run\stop.flag" >nul 2>&1
+    echo.
+    echo [Status] Stopped by stop.bat. Closing.
+    goto END
+)
 
 echo ---------------------------------------------------
 echo [Status] Server process ended. Exit code = %RC%

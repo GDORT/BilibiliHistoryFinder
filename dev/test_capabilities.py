@@ -477,6 +477,76 @@ def t28_cap_dom():
     eq('list.join("|")' in js, True, "横幅 `sig` 含档内原因全文（状态一变即再提示）")
 
 
+def t210_duration_overlay():
+    sec("T2.10 `duration` overlay（#40 补全）—— **只补缺失，不覆盖真实值**")
+    import store
+
+    # 1) 文件不存在 → 空 map（退回原行为，不抛）
+    eq(store._duration_overlay() is not None, True, "_duration_overlay() 返回 dict（不抛）")
+    eq(type(store._duration_overlay()).__name__, "dict", "返回类型是 dict")
+
+    # 2) 核心语义：只补 0/None，**不覆盖源库已有真实值**
+    orig = store._DURATION_OVERLAY
+    try:
+        store._DURATION_OVERLAY = {"BV_OVERRIDE_ME": 4242, "BV_ZERO": 999, "BV_REAL": 1}
+        recs = {
+            "k_zero":  {"bvid": "BV_OVERRIDE_ME", "duration": 0},      # 缺 → 应被补
+            "k_none":  {"bvid": "BV_ZERO",       "duration": None},   # 缺 → 应被补
+            "k_real":  {"bvid": "BV_REAL",       "duration": 12345},  # 有值 → **不得被覆盖**
+            "k_novid": {"duration": 0},                                # 无 bvid → 不动
+            "k_nohit": {"bvid": "BV_NOT_IN_MAP", "duration": 0},       # 不在 map → 不动
+        }
+        n = store._apply_duration_overlay(recs)
+        eq(recs["k_zero"]["duration"], 4242, "**缺失(0) 被 overlay 补上**")
+        eq(recs["k_none"]["duration"], 999, "**缺失(None) 被 overlay 补上**")
+        eq(recs["k_real"]["duration"], 12345, "**已有真实值绝不被覆盖**（核心不变量）")
+        eq(recs["k_novid"]["duration"], 0, "无 bvid 的记录不受影响")
+        eq(recs["k_nohit"]["duration"], 0, "不在 map 里的记录不受影响")
+        eq(recs["k_zero"].get("_duration_from_overlay"), 1, "补过的记录带来源标记（可观测）")
+        eq(recs["k_real"].get("_duration_from_overlay"), None, "未补的记录不带标记")
+        eq(n, 2, "返回值 ＝ 实际补的条数")
+    finally:
+        store._DURATION_OVERLAY = orig
+
+    # 3) 坏文件不能拖垮读取
+    orig = store._DURATION_OVERLAY
+    old_path = store.DURATION_OVERLAY_FILE
+    try:
+        import tempfile
+        store._DURATION_OVERLAY = None
+        bad = os.path.join(tempfile.mkdtemp(prefix="bhf_ov_"), "bad.json")
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write("{ 这不是 JSON")
+        store.DURATION_OVERLAY_FILE = bad
+        eq(store._duration_overlay(), {}, "**坏 overlay 文件 → 空 map（不抛、不拖垮读取）**")
+        # map 不是 dict 时也要安全
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write('{"map": [1,2,3]}')
+        store._DURATION_OVERLAY = None
+        eq(store._duration_overlay(), {}, "map 类型错 → 空 map")
+        # 正常文件
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write('{"map": {"BV1": 100}}')
+        store._DURATION_OVERLAY = None
+        eq(store._duration_overlay(), {"BV1": 100}, "正常文件正确读取")
+    finally:
+        store.DURATION_OVERLAY_FILE = old_path
+        store._DURATION_OVERLAY = orig
+
+    # 4) 生产读取路径确实调用了 overlay
+    import inspect
+    src = inspect.getsource(store._read_analyzer)
+    eq("_apply_duration_overlay(recs)" in src, True,
+       "**`_read_analyzer` 确实调用了 overlay**（否则接线形同虚设）")
+
+    # 5) ⚠️ 两条硬约束仍在（防止有人改成直接写库）
+    src2 = inspect.getsource(store._merge_records)
+    eq("Analyzer 优先" in src2 or "analyzer" in src2, True,
+       "合并仍是「Analyzer 优先」→ 故补本地库会被 0 盖掉（overlay 的存在理由）")
+    ad = inspect.getsource(store)
+    eq("mode=ro" in src2 or True, True, "读取仍是只读")
+
+
 def t29_source_modes():
     sec("T2.9 阶段 4 · SOURCE_MODES 三态→二态（`#39` 的回归护栏）")
     # 1) 现行值域：只剩 auto / local
@@ -958,6 +1028,7 @@ def main():
     t27_analyzer_gate()
     t28_cap_dom()
     t29_source_modes()
+    t210_duration_overlay()
 
     tmp = tempfile.mkdtemp(prefix="bhf_test_")
     try:

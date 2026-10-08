@@ -1063,7 +1063,14 @@ def _forward_fetcher(rel_path, timeout=30, method="GET", params=None):
     except (urllib.error.URLError, OSError) as e:
         reason = getattr(e, "reason", None)
         reason = reason if isinstance(reason, str) else str(e)
-        return {"ok": False, "reachable": False,
+        # ⚠️ `status: None` 是**刻意补的**（2026-10-06，评估稿 7-b 的修法）：
+        #   三个返回分支的形状原本不一致 —— `HTTPError` 分支带 `status:<code>`、
+        #   `URLError` 分支**不带**。而 `/api/capabilities` 是恒带 `status` 的
+        #   （`ana.get("health_status")`，值可为 `None`）⇒ 同一份契约测试在两个端点上
+        #   得到不同结论，问题 ① 正是被这一点绊倒（恒红）。
+        #   现在**统一为「`status` 恒在，值可能为 `None`」** —— 与 `capabilities` 对齐。
+        #   ⚠️ 只加键、不改语义：`None` 表示「连得上与否未知/未触达」，不是 HTTP 码。
+        return {"ok": False, "reachable": False, "status": None,
                 "error": f"无法连接 Analyzer/Fetcher 后端（{base}）：{reason}"}
 
 
@@ -1159,7 +1166,8 @@ def _forward_fetcher_json(rel_path, body_bytes, timeout=30, method="POST"):
     except (urllib.error.URLError, OSError) as e:
         reason = getattr(e, "reason", None)
         reason = reason if isinstance(reason, str) else str(e)
-        return {"ok": False, "reachable": False,
+        # ⚠️ 同上：`status: None` 让形状与 `capabilities` / `_forward_fetcher` 一致。
+        return {"ok": False, "reachable": False, "status": None,
                 "error": "无法连接 Analyzer/Fetcher 后端（%s）：%s" % (base, reason)}
 
 

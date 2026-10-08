@@ -145,6 +145,25 @@ def eval_condition(rec, cond, now, ctx=None):
     if op == "empty":
         return cur in (None, "")
 
+    # ---- 阶段 5 修 `#41`：`duration`「**有值才判**」守卫 ----
+    # 问题：`duration` 缺失（未落盘/降级导入）时 `rec.get("duration")` 是 `0` 或 `None`，
+    #   而 `0 < 60` 成立 → 记录被误标成「短视频碎片」。实测本地库 462 条缺 duration 的记录里
+    #   **435 条（94.2%）会被这样误伤**（`待办.md` #41）。
+    # 为什么不能改 `_derived`：`progress_pct` 已经正确地对缺分母返回 `None`（那里没问题），
+    #   出问题的是直接读 `rec["duration"]` 的**比较类**算子。
+    # 修法（方案 B，刻意最窄）：**只在「值缺失」时短路求值**，
+    #   `duration` 有真实值（>0，含 1 秒的极短视频）时**行为完全不变**。
+    #   刻意放在 `exists` / `empty` 之后 —— 那两个算子的语义就是「查这个字段有没有值」，
+    #   必须能观察到 `None`/`0`，不能被这个守卫拦掉。
+    # ⚠️ 不改变 `progress_pct` / `progress_sec` 的行为：它们在缺 duration 时返 `None`，
+    #   比较类算子对 `None` 一律返 False（天然安全）。
+    if field == "duration" and op not in ("exists", "empty"):
+        try:
+            if cur is None or float(cur) <= 0:
+                return False        # 缺时长数据 → 不参与该条件
+        except (TypeError, ValueError):
+            return False            # 非数值（脏数据）→ 同样不参与
+
     # 相对时间：相对 now 的天数窗（view_at 秒 或 view_at_age_days 天）
     if op in ("relative_after", "relative_before"):
         secs = _parse_duration(val)
@@ -489,10 +508,35 @@ def sort_value(rec, field, now):
 
 
 def apply_sort(recs, sort_fields, now):
-    """稳定多列排序：从末列往首列依次排序，使首列为主序。dir='desc' 降序。"""
+    """稳定多列排序：从末列往首列依次排序，使首列为主序。dir='desc' 降序。
+
+    ⚠️ 阶段 5 修 `#42`（`待办.md`）：**缺值恒排末尾，升序 ＋ 降序都是**。
+    原实现直接 `recs.sort(key=sort_value, reverse=rev)` —— 而 `sort_value` 用 `(1, 0)`
+    表示「缺值」意图排末尾，但 `reverse=True` 会让 **`(1,0) > (0,x)` → 缺值反而最大 → 排最前**。
+    这与 `sort_value` 的 docstring「**None 永远排末尾**」直接矛盾（实测 `['a','b','c']`
+    降序后变 `['c','b','a']`）。
+
+    修法（不动 `sort_value` 的返回形状，避免影响其它调用方）：
+    **按方向把「有值」与「缺值」分成两段** —— 先按该列排好有值的部分，
+    再把缺值整体追加到末尾。用「有值段的原始下标」做次级键 ⇒ **稳定**，
+    且与多列排序（从末列往首列依次处理）的既有语义一致。
+    """
     if not sort_fields:
         return
     for sf in reversed(sort_fields):
         f = sf.get("field")
         rev = (sf.get("dir") or "desc") == "desc"
-        recs.sort(key=lambda r, ff=f: sort_value(r, ff, now), reverse=rev)
+        # 分段：0 段＝有值、1 段＝缺值。**无论升降序，缺值段都放末尾。**
+        # 段内用**原始下标**做次级键 ⇒ 稳定（与 `list.sort` 的稳定性一致）。
+        rows = [(i, r) for i, r in enumerate(recs)]
+        present = [(i, r) for i, r in rows if sort_value(r, f, now)[0] == 0]
+        missing = [(i, r) for i, r in rows if sort_value(r, f, now)[0] != 0]
+        # ⚠️ `sort_value` 收的是**记录本身**，而 `present` 的元素是 `(下标, 记录)` → 键要用 `t[1]`
+        key = (lambda t: sort_value(t[1], f, now))
+        if rev:
+            # 降序：段内反向排。`list.sort` 稳定 ⇒ **同值元素的原有先后被保留**。
+            present.sort(key=key, reverse=True)
+        else:
+            present.sort(key=key)
+        missing.sort(key=lambda t: t[0])   # 缺值段按原下标（保持原相对顺序）
+        recs[:] = [r for _, r in (present + missing)]
