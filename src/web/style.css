@@ -2,7 +2,7 @@
   --pink: #fb7299;
   --pink-dark: #e85d86;
   --blue: #00aeec;
-  --bg: #f4f5f7;
+  --bg: #f1f2f3;   /* B站网页版页面底色 */
   --card: #ffffff;
   --text: #18191c;
   --sub: #61666d;
@@ -26,21 +26,64 @@ body {
   position: sticky; top: 0; z-index: 10;
 }
 .topbar-inner {
-  max-width: var(--wrap); margin: 0 auto;
-  /* 左 padding = 容器左 padding + sidebar 宽 + gap，使内部有效宽度对齐右侧卡片网格 */
-  padding: 10px var(--pad) 10px calc(var(--pad) + var(--side-w) + var(--gap));
-  display: flex; align-items: center; gap: 12px;
+  max-width: var(--wrap); margin: 0 auto; height: 56px;
+  padding: 0 var(--pad);
+  display: flex; align-items: center; gap: 18px;
 }
-.tabs { display: flex; gap: 4px; flex-shrink: 0; }
+/* B站式 logo：粉色圆角块 ＋ 白色 bilibili 字样 */
+.brand { flex-shrink: 0; display: inline-flex; align-items: center; }
+.logo {
+  display: inline-block; padding: 3px 10px; border-radius: 6px;
+  background: linear-gradient(135deg, var(--pink), #fc8bab);
+  color: #fff; font-size: 14px; font-weight: 800; font-style: italic;
+  letter-spacing: .01em; line-height: 1.45;
+}
+
+/* ⋯ 更多 溢出菜单：装低频运维入口 */
+.more-wrap { position: relative; flex: 0 0 auto; }
+.more-menu {
+  position: absolute; top: calc(100% + 8px); right: 0; z-index: 30;
+  min-width: 190px; padding: 6px; background: var(--card);
+  border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.12);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.more-menu.hidden { display: none; }
+.mm-group { display: flex; flex-direction: column; gap: 2px; padding: 4px 0; }
+.mm-group + .mm-group { border-top: 1px solid var(--border); }
+.mm-title {
+  display: flex; align-items: center; gap: 6px;
+  padding: 2px 10px 4px; font-size: 11.5px; font-weight: 700;
+  color: var(--sub); letter-spacing: .02em;
+}
+.mm-item {
+  display: flex; align-items: center;   /* 让右侧短标签可对齐（.cap-tag 用 margin-left:auto 顶到右边） */
+  text-align: left; width: 100%; background: none; border: none;
+  padding: 7px 10px; border-radius: 6px; cursor: pointer;
+  font-size: 13px; color: var(--text); white-space: nowrap;
+}
+.mm-item:hover { background: rgba(251,114,153,.08); color: var(--pink); }
+.mm-item.cap-disabled { opacity: .45; cursor: not-allowed; }
+.mm-item.cap-disabled:hover { background: none; color: var(--text); }
+/* 置灰项右侧短标签（免悬停即可看出「不可用」；完整原因仍留悬停/点击） */
+.cap-tag {
+  margin-left: auto; flex: 0 0 auto;
+  padding: 1px 6px; border-radius: 8px;
+  font-size: 11px; line-height: 1.6;
+  background: #e8eaed; color: #7a7f87;
+}
+/* 顶栏分区导航（B站式：纯文字链接，hover/active 转粉，active 底部短下划线） */
+.tabs { display: flex; gap: 2px; flex-shrink: 0; align-self: stretch; }
 .tab {
-  background: none; border: none; padding: 6px 14px; font-size: 14px;
-  color: var(--sub); cursor: pointer; border-radius: 6px; position: relative;
+  background: none; border: none; padding: 0 12px; font-size: 14px;
+  color: #18191c; cursor: pointer; position: relative; white-space: nowrap;
+  display: inline-flex; align-items: center;
 }
-.tab:hover { color: var(--text); }
-.tab.active { color: var(--tab-active); font-weight: 600; }
+.tab:hover { color: var(--pink); }
+.tab.active { color: var(--pink); font-weight: 600; }
 .tab.active::after {
-  content: ""; position: absolute; bottom: -2px; left: 50%; transform: translateX(-50%);
-  width: 20px; height: 3px; background: var(--tab-active); border-radius: 2px;
+  content: ""; position: absolute; bottom: 0; left: 50%; transform: translateX(-50%);
+  width: 18px; height: 2px; background: var(--pink); border-radius: 2px;
 }
 
 /* 工具栏中间：生命周期视图（全部 / 需要观看 / 已跳过 / 已搁置） */
@@ -53,18 +96,21 @@ body {
 .vtab:hover { border-color: var(--pink); color: var(--pink); }
 .vtab.active { background: var(--pink); color: #fff; border-color: var(--pink); font-weight: 600; }
 
-.search { flex: 1; min-width: 0; }
+.search { flex: 1 1 auto; min-width: 0; max-width: 480px; }
 .search input {
-  width: 100%; max-width: 400px; padding: 7px 14px; border: 1px solid var(--border);
-  border-radius: 8px; font-size: 13px; outline: none; background: var(--bg);
+  width: 100%; max-width: 400px; padding: 8px 14px; border: 1px solid transparent;
+  border-radius: 8px; font-size: 13px; outline: none; background: #f1f2f3;
 }
 .search input:focus { border-color: var(--pink); background: #fff; }
+/* 顶栏右侧操作区（同步 ＋ 设置 ＋ ⋯更多），靠右对齐 */
+.tb-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .btn-sm {
   background: var(--pink); color: #fff; border: none; padding: 7px 14px;
   border-radius: 6px; cursor: pointer; font-size: 13px; white-space: nowrap; flex-shrink: 0;
 }
 .btn-sm:hover { background: var(--pink-dark); }
 .btn-sm:disabled { opacity: .5; }
+.btn-sync { display: inline-flex; align-items: center; gap: 5px; }
 
 /* ⑥ 应用变更：待应用变更数徽章（需重启时转红以示醒目） */
 .code-badge {
@@ -80,7 +126,7 @@ body {
 .topbar-status {
   background: var(--card); border-bottom: 1px solid var(--border);
   max-width: var(--wrap); margin: 0 auto;
-  padding: 0 var(--pad) 0 calc(var(--pad) + var(--side-w) + var(--gap));
+  padding: 0 var(--pad);
 }
 .status-inner { display: flex; align-items: center; gap: 12px; padding: 7px 0; }
 .sync-progress { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
@@ -152,6 +198,15 @@ body {
 /* 右侧内容区 */
 .content { flex: 1; min-width: 0; }
 
+/* 内容区头部：分类 tab ＋ 状态筛选 ＋ 列表级操作（B站式浏览骨架） */
+.content-head {
+  display: flex; flex-direction: column; gap: 10px;
+  padding-bottom: 12px; margin-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+.list-tools { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.list-ops { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+
 /* 五列卡片网格 */
 .list {
   list-style: none; margin: 0; padding: 0;
@@ -162,7 +217,6 @@ body {
 @media (max-width: 680px) {
   .list { grid-template-columns: repeat(2, 1fr); }
   .sidebar { display: none; }
-  .topbar-inner { padding-left: var(--pad); }
 }
 @media (max-width: 440px) { .list { grid-template-columns: 1fr; } }
 
@@ -170,14 +224,15 @@ body {
 .item {
   display: flex; flex-direction: column; background: var(--card);
   border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
-  text-decoration: none; color: inherit; position: relative; transition: box-shadow .15s;
+  text-decoration: none; color: inherit; position: relative;
+  transition: border-color .2s, box-shadow .2s;
 }
-.item:hover { box-shadow: 0 2px 12px rgba(0,0,0,.08); }
+.item:hover { border-color: var(--pink); box-shadow: 0 0 12px rgba(0,0,0,.1); }
 
-/* 封面区域（256 x 144） */
+/* 封面区域（16:9，B站网页版比例） */
 .thumb { display: block; position: relative; line-height: 0; }
 .cover {
-  width: 100%; height: 144px; object-fit: cover; background: #eee; display: block;
+  width: 100%; aspect-ratio: 16 / 9; height: auto; object-fit: cover; background: #eee; display: block;
 }
 
 /* 封面左上角徽标（直播中/专栏） */
@@ -199,18 +254,18 @@ body {
 
 /* 封面右下角：视频时长 / 已看完 */
 .dur, .badge-done {
-  position: absolute; right: 6px; bottom: 7px;
-  font-size: 11.5px; line-height: 1.5; padding: 1px 6px; border-radius: 3px;
-  color: #fff; background: rgba(0,0,0,.58); z-index: 2;
+  position: absolute; right: 5px; bottom: 6px;
+  font-size: 11px; line-height: 1.5; padding: 1px 6px; border-radius: 2px;
+  color: #fff; background: rgba(0,0,0,.5); z-index: 2;
 }
 .badge-done { background: rgba(0,0,0,.45); font-weight: 500; }
 
 /* 封面底部：观看进度百分比条 */
 .pbar {
-  position: absolute; left: 0; right: 0; bottom: 0; height: 4px;
-  background: rgba(0,0,0,.35); z-index: 2;
+  position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+  background: rgba(0,0,0,.6); z-index: 2;
 }
-.pbar > i { display: block; height: 100%; background: var(--pink); }
+.pbar > i { display: block; height: 100%; background: #FF6699; }
 
 /* 卡片信息区 */
 .meta { padding: 7px 9px 4px; display: flex; flex-direction: column; gap: 4px; }
@@ -388,7 +443,7 @@ body.lock-scroll { overflow: hidden; }
 /* 卡片底部：视频作者 + 观看时间（贴底对齐；标题/作者/时间字重一致，仅颜色区分） */
 .card-bottom { margin-top: auto; padding: 0 9px 9px; display: flex; align-items: center; justify-content: space-between; gap: 6px; }
 .up { font-size: 12px; font-weight: 400; color: var(--sub); text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.up:hover { color: var(--blue); }
+.up:hover { color: var(--pink); }
 .time { font-size: 12px; font-weight: 400; color: var(--sub); white-space: nowrap; flex-shrink: 0; }
 
 /* 底部状态栏 */
@@ -463,33 +518,19 @@ body.lock-scroll { overflow: hidden; }
 .fld-status.ok { color: #2bbf5a; }
 .fld-status.bad { color: #e24b4a; }
 
-/* ====== 顶部工具栏：分组与分隔（优化） ====== */
-.topbar-inner { flex-wrap: wrap; gap: 12px 14px; justify-content: space-between; }
-.tb-group { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
-.tb-nav { gap: 16px; }
-.tb-find { flex: 1; min-width: 220px; }
-.tb-find .search { flex: 1; min-width: 140px; }
-.tb-actions { gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
-/* 分组之间的竖向分隔线 */
-.tb-group + .tb-group { border-left: 1px solid var(--border); padding-left: 14px; }
-/* Analyzer 联调分组：琥珀色测试按钮，与常规操作区分 */
-.tb-analyzer { gap: 6px; }
-.btn-test { border: 1px solid #e6a23c; color: #d99416; background: #fffdf6; font-weight: 600; }
-.btn-test:hover { background: #fdf6ec; }
-.btn-test:disabled { opacity: .6; cursor: progress; }
+/* ====== 顶部工具栏：单行 shell（标题 ＋ 搜索 ＋ 右侧操作） ====== */
 .diag-pre {
   margin: 0; max-height: 62vh; overflow: auto; background: #0f1115; color: #d6e2ff;
   padding: 12px 14px; border-radius: 8px; font-size: 12.5px; line-height: 1.6;
   white-space: pre-wrap; word-break: break-word;
 }
-@media (max-width: 900px) {
-  .tb-group + .tb-group { border-left: none; padding-left: 0; }
-  .tb-find { flex-basis: 100%; order: 3; }
-}
 @media (max-width: 680px) {
-  .topbar-inner { padding-left: var(--pad); }
-  .tb-nav, .tb-find, .tb-actions { flex-basis: 100%; }
-  .tb-actions { justify-content: flex-start; }
+  .topbar-inner { gap: 10px; }
+  .logo { font-size: 13px; padding: 2px 8px; }
+  .tab { padding: 0 8px; }
+  .search { max-width: none; }
+  .content-head { gap: 8px; }
+  .list-ops { margin-left: 0; }
 }
 
 /* ====== 高级筛选抽屉（补充缺失样式，修复“显示异常”） ====== */

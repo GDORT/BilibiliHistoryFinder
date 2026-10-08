@@ -63,6 +63,21 @@ const CAP_HINT = {
 /** 最近一次拿到的能力表（供卡片渲染层判断 `remark`）。 */
 let CAPS = {};
 
+/** ⋯更多 菜单内的置灰项：加一个右侧短标签，免悬停即可看出「不可用」。 */
+function _syncCapTag(el, unavailable) {
+  let tag = el.querySelector(":scope > .cap-tag");
+  if (unavailable && el.classList.contains("mm-item")) {
+    if (!tag) {
+      tag = document.createElement("span");
+      tag.className = "cap-tag";
+      tag.textContent = "不可用";
+      el.appendChild(tag);
+    }
+  } else if (tag) {
+    tag.remove();
+  }
+}
+
 /** 把「不可用」按 `UNAVAILABLE_MODE` 施加到一组元素。 */
 function _applyTo(selectors, available, hint) {
   (selectors || []).forEach((sel) => {
@@ -72,6 +87,7 @@ function _applyTo(selectors, available, hint) {
         el.removeAttribute("aria-disabled");
         el.title = el.dataset.capOriginTitle || "";
         if (UNAVAILABLE_MODE === "hide") el.classList.remove("hidden");
+        _syncCapTag(el, false);
       } else {
         // 首次置灰时把原 title 存下来，恢复时才能还原（否则提示会被覆盖丢失）
         if (!el.dataset.capOriginTitle) el.dataset.capOriginTitle = el.title || "";
@@ -79,6 +95,7 @@ function _applyTo(selectors, available, hint) {
         el.setAttribute("aria-disabled", "true");
         el.title = hint || "";
         if (UNAVAILABLE_MODE === "hide") el.classList.add("hidden");
+        _syncCapTag(el, true);
       }
     });
   });
@@ -514,6 +531,36 @@ $("archChk").addEventListener("change", () => {
   state.archived = $("archChk").checked;
   load(true);
 });
+
+/* ====== ⋯ 更多 溢出菜单（低频运维入口：抓取/探活/自检/备份/导出/图片） ====== */
+(function initMoreMenu() {
+  const btn = $("overflowBtn");
+  const menu = $("moreMenu");
+  if (!btn || !menu) return;
+  const close = () => {
+    menu.classList.add("hidden");
+    btn.setAttribute("aria-expanded", "false");
+    btn.classList.remove("open");
+  };
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const willOpen = menu.classList.contains("hidden");
+    menu.classList.toggle("hidden", !willOpen);
+    btn.setAttribute("aria-expanded", willOpen ? "true" : "false");
+    btn.classList.toggle("open", willOpen);
+  });
+  // 点击菜单外任意处收起
+  document.addEventListener("click", (e) => {
+    if (menu.classList.contains("hidden")) return;
+    if (btn.contains(e.target) || menu.contains(e.target)) return;
+    close();
+  });
+  // 点菜单内任一条目后收起（条目自身的 click 处理不受影响）
+  menu.addEventListener("click", (e) => {
+    if (e.target.closest(".mm-item")) close();
+  });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+})();
 
 /* ====== 续看规则引擎：字段词表与控件生成（data/rules.json） ====== */
 const FIELD_LABELS = {

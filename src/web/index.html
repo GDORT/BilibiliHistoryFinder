@@ -10,66 +10,58 @@
   <!-- 顶部工具栏 -->
   <header class="topbar">
     <div class="topbar-inner">
-      <!-- 分组 A：分类与生命周期视图（主导航） -->
-      <div class="tb-group tb-nav">
-        <nav class="tabs">
-          <button class="tab active" data-biz="">综合</button>
-          <button class="tab" data-biz="archive">视频</button>
-          <button class="tab" data-biz="live">直播</button>
-          <button class="tab" data-biz="article">专栏</button>
-        </nav>
-        <div class="view-tabs">
-          <button class="vtab active" data-view="all">全部</button>
-          <button class="vtab" data-view="needs">需要观看</button>
-          <button class="vtab" data-view="skipped">已跳过</button>
-          <button class="vtab" data-view="stale">已搁置</button>
-        </div>
+      <!-- B站式 logo（左）＋ 分区导航（综合/视频/直播/专栏） -->
+      <div class="brand" title="B站历史查看器" aria-label="B站历史查看器"><span class="logo">bilibili</span></div>
+      <nav class="tabs" aria-label="分区">
+        <button class="tab active" data-biz="">综合</button>
+        <button class="tab" data-biz="archive">视频</button>
+        <button class="tab" data-biz="live">直播</button>
+        <button class="tab" data-biz="article">专栏</button>
+      </nav>
+      <div class="search">
+        <input id="q" type="text" placeholder="搜索视频UP主或标题" autocomplete="off" />
       </div>
-
-      <!-- 分组 B：检索（搜索 + 快捷筛选 + 高级筛选） -->
-      <div class="tb-group tb-find">
-        <div class="search">
-          <input id="q" type="text" placeholder="搜索视频UP主或标题" autocomplete="off" />
-        </div>
-        <button class="btn-sm btn-ghost" id="browseToggle" title="浏览筛选（时长 / 时间 / 设备 / 含存档）">筛选 ▾</button>
-        <button class="btn-sm btn-ghost" id="advToggle" title="高级筛选（组合条件 / 黑白名单 / 排序 / 保存视图）">高级筛选 ⚙</button>
-      </div>
-
-      <!-- 分组 C：操作（规则 / 批量 / 同步 / 实时更新 / 设置） -->
-      <div class="tb-group tb-actions">
-        <button id="ruleBtn" class="btn-sm btn-ghost btn-gear" title="续看规则（编辑中同步 / 全量暂停）">
-          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="12" cy="12" r="3"></circle>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
-          </svg>
-          <span id="rulePending" class="badge-dot hidden" title="有已保存但未应用的规则改动"></span>
-          <span id="ruleDirty" class="badge-num hidden" title="自上次应用以来可能命中规则却未标记的新记录"></span>
+      <div class="tb-actions">
+        <button id="syncBtn" class="btn-sm btn-sync" title="同步数据（**后端策略**按当前状态决定：调 Analyzer 还是本地 Finder，以及增量/全量）">
+          <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          <span>同步</span>
         </button>
-        <button id="batchBtn" class="btn-sm btn-ghost" title="进入批量勾选模式：可批量跳过或恢复视频">批量</button>
-        <button id="syncBtn" class="btn-sm" title="同步数据（**后端策略**按当前状态决定：调 Analyzer 还是本地 Finder，以及增量/全量）">同步数据</button>
         <button id="settingsBtn" class="btn-icon" title="设置" aria-label="设置">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         </button>
-      </div>
-
-      <!-- 分组 D：Analyzer 联调（逐一测试 Analyzer 接口；需本机 Analyzer 后台运行） -->
-      <div class="tb-group tb-analyzer">
-        <button id="anHealthBtn" class="btn-sm btn-test" title="GET /health：探测 Analyzer/Fetcher 后端是否可达">① 健康探测</button>
-        <!-- 阶段 5：「实时更新」从顶栏移入联调区 —— 它是**运维操作**（催 Analyzer 跑分析流程），不是日常续看入口。连同连接状态点一并迁到这里。 -->
-        <span id="fetcherDot" class="conn-dot off" title="Analyzer 连接状态"></span>
-        <button id="fetcherBtn" class="btn-sm btn-ghost" title="GET /api/fetcher-trigger：**只催 Analyzer 重新分析已有数据**（不拉新数据）。抓取请用顶部「同步数据」—— 那条会由后端策略自动决定调谁">实时更新（催分析）</button>
-        <button id="anRealtimeBtn" class="btn-sm" title="POST /api/sync（**不传 full**）：由**后端策略**按当前状态决定调谁 —— Analyzer 可用则转发 Analyzer，不可用则走本地 Finder（需有效 SESSDATA）；增量/全量也由策略判定（强刷见设置面板「高级覆盖」）">② 增量同步</button>
-        <button id="anFullBtn" class="btn-sm" title="POST /api/sync：与「② 增量同步」**同一个端点** —— 本按钮只是**不额外要求增量**（想要强制全量，请用设置面板「高级覆盖」里的「强制全量重建」，那才是真正的 override）">③ 重新同步</button>
-        <button id="anDataBtn" class="btn-sm btn-test" title="GET /api/fetcher-check：真正调用 Analyzer 完整性校验（POST /data_sync/check）+ 报告，检测 JSON↔DB 是否一致">④ 数据自检</button>
-        <button id="anBackupBtn" class="btn-sm btn-test" title="POST /api/backup：对 Finder 依赖的 Analyzer 主源 + 本地库做一致快照，作为轻量自主备份">⑤ 本地备份</button>
-        <button id="anBackupListBtn" class="btn-sm btn-ghost" title="GET /api/backups：列出已生成的本地备份快照">查看备份</button>
-        <button id="anApplyBtn" class="btn-sm btn-test" title="POST /api/apply：唯一入口——自动比对启动快照与磁盘：改了数据层就热重载（~0.1s 不重启），改了 server.py 就自动重启（~1-2s，由 start.bat 拉起），只改前端则提示刷新即可。无需你判断改了哪些文件">⑥ 应用变更<span id="codeBadge" class="code-badge hidden">0</span></button>
-        <button id="anExportBtn" class="btn-sm btn-test" title="POST /api/export/excel → 转发 Analyzer /export/export_history 生成 Excel，再经 /api/export/excel/{file} 下载。Finder 自己不写 xlsx，保证与 Analyzer 同一口径">⑧ 导出 Excel</button>
-        <button id="anDbBtn" class="btn-sm btn-test" title="GET /api/export/db → 转发 Analyzer /export/download_db 下载整库 .db（与 Frontend「下载数据库」同源）">⑨ 下载整库</button>
-        <button id="anLocalExportBtn" class="btn-sm btn-ghost" title="GET /api/export/local/db → **不转发**，直读本地 Finder 库（走 sqlite3 在线快照，抓取正在写库也不会取到不一致副本）。Analyzer 不可达时的独立形态出口">⬇ 本地库</button>
-        <button id="anImgBtn" class="btn-sm btn-test" title="GET /api/images/status → 转发 Analyzer /images/status，查看封面/头像的批量下载进度（只读，不触发下载）">⑩ 图片状态</button>
-        <button id="anImgStartBtn" class="btn-sm btn-ghost" title="POST /api/images/start：触发 Analyzer 批量下载封面+头像。默认 use_sessdata=false（公开内容无需凭证）并限定当前年，属写盘操作，会先二次确认">⑪ 下载图片</button>
-        <button id="anImgStopBtn" class="btn-sm btn-ghost" title="POST /api/images/stop：停止正在进行的图片下载任务">停止</button>
+        <!-- ⋯ 更多：溢出菜单，装低频运维入口（调用 Analyzer 的抓取/探活/自检/备份/导出/图片）。
+             每个条目仍是独立按钮 / 独立 id / 独立 title（不合并 —— 设计稿 P3）。 -->
+        <div class="more-wrap">
+          <button id="overflowBtn" class="btn-icon" title="更多（运维）" aria-label="更多" aria-haspopup="true" aria-expanded="false">⋯</button>
+          <div id="moreMenu" class="more-menu hidden">
+            <div class="mm-group">
+              <div class="mm-title">抓取与同步</div>
+              <button id="anRealtimeBtn" class="mm-item" title="POST /api/sync（**不传 full**）：由**后端策略**按当前状态决定调谁 —— Analyzer 可用则转发 Analyzer，不可用则走本地 Finder（需有效 SESSDATA）；增量/全量也由策略判定（强刷见设置面板「高级覆盖」）">增量同步</button>
+              <button id="anFullBtn" class="mm-item" title="POST /api/sync：与「增量同步」**同一个端点** —— 本按钮只是**不额外要求增量**（想要强制全量，请用设置面板「高级覆盖」里的「强制全量重建」，那才是真正的 override）">重新同步</button>
+              <button id="fetcherBtn" class="mm-item" title="GET /api/fetcher-trigger：**只催 Analyzer 重新分析已有数据**（不拉新数据）。抓取请用顶部「同步」—— 那条会由后端策略自动决定调谁">实时更新（催分析）</button>
+              <button id="anLocalExportBtn" class="mm-item" title="GET /api/export/local/db → **不转发**，直读本地 Finder 库（走 sqlite3 在线快照，抓取正在写库也不会取到不一致副本）。Analyzer 不可达时的独立形态出口">本地库</button>
+            </div>
+            <div class="mm-group">
+              <div class="mm-title">健康与诊断<span id="fetcherDot" class="conn-dot off" title="Analyzer 连接状态"></span></div>
+              <button id="anHealthBtn" class="mm-item" title="GET /health：探测 Analyzer/Fetcher 后端是否可达">健康探测</button>
+              <button id="anDataBtn" class="mm-item" title="GET /api/fetcher-check：真正调用 Analyzer 完整性校验（POST /data_sync/check）+ 报告，检测 JSON↔DB 是否一致">数据自检</button>
+              <button id="anApplyBtn" class="mm-item" title="POST /api/apply：唯一入口——自动比对启动快照与磁盘：改了数据层就热重载（~0.1s 不重启），改了 server.py 就自动重启（~1-2s，由 start.bat 拉起），只改前端则提示刷新即可。无需你判断改了哪些文件">应用变更<span id="codeBadge" class="code-badge hidden">0</span></button>
+            </div>
+            <div class="mm-group">
+              <div class="mm-title">备份与导出</div>
+              <button id="anBackupBtn" class="mm-item" title="POST /api/backup：对 Finder 依赖的 Analyzer 主源 + 本地库做一致快照，作为轻量自主备份">本地备份</button>
+              <button id="anBackupListBtn" class="mm-item" title="GET /api/backups：列出已生成的本地备份快照">查看备份</button>
+              <button id="anExportBtn" class="mm-item" title="POST /api/export/excel → 转发 Analyzer /export/export_history 生成 Excel，再经 /api/export/excel/{file} 下载。Finder 自己不写 xlsx，保证与 Analyzer 同一口径">导出 Excel</button>
+              <button id="anDbBtn" class="mm-item" title="GET /api/export/db → 转发 Analyzer /export/download_db 下载整库 .db（与 Frontend「下载数据库」同源）">下载整库</button>
+            </div>
+            <div class="mm-group">
+              <div class="mm-title">图片与维护</div>
+              <button id="anImgBtn" class="mm-item" title="GET /api/images/status → 转发 Analyzer /images/status，查看封面/头像的批量下载进度（只读，不触发下载）">图片状态</button>
+              <button id="anImgStartBtn" class="mm-item" title="POST /api/images/start：触发 Analyzer 批量下载封面+头像。默认 use_sessdata=false（公开内容无需凭证）并限定当前年，属写盘操作，会先二次确认">下载图片</button>
+              <button id="anImgStopBtn" class="mm-item" title="POST /api/images/stop：停止正在进行的图片下载任务">停止下载</button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
     <div class="topbar-status">
@@ -234,6 +226,30 @@
     </aside>
 
     <section class="content">
+      <!-- 内容区头部：状态筛选 ＋ 列表级操作（分类 tab 已上移到顶栏「分区导航」） -->
+      <div class="content-head">
+        <div class="list-tools">
+          <div class="view-tabs">
+            <button class="vtab active" data-view="all">全部</button>
+            <button class="vtab" data-view="needs">需要观看</button>
+            <button class="vtab" data-view="skipped">已跳过</button>
+            <button class="vtab" data-view="stale">已搁置</button>
+          </div>
+          <div class="list-ops">
+            <button class="btn-sm btn-ghost" id="browseToggle" title="浏览筛选（时长 / 时间 / 设备 / 含存档）">筛选 ▾</button>
+            <button class="btn-sm btn-ghost" id="advToggle" title="高级筛选（组合条件 / 黑白名单 / 排序 / 保存视图）">高级筛选 ⚙</button>
+            <button id="ruleBtn" class="btn-sm btn-ghost btn-gear" title="续看规则（编辑中同步 / 全量暂停）">
+              <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="12" cy="12" r="3"></circle>
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+              </svg>
+              <span id="rulePending" class="badge-dot hidden" title="有已保存但未应用的规则改动"></span>
+              <span id="ruleDirty" class="badge-num hidden" title="自上次应用以来可能命中规则却未标记的新记录"></span>
+            </button>
+            <button id="batchBtn" class="btn-sm btn-ghost" title="进入批量勾选模式：可批量跳过或恢复视频">批量</button>
+          </div>
+        </div>
+      </div>
       <ul id="list" class="list"></ul>
       <div id="empty" class="empty hidden">没有匹配的记录</div>
       <div id="loadMore" class="loadmore hidden"><button class="btn ghost" id="moreBtn">加载更多</button></div>
