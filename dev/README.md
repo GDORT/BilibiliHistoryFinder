@@ -28,7 +28,7 @@
 | `regression_fallback.py` | **② 自动回退（增量 → 全量）的端到端回归**。真起 `server.Handler` 发 HTTP GET；三条用例互相对照（缺基线**必须**回退 / 基线正常**不得**回退 / 其它错误**不得**回退）；**附加组**对 `POST /api/sync` 再断言一次（阶段 2 判据收敛）；**新增组（A1）**用**默认策略**跑两条 —— 缺基线＋冷却内 → `skip` 不发请求、原因落到 `sync_state["last"]`，缺基线＋已过冷却 → 全量成功后 `no_baseline` **必须被清**。**共 7 项** | `python dev/regression_fallback.py` | 同上；**base 走内存覆盖，`data/fetcher_config.json` 一字节不动** |
 | `mock_analyzer.py` | **假 Analyzer**：增量接口固定回「未找到本地历史记录」以逼出回退分支；全量默认 `503`（→ Finder 判 `ok=false` → 不触发 `post`，**零副作用**）。`set BHF_MOCK_FULL=200` 可放行全量 | `python dev/mock_analyzer.py`（默认 `127.0.0.1:8790`） | 只绑 `127.0.0.1`；不连 B站、不读写真实历史库 |
 | `stub_fetcher.py` | **假控制后端**（端口 `8899`）：真实 Analyzer 未开时，验证「实时更新」按钮 → 转发 → 刷新的**控制流闭合**。不真拉数据 | `python dev/stub_fetcher.py` | 只绑 `127.0.0.1:8899` |
-| `verify_riskfix.py` | **风险审查修复的自动化验收**（2026-10-01）：第一批 `F-H1` 只绑回环 · `F-H3` 脏 body 返 400 · `F-H2` 坏路径被拒且不落盘 · `N-H1` 失败留痕（`FileNotFoundError` 不记）· `N-L3` 原子写；`log/2026-09-30-代码设计与风险审查.md` §8 收尾 `C-H1` body 上限 413 · `C-M1` 纯空白 400 · `C-H2` 同一配置文件的字段不被互相清掉 · `C-M2` span/meta 读失败留痕。**2026-10-02 追加 `A3` / `A5`**：主源为 Analyzer 时 `/api/local/delete` 必须 `blocked`（独立形态放行）· `/api/export/local/db` 返回有效 sqlite（magic 头）且临时快照不残留。**2026-10-03 追加阶段 3 门控组 `G-P`/`G-E`**：抗抖动滞回（连续 2 次才拦）· 恢复不对称（1 次成功即解封）· 记账过期放行 · 绝不 fail-closed；7 个 Analyzer-only 端点在假后端连发 502 时返 409 ＋ `capability`，且**门控在转发之前生效**（后端零请求）· 7 个本地/探测端点**不得误伤**（尤其 `/api/fetcher-health`）。假后端由脚本自建（`_FakeAnalyzer`，可切换 200/502），**结果不依赖本机 Analyzer 是否在跑**。**共 97 项断言** | `python dev/verify_riskfix.py` | 把 `src/` **整目录复制**到临时目录后**原样启动** `python <tmp>/src/server.py`（不 patch、不 mock `main()`）；`ANALYZER_DB` 指向沙箱内不存在的路径 → **不读真实 Analyzer 库**；用 `netstat` 独立核对监听地址；C-H1 用**裸 socket** 手搓「声称 5 MB、不发送 body」的请求（`urllib` 会按 data 长度自动填，捏不出来） |
+| `verify_riskfix.py` | **风险审查修复的自动化验收**（2026-10-01）：第一批 `F-H1` 只绑回环 · `F-H3` 脏 body 返 400 · `F-H2` 坏路径被拒且不落盘 · `N-H1` 失败留痕（`FileNotFoundError` 不记）· `N-L3` 原子写；`archive/2026-09-30-代码设计与风险审查.md` §8 收尾 `C-H1` body 上限 413 · `C-M1` 纯空白 400 · `C-H2` 同一配置文件的字段不被互相清掉 · `C-M2` span/meta 读失败留痕。**2026-10-02 追加 `A3` / `A5`**：主源为 Analyzer 时 `/api/local/delete` 必须 `blocked`（独立形态放行）· `/api/export/local/db` 返回有效 sqlite（magic 头）且临时快照不残留。**2026-10-03 追加阶段 3 门控组 `G-P`/`G-E`**：抗抖动滞回（连续 2 次才拦）· 恢复不对称（1 次成功即解封）· 记账过期放行 · 绝不 fail-closed；7 个 Analyzer-only 端点在假后端连发 502 时返 409 ＋ `capability`，且**门控在转发之前生效**（后端零请求）· 7 个本地/探测端点**不得误伤**（尤其 `/api/fetcher-health`）。假后端由脚本自建（`_FakeAnalyzer`，可切换 200/502），**结果不依赖本机 Analyzer 是否在跑**。**共 97 项断言** | `python dev/verify_riskfix.py` | 把 `src/` **整目录复制**到临时目录后**原样启动** `python <tmp>/src/server.py`（不 patch、不 mock `main()`）；`ANALYZER_DB` 指向沙箱内不存在的路径 → **不读真实 Analyzer 库**；用 `netstat` 独立核对监听地址；C-H1 用**裸 socket** 手搓「声称 5 MB、不发送 body」的请求（`urllib` 会按 data 长度自动填，捏不出来） |
 | `migrate_p2.py` | **阶段 0 · P2 一次性数据迁移脚本** —— 把 Analyzer 主库的长尾 / 缺口导入本地库（**不是测试，是数据操作**；放这里是因为它只在开发期手动跑一次）。默认 `--dry-run` 预演，**`--apply` 才写** | `python dev/migrate_p2.py`<br>`python dev/migrate_p2.py --apply` | 会**写** `data/bilibili_history.db`（本地库）→ 跑前先备份；**不碰** Analyzer 主库（只读） |
 
 ### 关系图
@@ -65,7 +65,7 @@ verify_riskfix.py  —— **整进程级**验收（黑盒）
 
 > 阶段 2 要把抓取判据从「读手切模式」换成「读探测 + 策略」 —— 那时**先跑纯函数单测**（几秒内知道决策逻辑对不对），再跑集成回归。
 
-`mock_analyzer.py` 单跑时是「手工版」（改配置 → 触发 → 还原，见 `doc/log/2026-10-01-待办-当前阶段.md` §6.2，「想亲眼看一次」时用）；
+`mock_analyzer.py` 单跑时是「手工版」（改配置 → 触发 → 还原，见 `doc/archive/2026-10-01-待办-当前阶段.md` §6.2，「想亲眼看一次」时用）；
 被 `regression_fallback.py` 复用时是「自动版」（内存覆盖，不改磁盘）。
 
 ## 二、四条共同安全约定
@@ -217,7 +217,7 @@ curl --noproxy "*" -X POST -H "Content-Type: application/json" -d "{\"base\":\"h
 > ⭐ **零成本的替代（现在就能做）**：`dev/test_capabilities.py` 的 `T2.8` ＋ `test_api_contract.P6` 已覆盖**静态**契约（`CAP_DOM` 选择器存在性 · 关键标志在静态资源里）。**缺的是「点了会怎样」**，那部分只能靠 A1。
 
 > 📐 **详细测试设计已补**（2026-10-07）：本节回答「要花多少」；「**怎么设计、为了什么**」见
-> `doc/log/2026-10-07-设计-前端运行时自动化测试.md` —— 含目的（锁 `#41`/`#42` 等**交互层才暴露**的回归）
+> `doc/archive/2026-10-07-设计-前端运行时自动化测试.md` —— 含目的（锁 `#41`/`#42` 等**交互层才暴露**的回归）
 > · 边界 · 原则 · 三层架构 · **夹具设计**（闭合本节前置 2）· **用例清单**（6 组，各带反例）· 运行与
 > `run_all.py` 集成 · 风险 · **判定标准** · MVP 三步。前置 3（驱动）已由 `dev/e2e/setup.ps1` 下载完成 ⇒ **A1 已从「待定」变为「可建」**。
 

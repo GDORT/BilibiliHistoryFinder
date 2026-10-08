@@ -3,6 +3,8 @@ config.json
 
 # ===== 本地数据库（含用户真实历史数据，禁止提交） =====
 data/
+dev/
+doc/
 output/
 
 # ===== Python =====

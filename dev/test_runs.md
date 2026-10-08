@@ -666,3 +666,21 @@
 - 声明校验：通过（常规 0 处 ＋ A1 0 处）｜零污染：通过
 - 汇总：9 套 × 2 环境｜累计断言 1454 次
 - **总判定：✅ 全绿**
+
+## 2026-10-09 03:44:48  runner
+- 环境：带代理／无代理（本机有代理变量）
+- 验收级：**是**（带代理／无代理双环境）
+- A1 前端冒烟：已启用（`--with-a1`）
+- `test_engine.py` — 规则引擎单测（零 IO）｜断言 114｜0.4s
+- `test_collector.py` — 采集器离线部分（临时库）｜断言 47｜0.7s
+- `test_api_contract.py` — 端点契约（沙箱 + 假 Analyzer）｜断言 97｜15.4s
+- `test_finder_collect.py` — Finder 自身抓取（沙箱 + 假 B站，零实网）｜断言 22｜9.9s
+- `test_capabilities.py` — 能力/门控/端点冒烟｜断言 289｜1.0s
+- `regression_fallback.py` — 降级与回退链路｜断言 7｜5.5s
+- `regression_restart.py` — 重启链路｜断言 n/a｜13.1s
+- `verify_riskfix.py` — 风险修复验收（整进程隔离副本）｜断言 97｜15.4s
+- `smoke_frontend.py`（A1 · 带代理）— 前端运行时 G1–G6｜断言 54｜9.7s
+- `smoke_frontend.py`（A1 · 无代理）— 前端运行时 G1–G6｜断言 54｜9.4s
+- 声明校验：通过（常规 0 处 ＋ A1 0 处）｜零污染：通过
+- 汇总：9 套 × 2 环境｜累计断言 1454 次
+- **总判定：✅ 全绿**
