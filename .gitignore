@@ -6,6 +6,7 @@ data/
 dev/
 doc/
 output/
+userscript/
 
 # ===== Python =====
 __pycache__/

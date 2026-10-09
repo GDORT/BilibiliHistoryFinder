@@ -1,116 +1,114 @@
-# BilibiliHistoryFinder — B站历史查看器（原型版）
+# BilibiliHistoryFinder — B站历史查看器
 
-> 状态：活跃
-> 性质：导览
-> 最后核对：2026-10-09 @0e752c9
+> 状态：功能完整可用（Phase 1 已定稿）
+> 最后更新：2026-10-09
 
-> **本仓库处于原型阶段（Prototype）**。本仓库为「续看 / 历史筛选分类」规则的**原型实现**：用纯 Python 标准库把 B站观看历史抓到本地、长期留存，并用一个类 B站网页端的界面浏览、搜索、筛选，找出「还没看完」的视频。
-> 后续正式版路线见 **[`doc/README.md`](doc/README.md)**（文档总入口：`现状.md` 写「现在是什么」 · `方案.md` 写「要做什么」 · `adr/` 记已拍板决策 · `log/` 存过程记录 · `archive/` 阶段完成归档）；**本 README 面向使用者，只说明「怎么用 / 长什么样」** —— 端口、路径、条数、能力项数等**事实一律以 `doc/现状.md` 为准，本文不复述**（[铁律一](doc/README.md) §5）。
+一个**本地单机**的 B站观看历史查看器：把观看历史长期留存到本地 SQLite，用类 B站网页端的界面浏览、搜索、筛选，并自动找出「还没看完」的视频。
+
+- **零第三方依赖**：只用 Python 标准库，无 pip 安装、无构建步骤
+- **只读主数据**：主数据源是 Analyzer 的库，本仓库只读不写
+- **完全离线可用**：前端是原生 HTML/CSS/JS 单页
 
 ---
 
 ## 1. 它能做什么
 
-- **本地留存**：历史记录存进本地 SQLite，突破 B站官方「近 ~1000 条 / 3 个月滚动覆盖」的限制，从你开始用它的那天起一条不漏。
-- **类网页端浏览**：封面 + 标题 + UP主 + 相对时间 + 进度条，可点击跳转 B站观看。
-- **「需要观看」视图**：自动筛出「还没看完」（`progress < 95%` 或未完成）且未被规则跳过的视频。
-- **续看规则引擎（auto_skip）**：按进度 / 时长 / 类型 / UP主等条件**批量标记「不需要观看」**，规则存于 `data/rules.json`，在内容区「续看规则」抽屉中编辑。
-- **三态跳过**：空 / 手动跳过 / 自动跳过，互斥且带角标；自动覆盖手动（最后操作优先）。
-- **批量操作**：批量跳过 / 恢复 / 隐藏 / **归档**。
-- **高级筛选器（规则引擎超集）**：组合布尔（AND/OR/NOR + NOT）、相对时间（近 N 天/超 N 天）、空值判断、多列排序、聚合 HAVING（同 UP 主> N 条）、黑白名单、保存视图预设——全部作为当前续看规则的读时查询层，不改变分类桶归属（视图 tab 归属不变）。详见 `doc/现状.md` §8.1（`archive/记录筛选规则分析.md` §11 的结论已并入）。
-- **增量同步**：首次全量建基线，之后只拉新记录，快且不踩限流。
+- **本地留存**：突破 B站官方「近 ~1000 条 / 3 个月滚动覆盖」的限制，从你开始用它的那天起一条不漏。
+- **类网页端浏览**：封面 + 标题 + UP主 + 相对时间 + 进度条，点击跳转 B站观看。
+- **「需要观看」视图**：自动筛出还没看完且未被规则跳过的视频。
+- **续看规则引擎**：按进度 / 时长 / 类型 / UP主等条件批量标记「不需要观看」，规则存于 `data/rules.json`，在内容区「续看规则」抽屉中编辑。
+- **三态跳过**：空 / 手动跳过 / 自动跳过，互斥且带角标；自动覆盖手动。
+- **批量操作**：批量跳过 / 恢复 / 隐藏 / 归档。
+- **高级筛选器**：组合布尔（AND/OR/NOR + NOT）、相对时间、空值判断、多列排序、聚合 HAVING（同 UP 主 > N 条）、黑白名单、保存视图预设。
+- **增量同步**：首次全量建基线，之后只拉新记录。
+- **备份与导出**：一键本地备份；导出 Excel / 下载整库（经 Analyzer 中继，本仓库不自己生成第二份口径的文件）。
 
 ---
 
 ## 2. 快速开始（Windows）
 
-### 2.1 关于登录态（SESSDATA）──当前有两份，职责不同
-> 本仓库现阶段**读取的权威数据来自 Analyzer**（见 §4）。因此**主用凭证是 Analyzer 的 `config/config.yaml` 里的 SESSDATA**，**不是**本仓库根 `config.json`。
+### 2.1 登录态（SESSDATA）
 
-1. **主用（权威）：Analyzer 的 `config.yaml`**。若已装 BilibiliHistoryAnalyzer 后台，SESSDATA 填在这里（服务端读取，网页/前端都不碰凭证）。过期后在 Analyzer 侧重填即可。
-2. **遗留（不推荐）：本仓库根 `config.json`**。仅供 `collector.py`（本地备份采集）使用，**当前该份已失效**（同步会报接口 `-101`）；`collector.py` 本身**保留**（决策见 `doc/adr/0004`），仅 `local` 模式使用；`auto`/`analyzer` 模式下不调用它。**新用户不必再填这份。**
-   > **凭证单一化已实现（2026-09-25）**：数据源切换到 `auto`/`analyzer` 时，网页「同步数据」按钮**不再运行 `collector.py`**，改为转发 Analyzer 全量拉取——即 Finder 侧不再使用这份遗留凭证。**只有**把数据源模式显式切成 `local`（模式 B：自身抓取）时才需要它有效。
-   > 凭证健康可在网页顶部横幅直接看到（🟢 正常 / 🔴 失效 / 🔴 Analyzer 不可达）；Analyzer 侧另有 `scheduler_config.yaml` 每 10 分钟检查并按邮件告警。
+本仓库读取的权威数据来自 Analyzer，因此**主用凭证是 Analyzer 的 `config/config.yaml` 里的 SESSDATA**；网页和前端都不碰凭证。
+
+仓库根 `config.json` 里另有一份，仅供遗留的 `collector.py`（本地备份采集）使用，新用户不必填。
 
 取值方式（两份通用）：
-1. 用浏览器登录 B站（bilibili.com）。
-2. 按 `F12` → **Application** → 左侧 **Cookies** → 选 `https://.bilibili.com` 域名。
-3. 找到名为 **`SESSDATA`** 的条目，复制它的 **Value**（一长串字符）。
 
-> ⚠️ SESSDATA 是登录凭证，泄露等于别人能登录你的账号，**请勿分享、勿提交到公开仓库**。它会过期（几天到几十天不等），过期后同步失败需重新取值。
+1. 浏览器登录 B站（bilibili.com）
+2. `F12` → **Application** → 左侧 **Cookies** → 选 `https://.bilibili.com`
+3. 找到 **`SESSDATA`**，复制它的 **Value**
 
-### 2.2 启动（推荐用 bat）
-仓库根目录已提供 `start.bat` / `stop.bat`：
-- 双击 **`start.bat`**：自动探测本机 Python（兼容无系统级 Python 的情况）、**以 supervised 模式**前台启动服务并持续打印状态（含续看规则「待应用 / 脏计数」）。
-  > 「supervised」＝该窗口自己充当 supervisor：网页上点 ⋯ 更多 里的「应用变更」触发重启时，服务会以退出码 42 退出，**窗口会自动把它重新拉起（≈3 秒）**，因此**改完代码无需关掉重开 bat**。
-- 双击 **`stop.bat`**：关闭 Finder 服务（正常停止，不会触发自动重启）＋顺带关掉 `BilibiliHistoryAnalyzer.exe`（start.bat 拉起的那个）。**成功即自动关窗**，只有真出错（杀不掉进程）才 `pause`。
-- 浏览器打开 **http://127.0.0.1:8765**（**默认端口**；改过则以 `doc/现状.md` §3 为准）即可使用。
-- 改代码后如何生效 → 网页上**只需点 ⋯ 更多 里的「应用变更」一个按钮**，不用你判断改了哪些文件：
-  - 改了 `store.py` / `engine.py` / `rules.json` / 数据 → 自动**热重载**（约 0.1 s，不重启进程、不释放端口）；
-  - 改了 `server.py` / `start.bat` → 自动**重启**（≈3 秒，由 `start.bat` 窗口拉起）；
-  - 只改了 `src/web/*`（前端） → 自动提示**浏览器刷新**（Ctrl+F5），服务端零动作。
-  按钮上的徽章 `● N` 会显示「有几处变更待应用」（需重启时转红）；它**只提示、绝不自动执行**。
+> ⚠️ SESSDATA 等于登录凭证，**请勿分享、勿提交到公开仓库**。它会过期，过期后同步失败需重新取值。凭证失效时页面顶部横幅会变红提示。
 
-### 2.3 手动启动（等价命令）
+### 2.2 启动
+
+仓库根目录提供 `start.bat` / `stop.bat`：
+
+- 双击 **`start.bat`**：自动探测本机 Python，以 supervised 模式前台启动，并**顺带拉起 Analyzer**。
+  - supervised ＝ 该窗口自己充当 supervisor：网页点「应用变更」触发重启时，服务以退出码 42 退出，窗口**自动把它重新拉起（约 3 秒）**，改完代码无需关掉重开 bat。
+- 双击 **`stop.bat`**：关闭 Finder ＋ **顺带关掉 Analyzer**。成功即自动关窗，只有真出错才停留。
+- 浏览器打开 **http://127.0.0.1:8765** 即可使用（端口改过则以 `config.json` 的 `web_port` 为准）。
+
+改代码后如何生效 —— 网页上**点 ⋯ 更多 里的「应用变更」** 一个按钮即可，不用自己判断改了什么：
+
+| 改动位置 | 生效方式 |
+| --- | --- |
+| `store.py` / `engine.py` / `rules.json` / 数据 | 热重载（约 0.1 秒，不重启进程） |
+| `server.py` / `start.bat` | 自动重启（约 3 秒，由 start.bat 拉起） |
+| 只改 `src/web/*`（前端） | 提示浏览器刷新（Ctrl+F5），服务端零动作 |
+
+按钮上的徽章 `● N` 显示「有几处变更待应用」（需重启时转红）；**只提示、绝不自动执行**。
+
+### 2.3 手动启动
+
 ```bash
-# 0) 数据来源：主源是 Analyzer（read-only 直连），本仓库不负责拉取；仅当无 Analyzer 时才用 collector 兜底。
-#    （collector 为遗留路径，其 config.json 的 SESSDATA 当前已失效；collector 保留、仅 local 模式用，见 doc/adr/0004）
-python src/collector.py --config config.json
-
-# 启动 Web 服务（端口取 config.json 的 web_port，默认值见 doc/现状.md §3）
-python src/server.py
-
-# 换端口：改 config.json 的 "web_port" 即可（端口只由配置文件决定，无环境变量开关）
+python src/server.py          # 端口取 config.json 的 web_port
 ```
-> 注意：**手动 `python src/server.py` 启动时没有 supervisor**——点「应用变更」若需要重启，接口会返回 `action: manual` 并**明确警告「重启后不会自动拉起」（且不会自杀）**，避免把服务点死。要用一键重启请走 `start.bat`。
+
+> 手动启动时**没有 supervisor**：若「应用变更」需要重启，接口会返回 `action: manual` 并警告「重启后不会自动拉起」（且不会自杀），避免把服务点死。要用一键重启请走 `start.bat`。
 
 ---
 
 ## 3. 界面与核心操作
 
-采用**标准 app shell**（2026-10-08 UI 分层调整，详见 `doc/现状.md` §8）：**顶栏**（B站式 logo ＋ 分区导航 ＋ 搜索 ＋ 同步 ＋ ⚙ 设置 ＋ ⋯ 更多）／ **左时间侧栏 ＋ 内容区**（视图 tab ＋ 列表级操作 ＋ 卡片列表）。
+采用标准 app shell：**顶栏**（logo ＋ 分区导航 ＋ 搜索 ＋ 同步 ＋ ⚙ 设置 ＋ ⋯ 更多）／ 左时间侧栏 ＋ 内容区（视图 tab ＋ 卡片列表）。
 
 **顶栏**
 
-- **logo ＋ 分区导航**（综合 / 视频 / 直播 / 专栏）：按内容类型筛选（原「类型 tab」上移到顶栏）。
+- **logo ＋ 分区导航**（综合 / 视频 / 直播 / 专栏）：按内容类型筛选。
 - **搜索**：按标题或 UP主名实时搜索。
-- **同步**：一个入口由**后端策略**按当前状态决定调 Analyzer 还是本地 Finder、增量还是全量（强刷见设置面板「高级覆盖」）。
-- **⚙ 设置**：打开设置弹窗（后端地址 / 密钥 / **当前形态只读展示** / Analyzer 主库路径）。
-- **⋯ 更多**：溢出菜单，装低频运维入口，**按四组排布**（每项仍是独立按钮 / 独立入口，不合并）：
-  - **抓取与同步**：增量同步 / 重新同步 / 实时更新（催分析）/ 本地库。
-  - **健康与诊断**：健康探测 / 数据自检 / 应用变更（唯一开发运维入口）。
-  - **备份与导出**：本地备份 / 查看备份 / 导出 Excel / 下载整库。
-  - **图片与维护**：图片状态 / 下载图片 / 停止下载。
-  - Analyzer 不可达时，菜单内相关项**置灰**并在右侧显示短标签「不可用」（完整原因悬停可看）。
-- **导出 / 图片走中继**：导出转发 Analyzer `/export/*`（Finder 自己不生成 Excel，避免第二份口径）；图片转发 `/images/*`，封面/头像属公开内容（默认 `use_sessdata=false`）且为写盘操作，会二次确认。
+- **同步**：一个入口，由**后端策略**按当前状态决定调 Analyzer 还是本地、增量还是全量。
+- **⚙ 设置**：后端地址 / 密钥 / 当前形态只读展示 / Analyzer 主库路径。
+- **⋯ 更多**：低频运维入口，按四组排布（每项仍是独立按钮，不合并）：
+  - 抓取与同步：增量同步 / 重新同步 / 实时更新 / 本地库
+  - 健康与诊断：健康探测 / 数据自检 / 应用变更
+  - 备份与导出：本地备份 / 查看备份 / 导出 Excel / 下载整库
+  - 图片与维护：图片状态 / 下载图片 / 停止下载
+- Analyzer 不可达时，菜单内相关项**置灰**并显示短标签「不可用」（完整原因悬停可看）。
 
 **内容区**
 
-- **视图 tab**（全部 / 需要观看 / 已跳过 / 已搁置）：按「续看生命周期」切换。
+- **视图 tab**（全部 / 需要观看 / 已跳过 / 已搁置）：按续看生命周期切换。
 - **筛选 ▾**：时长 / 时间 / 设备 / 含存档的**临时浏览条件**（不落库，刷新即还原）。
 - **高级筛选**：右侧抽屉，组合条件 / 黑白名单 / 排序 / 保存视图。
-- **续看规则**：右侧抽屉编辑规则；橙色圆点＝待应用，数字＝脏计数（自上次应用以来未标记的新记录）。
-- **批量**：进入批量勾选模式，可批量跳过 / 恢复 / 隐藏 / 归档。
-- **卡片备注**：卡片上直接点备注处即可编辑，写回 **Analyzer 主库** `remark` 字段（与官方 Frontend 互通）。
+- **续看规则**：右侧抽屉编辑规则；橙色圆点＝待应用，数字＝脏计数。
+- **批量**：进入勾选模式，可批量跳过 / 恢复 / 隐藏 / 归档。
+- **卡片备注**：卡片上直接点备注处编辑，写回 Analyzer 主库 `remark` 字段（与官方 Frontend 互通）。
 
 **形态与凭证**
 
-- **当前形态（只读，不可手切）**：`auto`（默认：Analyzer 可用即组合形态，否则降级本地）由后端连接探测自动判定；阶段 4 起已删除手切值 `analyzer`。含义与降级判据见 `doc/现状.md` §2.3。`local` 仍保留但当前无 UI 入口（`doc/adr/0005`）。
-- **数据源健康横幅**：Analyzer 不可达 / 凭证失效（-101）/ 已降级时，页面顶部出现对应提示条；一切正常则隐藏。收起后同状态不再打扰。
-- **应用变更（唯一开发运维入口，不是数据功能）**：
-  - **一个按钮，零判断**：`POST /api/apply` 自动比对「启动基线 vs 磁盘」，自己决定 → 热重载 / 重启 / 只需刷新 / 无需动作。
-  - 徽章 `● N` = 待应用变更数（页面加载、窗口获得焦点、每 15 s 轮询 `GET /api/code-status`；`document.hidden` 时不请求）；**只提示、不自动执行**，建议动作为重启时徽章转红。
-  - 需重启时前端会轮询 `boot_id` 直到**新进程**出现（避免旧进程在重启窗口内「假在线」）再自动刷新页面。
-  - 防重启风暴：120 s 内重启 ≥3 次会被拒绝（返回 `blocked` + 剩余等待秒数）。
-  - 手动 `python` 启动（无 supervisor）时若需重启，返回 `action: manual` 并**不自杀**，只尽力热重载可覆盖部分。
-  - 底层端点 `POST /api/reload`、`POST /api/restart` 仍保留（API 层逃生口，`POST /api/apply?force=reload|restart` 可强制指定方式）。端点清单见 `doc/现状.md` §7.2。
+- **当前形态只读、不可手切**：`auto`（默认）由后端连接探测自动判定 —— Analyzer 可用即组合形态，否则降级本地。
+- **数据源健康横幅**：Analyzer 不可达 / 凭证失效 / 已降级时页面顶部出现提示条；一切正常则隐藏。
+- **应用变更**：`POST /api/apply` 自动比对「启动基线 vs 磁盘」，自己决定热重载 / 重启 / 只需刷新 / 无需动作。120 秒内重启 ≥3 次会被拒绝（防重启风暴）。
 
 ### 续看规则引擎
-- 规则存于 `data/rules.json`，同一时刻仅一条 `active` 生效；可在抽屉内增删改分组与条件。
-- 每规则由若干**分组**组成，每分组含若干**条件**（字段 / 运算符 / 值），命中任一分组即按该分组动作处理：`auto_skip`（自动跳过）/ `stale`（已搁置）。
+
+- 规则存于 `data/rules.json`，同一时刻仅一条 `active` 生效。
+- 每规则由若干**分组**组成，每分组含若干**条件**（字段 / 运算符 / 值）；命中任一分组即按该分组动作处理：`auto_skip`（自动跳过）/ `stale`（已搁置）。
 - 可用字段：`progress_pct`、`progress_sec`、`duration`、`business`、`author_name`、`author_mid`、`title`、`archived_only`、`view_at_age_days`。
-- 运算符：`>= <= > <`、`between`、`in`/`not_in`、`contains`、`==`。
-- **保存配置**＝写 `rules.json` 但不重算；**应用规则**＝对全量记录重扫并写 `auto_skip`/`auto_skip_reason`，应用前弹窗显示将标记条数供确认。
+- 运算符：`>= <= > <`、`between`、`in` / `not_in`、`contains`、`==`。
+- **保存配置**＝写 `rules.json` 但不重算；**应用规则**＝对全量记录重扫并写标记，应用前弹窗显示将标记条数供确认。
 
 ---
 
@@ -119,94 +117,67 @@ python src/server.py
 ```
 BilibiliHistoryFinder/
 ├── src/
-│   ├── server.py         # 本地 Web 服务（http.server）：/api/* 历史/规则/跳过/查询 + Analyzer 中继/自检/备份
-│   ├── store.py          # 只读数据层：读 Analyzer(主) + 本地库(备份) 合并 → canonical；按 bvid 折叠
-│   ├── engine.py         # 续看规则引擎（纯逻辑，无 I/O）
-│   ├── collector.py      # 采集器（遗留/备用）：SESSDATA + cursor 分页落 SQLite；仅 local 模式调用（保留，见 doc/adr/0004）
-│   ├── adapter_analyzer.py  # Analyzer 直连验证脚本（非服务路径）
-│   └── web/              # 前端单页：index.html / app.js / style.css（零框架、零 npm）
-├── data/                 # 运行态数据 —— 完整清单（路径 / 表结构 / 读写角色）见 doc/现状.md §2.1
-│   ├── canonical_state.db   # 侧状态库：skip_state / saved_views / lists / meta（**本仓库唯一可写库**）
-│   ├── bilibili_history.db  # 本地备份库（collector 写入；**非主源**）
-│   ├── rules.json           # 续看规则（由「续看规则」抽屉编辑，不直接手改）
-│   ├── source_config.json   # 数据源主开关（mode ＋ analyzer_db）
-│   ├── backup_policy.json   # 备份触发 / 保留策略
-│   ├── fetcher_config.json  # Fetcher 地址 / Key（设置齿轮写入）
-│   ├── backup/ · covers/    # 备份快照 · 封面图片缓存
-│   └── run/                 # 重启记账 · 重启链路日志 · 退出握手标记
-├── config.json           # ⚠️ 在**仓库根**（不在 data/ 下）：web_port ＋ collector 用 SESSDATA（遗留，当前已失效）
-├── start.bat / stop.bat  # 启动 / 关闭（自动探测 Python；start.bat 为 supervised 模式，可被网页「应用变更」自动拉起；会顺带拉起 Analyzer）
-├── dev/                  # 测试资产（回归 / 单测 / 假后端桩）—— 手册见 dev/README.md
-└── doc/                  # 文档 —— 入口 doc/README.md（4 份活跃 ＋ adr/ ＋ log/ ＋ archive/ ＋ 两个第三方源码副本）
+│   ├── server.py              # 本地 Web 服务：/api/* 历史/规则/跳过/查询 + Analyzer 中继/自检/备份
+│   ├── store.py               # 只读数据层：读 Analyzer(主) + 本地库(备份) 合并 → canonical
+│   ├── engine.py              # 续看规则引擎（纯逻辑，无 I/O）
+│   ├── collector.py           # 采集器（遗留备用）：仅 local 模式调用
+│   ├── adapter_analyzer.py    # Analyzer 直连验证脚本
+│   └── web/                   # 前端单页：index.html / app.js / style.css（零框架、零 npm）
+├── data/                      # 运行态数据
+│   ├── canonical_state.db     # 侧状态库：skip_state / saved_views / lists / meta（本仓库唯一可写库）
+│   ├── bilibili_history.db    # 本地备份库（非主源）
+│   ├── rules.json             # 续看规则（由抽屉编辑，不直接手改）
+│   ├── source_config.json     # 数据源主开关
+│   ├── backup_policy.json     # 备份触发 / 保留策略
+│   ├── fetcher_config.json    # Fetcher 地址 / Key
+│   ├── backup/ · covers/      # 备份快照 · 封面缓存
+│   └── run/                   # 重启记账 · 链路日志 · 退出握手标记
+├── config.json                # ⚠️ 在仓库根（不在 data/）：web_port ＋ collector 用 SESSDATA
+├── start.bat / stop.bat       # 启动 / 关闭（自动探测 Python，顺带拉起 / 关闭 Analyzer）
+├── dev/                       # 测试资产（回归 / 单测 / 假后端桩）
+└── userscript/                # 浏览器脚本方向（见 §7）
 ```
 
-- **主数据源**：Analyzer SQLite（**read-only 直连**）；本地 `data/bilibili_history.db` 仅为**备份源** —— 具体路径见 `doc/现状.md` §2.1。
-- **采集**：`collector.py` 仅用 Python 标准库（`urllib.request` / `sqlite3` / `json` / `datetime` / `argparse`），**无第三方依赖**；当前仅作遗留兜底。
-- **服务**：`server.py` 用标准库 `http.server` 起本地静态服务，**零依赖、零构建**。
-- **前端**：原生 HTML/CSS/JS 单页，可完全离线运行。
-- **数据通路**：主源 read-only 直读 Analyzer；合并键 `(bvid, view_at)`，冲突时 **Analyzer 优先**、本地库只补齐；同 `bvid` 的多次会话在**展示层折叠为一条**（`progress`：任一会话为 `-1` 则取 `-1`，否则取 `max`）—— 详见 `doc/现状.md` §2.4。
+- **主数据源**：Analyzer 的 SQLite，**read-only 直连**，本仓库从不写它。
+- **采集**：`collector.py` 仅用标准库（`urllib.request` / `sqlite3` / `json`），当前仅作遗留兜底。
+- **服务**：`server.py` 用标准库 `http.server`，零依赖、零构建。
+- **合并键**：`(bvid, view_at)`，冲突时 Analyzer 优先、本地库只补齐；同 `bvid` 的多次会话在展示层折叠为一条（`progress`：任一会话为 `-1` 则取 `-1`，否则取 `max`）。
 
 ---
 
 ## 5. 数据文件
 
-> **完整清单（路径 / 表结构 / 读写角色）以 `doc/现状.md` §2.1 为准** —— 本节**不复述**（[铁律一](doc/README.md) §5：事实只写一次，多抄一份就多一个同步失败点）。
+只需记住三件事：
 
-只需先记住三件事：
+- **主数据在 Analyzer 库**（`…\BilibiliHistoryAnalyzer\output\bilibili_history.db`）—— 本仓库只读。
+- **本仓库唯一可写的库**是 `data/canonical_state.db`（跳过状态 / 视图 / 名单）；`data/bilibili_history.db` 是本地备份库，非主源。
+- **唯一例外**：`config.json` 在**仓库根**（不在 `data/`），同时决定监听端口与 collector 用的 SESSDATA。
 
-- **主数据源在 Analyzer 库**（`…\BilibiliHistoryAnalyzer\output\bilibili_history.db`）—— 本仓库**只读**直连，从不写它。
-- **本仓库唯一可写的库**是 `data/canonical_state.db`（跳过 / 视图 / 名单）；`data/bilibili_history.db` 是本地**备份库**，非主源。
-- 其余路径都在 `data/` 下，**唯一例外是 `config.json`（在仓库根，不在 `data/`）** —— 它同时决定监听端口 `web_port` 与 collector 用的 `SESSDATA`（遗留，当前已失效）。
-
-> 💡 **备份建议**：真正的主数据在 **Analyzer 库**；本仓库的 `canonical_state.db`（跳过状态）与 `data/bilibili_history.db`（本地备份）建议一并复制，或直接用网页「本地备份」按钮快照到 `data/backup/`。`config.json` / Analyzer `config.yaml` 含凭证，备份时注意保密。
+> 💡 备份建议：主数据在 Analyzer 库；`canonical_state.db` 与 `data/bilibili_history.db` 建议一并复制，或直接用网页「本地备份」按钮快照到 `data/backup/`。含凭证的文件注意保密。
 
 ---
 
-## 6. 已知限制（原型）
+## 6. 已知限制
 
-- **只能「从现在起」留存**：B站端已被上限顶掉的过去历史无法恢复（服务端限制，任何方案都救不回）；原型价值是「以后一条不漏」。
+- **只能「从现在起」留存**：B站端已被上限顶掉的过去历史无法恢复（服务端限制，任何方案都救不回）。
 - 单账号；多账号为后续阶段。
-- SESSDATA 过期需手动更新。**2026-09-25 已补前端提示**：顶部横幅会在 Analyzer 凭证失效（-101）时变红提示，Analyzer 不可达或在自身模式/已降级时变黄（见 §3）。**⚠️ 注意区分两件事**：磁盘上**仍有两份**凭证（Analyzer `config.yaml`＝主用、仓库根 `config.json`＝collector 遗留且当前已失效）；而「**凭证单一化**」说的是**使用路径** —— `auto`/`analyzer` 模式下「同步数据」改走 Analyzer 全量，**不再调用 `collector.py`**，故日常运行**只用到 Analyzer 那一份**。`collector.py` 本身**保留**（决策见 `doc/adr/0004`），仅把数据源显式切成 `local` 时才需要那份遗留凭证有效（三态含义见 `doc/现状.md` §2.3）。
-- 一键**本地备份**已实现（「本地备份」按钮：`POST /api/backup` 对 Analyzer 主源 + 本地库做 sqlite3 在线快照至 `data/backup/<时间戳>/`，详见 `doc/现状.md` §9）。**导出为独立文件已接入**：导出 Excel / 下载整库 `.db`，全部**中继 Analyzer `/export/*`**（Finder 不自己生成文件，避免第二份口径；端点见 `doc/现状.md` §7.2）。
-- **自动备份触发**（2026-09-25）：不做定时备份（Analyzer/Frontend 也都没有），改为**「自上次备份以来 Analyzer 主源新增条数 ≥ 阈值」**时在拉取成功后自动备份一次，并按 `keep` 清理旧快照（详见 `doc/现状.md` §9）。阈值见 `data/backup_policy.json`，可用 `GET /api/backup-policy` 查看当前增量与是否达线。
-- **「应用变更」与控制台的关系（2026-09-25 已修）**：Windows 控制台被鼠标**选中**时处于 QuickEdit 状态，向它的**任何输出都会阻塞**；旧实现把重启提示 `print` 放在 `os._exit(42)` 之前，于是「光标停在控制台里 → 点了「应用变更」没反应」。现已三层防护：服务端输出全部改 `_safe_print`（守护线程，不阻塞）、重启链只写 `data/run/restart.log`、**3 秒看门狗**保证一定按退出码 42 退出；`start.bat` 的 `:RESTART` 段也改为零控制台输出。回归脚本 `dev/regression_restart.py`（用途与跑法见 `dev/README.md`）。**另：退出码本身也曾不可靠**——旧实现把 `os._exit(42)` 放在**守护线程**里，`shutdown()` 之后主线程先走完、解释器收尾把守护线程回收，退出码变成 **0**，于是 `start.bat` 落到 `pause`、服务停住。现已改为**主线程决定退出码** + **文件握手**（回归对照：旧设计 3/3 得 0、新设计 3/3 得 42）。**2026-09-26 00:15 已在 QuickEdit 冻结场景现场验证**：控制台全程保持选中（写入被冻结）时点「应用变更」，整链 **≈ 3 秒**完成自动重启并刷新（修复前同一链路 56 秒）。
+- SESSDATA 过期需手动更新（横幅会提示）。
+- **自动备份触发**：不做定时备份，改为「自上次备份以来主源新增条数达阈值」时自动备份一次，并按保留策略清理旧快照。
 - 设备类型（`dt`）仅为占位标签（B站未公开真实设备映射）。
-- 同步内自动套用规则暂缓，当前以「应用规则」为统一重校准入口。
+- 同步内自动套用规则暂缓，以「应用规则」为统一重校准入口。
 
 ---
 
-## 7. 文档索引
+## 7. 浏览器脚本方向（`userscript/`）
 
-> **唯一入口：[`doc/README.md`](doc/README.md)**（2026-10-01 完成文档结构重整，四层职责）：
-> [`doc/现状.md`](doc/现状.md) 「现在是什么」· [`doc/方案.md`](doc/方案.md) 「要做什么」· [`doc/待办.md`](doc/待办.md) 「还没做的」· `doc/adr/` 已拍板决策 · `doc/log/` 过程快照 · `doc/archive/` 阶段完成归档（冻结）。
->
-> **本 README 的约束**：它**面向使用者**，**不复述事实**（端口 / 路径 / 条数 / 能力项数 / 模块行数）—— 那些只在 `doc/现状.md` 定义，正文里凡出现 `doc/现状.md §x` 处即为权威落点（[铁律一](doc/README.md) §5）；**唯一例外**是 §2 快速开始里给使用者的默认端口 —— 那是可直接复制的地址，权威仍以 `doc/现状.md` §3 为准。
+独立于本体的**下一个方向**：把续看规则能力直接带进 B站网页版（在历史页上加角标与筛选入口），**不依赖 Analyzer**，也不改动本体任何功能。
 
-**源码副本（只读参考，非文档）**：`doc/BilibiliHistoryFetcher-master/`（Analyzer/Fetcher 后端源码）· `doc/BiliHistoryFrontend-master/`（开源前端，Tauri/Vue3）—— **说明与状态见 `doc/README.md` §6**，本节不复述。
+- 当前处于**可行性探针**阶段（`userscript/probe.user.js`）：只验证一件事 —— 能否稳定拦到历史接口的完整响应。
+- 该探针**只读**：不发请求、不回写、不改动页面既有元素。
+- 详细安装与判定标准见 `userscript/README.md`。
 
-**开发工具（`dev/`，非文档，共 17 个 `.py`）**：用途 / 跑法 / 共同安全约定与写新脚本的经验见 **`dev/README.md`**（测试资产手册）。一句话定位：
-
-| 脚本 | 定位 |
-| --- | --- |
-| `run_all.py` | **⭐ 统一 runner** —— 本仓「全绿」的**单一权威出处**。顺序跑 **8 套** ×两种环境（加 `--with-a1` → **9 套**，含前端冒烟；**两种环境**＝带代理／无代理）＋ 汇总退出码 ＋ **「文档声明 ↔ 实跑」交叉校验** ＋ 零污染核对 ＋ 追加过程日志到 `dev/test_runs.md`。日常只跑它 |
-| `test_engine.py` | 规则引擎单测（零 IO，**114 项**）—— 2026-10-05 新增，此前 `engine.py` 零覆盖 |
-| `test_collector.py` | 采集器离线部分单测（47 项，临时库）—— 2026-10-05 新增 |
-| `test_api_contract.py` | 端点契约（**97 项**，沙箱 ＋ 自带假 Analyzer）—— 2026-10-05 新增 |
-| `test_finder_collect.py` | **Finder 自身抓取**常驻回归（22 项，沙箱 ＋ **假 B站**，零实网）—— 2026-10-06 新增 |
-| **`e2e/smoke_frontend.py`** ⭐ | **前端运行时冒烟**（**54 项**：G1 加载 / G2 能力→DOM / G3 横幅两档 / G4 同步四态 / **G5 `#42` 排序** / **G6 `#41` duration 边界**）—— 真开 Chromium ＋ 真读 DOM。⚠️ 需先`. dev\e2e\env.ps1`；`run_all.py --with-a1` 才会跑 |
-| `e2e/make_fixtures.py` | **确定性夹具生成器**（39 条，五分类 ＋ `duration` 长尾三段）—— A1 的数据源 |
-| `test_capabilities.py` | 「连接即模式」阶段 1 的**纯函数单测**（零 IO、秒级，289 项）；`--live` 追加一次端点冒烟（320 项） |
-| `regression_restart.py` | **重启链路的常驻回归**（42/42/42 ＋ 旧设计 `0/0/0` 对照） |
-| `regression_fallback.py` | **增量 → 全量自动回退**的端到端回归（7 项，含缺基线标记的清除与冷却收敛） |
-| `verify_riskfix.py` | **风险审查修复的自动化验收**（97 项断言；整进程隔离副本） |
-| `mock_analyzer.py` | **假 Analyzer** —— 离线复现增量回退分支；`set BHF_MOCK_FULL=200` 可放行全量 |
-| `stub_fetcher.py` | **假控制后端** —— 真实 Analyzer 不在时验证控制流闭合 |
-| `migrate_p2.py` | **阶段 0 · P2 一次性数据迁移**（Analyzer 长尾 / 缺口 → 本地库）；默认 `--dry-run`，`--apply` 才写 |
-
-其中 **8 个常规测试脚本**（由 `run_all.py` 统一调度 ＋ `test_capabilities.py --live`；**加 `--with-a1` 共 9 套**）**只绑 `127.0.0.1` 随机端口、不启动对外服务、不读写任何历史数据**，写盘全部重定向到临时目录；`migrate_p2.py` 是**唯一会写真实本地库**的脚本（数据操作，需手动 `--apply`）。
-
-**归档溯源（`doc/archive/`，19 份，冻结不动）**：三轴方案原稿（`方案-后端与数据源` / `方案-前端` / `方案-油猴D`）、`方案-连接即模式`、`方案-Finder轻量化`、拆分前定稿、架构 / 规则 / 验证报告、源码评估、评估期与原型期原始文档等。**逐份清单（19 份全覆盖）见 [`doc/README.md`](doc/README.md) §2.1**。
+> 本体（§1–§7）与它互不影响；它尚未产出可用功能。
 
 ---
 
-*原型版 README · 适用版本：本地 Web 版（零第三方依赖，纯 Python 标准库）。本文属性：**活跃 / 导览** —— 面向使用者，不复述事实（见 `doc/README.md` §2 / §5）。*
+*本文面向使用者，描述当前可用状态。*
