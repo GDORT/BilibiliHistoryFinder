@@ -19,9 +19,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
 import engine  # noqa: E402
+import store  # noqa: E402
 
 # Analyzer 库（主源，read-only 直连）
-ANALYZER_DB = r"D:\Program Files (x86)\BilibiliHistoryAnalyzer\output\bilibili_history.db"
+# 2026-10-11：原先此处硬编码整条绝对路径，与 `store.py` 各存一份 —— 换机器必失效且要改两处。
+# 改为复用 store 的三级优先级解析（env ANALYZER_DB → env ANALYZER_HOME → 默认安装目录）。
+ANALYZER_DB = store.ANALYZER_DB
 # 规则定义沿用 Finder 当前 data/rules.json（active 规则即分类依据）
 RULES_FILE = os.path.join(PROJECT_ROOT, "data", "rules.json")
 

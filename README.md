@@ -18,12 +18,12 @@
 | | **入口 A · 服务端** | **入口 B · 浏览器** |
 | --- | --- | --- |
 | **怎么用** | 本机跑 `start.bat`，开 `http://127.0.0.1:8765` | 油猴脚本装到浏览器，直接作用在 B站历史页 |
-| **代码在哪** | `src/` ＋ `data/` ＋ `start.bat` | [`userscript/`](userscript/)（**自成一体**） |
+| **代码在哪** | `src/` ＋ `data/` ＋ `start.bat` | `src/userscript/` ＋ 根产物 `bili_history.user.js`（**自成一体**） |
 | **看什么** | 本地全量历史（不受 3 个月窗口限制），高级筛选、批量操作、备份、导出 Excel | 当前浏览过的历史，卡片角标、分类视图、可视化规则编辑器 |
 | **抓数据靠谁** | Analyzer（唯一持凭证）＋ `collector.py` 遗留兜底 | **不需要 Analyzer**：浏览器 hook 旁听页面自己的请求 |
 | **要凭证** | 依赖 Analyzer 的 SESSDATA | 不需要 |
-| **文档** | 本文件 §§1–6 ＋ [`doc/`](doc/) | **[`userscript/说明.md`](userscript/说明.md)**（真相源）· [`README.md`](userscript/README.md)（操作手册） |
-| **产物** | 直接运行，无需构建 | `userscript/dist/bili_history.user.js`（`python userscript/build.py` 生成） |
+| **文档** | 本文件 §§1–6 ＋ [`doc/开发指南.md`](doc/开发指南.md) | **[`油猴脚本.md`](doc/油猴脚本.md)**（真相源）· [`油猴脚本接口事实.md`](doc/油猴脚本接口事实.md) |
+| **产物** | 直接运行，无需构建 | `bili_history.user.js`（`python dev/userscript/build.py` 生成） |
 
 ⚠️ **两条线的数据不共享**：入口 B 的数据只存在你浏览器的 IndexedDB 里，与入口 A 的 SQLite 库彼此独立。要把浏览器的数据带进服务端，走「入口 B 导出 JSON → 入口 A 导入」这条路。
 
@@ -152,11 +152,12 @@ BilibiliHistoryFinder/
 │   └── run/                   # 重启记账 · 链路日志 · 退出握手标记
 ├── config.json                # ⚠️ 在仓库根（不在 data/）：web_port ＋ collector 用 SESSDATA
 ├── start.bat / stop.bat       # 启动 / 关闭（自动探测 Python，顺带拉起 / 关闭 Analyzer）
-├── dev/                       # 测试资产（回归 / 单测 / 假后端桩）
+├── dev/                       # 测试资产（单测 / 集成回归 / 假后端桩；跑法见 doc/开发指南.md）
+├── doc/                       # 文档（现状 · 开发指南 · 开发历程回顾 · 历史留档）
 └── userscript/                # ★ 入口 B：浏览器脚本（自成一体，见 §7 与其内 说明.md）
 ```
 
-> 两个入口的边界：**入口 A**（`src/` `data/` `config.json` `start.bat`）**入口 B**（`userscript/`）各自独立，无代码互相 import。
+> 两个入口的边界：**入口 A**（`src/` `data/` `config.json` `start.bat`）**入口 B**（`src/userscript/` ＋根产物）各自独立，无代码互相 import。
 
 - **主数据源**：Analyzer 的 SQLite，**read-only 直连**，本仓库从不写它。
 - **采集**：`collector.py` 仅用标准库（`urllib.request` / `sqlite3` / `json`），当前仅作遗留兜底。
@@ -188,20 +189,20 @@ BilibiliHistoryFinder/
 
 ---
 
-## 7. 入口 B（浏览器脚本，`userscript/`）
+## 7. 入口 B（浏览器脚本，`src/userscript/` ＋根产物）
 
-> 完整说明以 [`userscript/说明.md`](userscript/说明.md) 为准（那里是这条线的真相源）。本节只做指路。
+> 完整说明以 [`油猴脚本.md`](doc/油猴脚本.md) 为准（那里是这条线的真相源）。本节只做指路。
 
 把续看规则能力直接带进 B站网页版（历史页上加角标与筛选入口），**不依赖 Analyzer**，也不改动入口 A 任何功能。
 
-- **产物**：`userscript/dist/bili_history.user.js`（**0.4.1**）—— IndexedDB 双存储 ／ 引擎移植＋对拍 ／ 卡片角标 ／ 分类视图 ／ 可视化规则编辑器 ／ 导出；两个悬浮面板默认关闭。
+- **产物**：`bili_history.user.js`（**0.4.1**）—— IndexedDB 双存储 ／ 引擎移植＋对拍 ／ 卡片角标 ／ 分类视图 ／ 可视化规则编辑器 ／ 导出；两个悬浮面板默认关闭。
 - **验证**：**9 套 · 215 项断言全绿**（含构建产物端到端）。
-- 真实接口与页面结构固化在 [`userscript/SCHEMA.md`](userscript/SCHEMA.md)（23 个顶层字段 ＋ `history` 子对象 8 字段 ＋ 真实 DOM 结构）。
+- 真实接口与页面结构固化在 [`油猴脚本接口事实.md`](doc/油猴脚本接口事实.md)（23 个顶层字段 ＋ `history` 子对象 8 字段 ＋ 真实 DOM 结构）。
 - 真实页选择器已按实测回填（`main.history-record` / `.bili-video-card`；卡片无 `kid` 属性，故按链接 `uri` 反查）。
 - 「主动补请求」按方案（限制 1）已定 ＝ **被动旁听，不做**（只覆盖你实际浏览过的分类）。
-- 安装与操作：`userscript/README.md`；阶段内的决策与历史留档在 `userscript/过程/`。
+- 安装与操作：`油猴脚本.md`；设计与踩坑见 [`开发历程回顾.md`](doc/开发历程回顾.md)。
 
-> **两条线互不影响**：入口 B 不读写 `data/`、不碰 `config.json`、不依赖 `start.bat`；入口 A 也不 import `userscript/` 任何文件。唯一的往来是手动导出的 JSON。
+> **两条线互不影响**：入口 B 不读写 `data/`、不碰 `config.json`、不依赖 `start.bat`；入口 A 也不 import `src/userscript/` ＋根产物 任何文件。唯一的往来是手动导出的 JSON。
 
 ---
 

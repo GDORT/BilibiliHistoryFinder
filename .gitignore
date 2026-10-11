@@ -1,14 +1,40 @@
-# ===== 凭证 / 本地配置（含 SESSDATA，禁止提交） =====
+# ============================================================
+#  纳管口径（2026-10-11）
+#
+#  原则：**代码 ＋ 文档 ＋ 测试 ＋ 脚本 全部入库**，
+#        只排除「含真实用户数据」「含凭证」「体积巨大」「外部拷贝」四类。
+#
+#  改动此文件前先确认两件事：
+#   1. 要忽略的东西，重新 clone 后能否从 setup 步骤重建？（不能 ⇒ 不该忽略）
+#   2. 它里面有没有别人的数据 / 凭证？（有 ⇒ 绝不提交）
+# ============================================================
+
+# ===== 1. 凭证（含真实 SESSDATA，绝不提交） =====
 config.json
 
-# ===== 本地数据库（含用户真实历史数据，禁止提交） =====
+# ===== 2. 真实用户数据（B站观看历史，本地数据库） =====
+# data/ 下有 canonical_state.db / bilibili_history.db / backup 快照 —— 全是个人真实历史
 data/
-dev/
-doc/
+# Analyzer 的抓取产出（含原始响应 JSON）
 output/
-userscript/
 
-# ===== Python =====
+# ===== 3. 本机环境（大体积 / 每台机器路径不同，需重跑 setup 重建） =====
+# dev/e2e/pkgs(110M) + browsers(707M) 是 playwright 依赖，重跑 dev/e2e/setup.ps1 即可重建
+dev/e2e/pkgs/
+dev/e2e/browsers/
+# setup.ps1 生成的 env.ps1 内含本机绝对路径，不跨机复用
+dev/e2e/env.ps1
+# 测试运行日志（每次跑都变，属于运行态而非源码）
+dev/test_runs.md
+# 离线回归用的临时沙箱副本（测试产物）
+dev/_verify_restart.py.bak
+
+# ===== 4. 第三方源码副本（外部 MIT/参考工程，非本项目代码） =====
+# 这两份是他人仓库的整份拷贝，保留在本机供核对字段/接口，不入库
+doc/BilibiliHistoryFetcher-master/
+doc/BiliHistoryFrontend-master/
+
+# ===== 5. Python =====
 __pycache__/
 *.pyc
 *.pyo
@@ -16,14 +42,10 @@ __pycache__/
 .venv/
 venv/
 
-# ===== 编辑器 / 系统 =====
+# ===== 6. 编辑器 / 系统 =====
 .vscode/
 .idea/
 .trae/
 .DS_Store
 *.swp
 Thumbs.db
-
-# ===== 参考工程 =====
-doc/BilibiliHistoryFetcher-master
-doc/BiliHistoryFrontend-master

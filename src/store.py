@@ -23,11 +23,30 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
 
-# Analyzer 库路径（可用环境变量 ANALYZER_DB 覆盖，便于迁移）
-ANALYZER_DB = os.environ.get(
-    "ANALYZER_DB",
-    r"D:\Program Files (x86)\BilibiliHistoryAnalyzer\output\bilibili_history.db",
-)
+# ===================== Analyzer 安装位置与库路径 =====================
+# 为什么拆成两段（2026-10-11）：
+#   原先只有 `ANALYZER_DB` 一个写死值 `D:\Program Files (x86)\...\output\bilibili_history.db`，
+#   换机器后它静默失效 —— Finder 读不到 Analyzer 库就**自动降级本地库**，
+#   界面上只显示"用本地库"，**不报错**，看起来像迁移成功了（中继其实全失效了）。
+#
+#   实际上 Analyzer 的安装目录才是「因机器而异」的那一段，
+#   而 `output\bilibili_history.db` 是它**内部固定**的相对位置。
+#   故拆为：`ANALYZER_HOME`（安装根，可被环境变量覆盖）＋ `ANALYZER_DB_REL`（固定相对路径）。
+#   ⚠️ 相对路径**相对 Analyzer 安装目录**，不是相对本项目 —— 两者通常不在同一个父目录下。
+#
+# 三级优先级（高 → 低）：
+#   1. 环境变量 `ANALYZER_DB`      —— 直接给完整库路径（测试沙箱就靠它锁幽灵路径）
+#   2. 环境变量 `ANALYZER_HOME`    —— 只给安装根，库路径由 ANALYZER_DB_REL 拼出
+#   3. `_DEFAULT_ANALYZER_HOME`    —— 本机实际安装位置（打包器默认装这儿）
+ANALYZER_DB_REL = os.path.join("output", "bilibili_history.db")
+
+_DEFAULT_ANALYZER_HOME = r"D:\Program Files (x86)\BilibiliHistoryAnalyzer"
+
+# Analyzer 安装根目录（不含库文件本身）
+ANALYZER_HOME = os.environ.get("ANALYZER_HOME") or _DEFAULT_ANALYZER_HOME
+
+# 生效的 Analyzer 库完整路径。**可被 `data/source_config.json` 覆盖**（见 `resolve_analyzer_db`）
+ANALYZER_DB = os.environ.get("ANALYZER_DB") or os.path.join(ANALYZER_HOME, ANALYZER_DB_REL)
 # 本地 Finder 库（备份源，collector.py 写入）
 LOCAL_DB = os.path.join(DATA_DIR, "bilibili_history.db")
 # 侧状态库（规则引擎私有：manual_skip / auto_exempt / 应用哈希）
@@ -557,6 +576,44 @@ def _pick_sources(mode, analyzer, local):
     return dict(local), "local"
 
 
+def resolve_analyzer_db(value):
+    """把配置里写的 `analyzer_db` 解析成可用的完整路径。
+
+    接受三种写法（2026-10-11）：
+
+    | 写法 | 例子 | 解析为 |
+    | --- | --- | --- |
+    | **绝对路径** | `D:\\...\\output\\bilibili_history.db` | 原样返回（**向后兼容**旧配置） |
+    | **相对 Analyzer 安装目录** | `output\\bilibili_history.db` / `output/bilibili_history.db` | `ANALYZER_HOME` ＋ 该相对路径 |
+    | **仅库文件名** | `bilibili_history.db` | `ANALYZER_HOME/output/` ＋ 它 |
+
+    为什么支持相对写法：原先配置里存的是**整条绝对路径**，换机器后必然失效 ——
+    而 Finder 读不到 Analyzer 库会**静默降级**成本地库（界面上只显示"用本地库"，不报错），
+    迁移看起来成功、实际中继全失效。拆成「安装目录 ＋ 内部固定相对位置」后，
+    换机器只需改 `ANALYZER_HOME`（或设同名环境变量），配置本身不用动。
+
+    ⚠️ 相对路径的基准是 **Analyzer 安装目录**，**不是本项目根目录** ——
+    两者通常不在同一个父目录下（Analyzer 在 `C:\\Program Files (x86)\\`，
+    本项目在别处），用项目根当基准会拼出根本不存在的路径。
+
+    ⚠️ 分隔符统一成 `os.sep`：配置里写 `output/bilibili_history.db`（正斜杠，
+    JSON 手写时更自然）也照样能解析，且不会拼出 `output` + 正斜杠 + 文件名
+    这种 Windows 上能跑但不整齐的路径（日志与界面里会出现）。
+    """
+    v = (value or "").strip().strip('"').strip("'")
+    if not v:
+        return ANALYZER_DB
+    if os.path.isabs(v):
+        return os.path.normpath(v)
+    # 正斜杠 → os.sep，避免拼出混分隔符的路径
+    v = v.replace("/", os.sep).replace("\\", os.sep)
+    # 纯文件名 → 放进 Analyzer 的默认输出子目录
+    if os.sep not in v:
+        return os.path.normpath(
+            os.path.join(ANALYZER_HOME, os.path.dirname(ANALYZER_DB_REL), v))
+    return os.path.normpath(os.path.join(ANALYZER_HOME, v))
+
+
 def analyzer_db_diagnosis(path=None):
     """#37：区分「路径配错」与「Analyzer 确实没有数据」。
 
@@ -567,8 +624,12 @@ def analyzer_db_diagnosis(path=None):
     `path`（2026-10-01 新增，默认 None = 当前生效的 `ANALYZER_DB`）：
     允许对**候选路径**做同样的只读探测 —— `/api/data-source` 在**改动生效之前**先拿它
     验一遍（F-H2：旧实现不校验，坏路径照样落盘）。默认值不变，故既有调用点零影响。
+
+    ⚠️ 2026-10-11：`path` 先过 `resolve_analyzer_db()` —— 否则调用方传相对写法
+    （`output\\bilibili_history.db`）时，`os.path.exists` 会相对**进程 cwd** 判定，
+    必然 false ⇒ 好路径被误报成 `path_missing`。
     """
-    p = path or ANALYZER_DB
+    p = resolve_analyzer_db(path) if path else ANALYZER_DB
     if not os.path.exists(p):
         return {
             "level": "error", "code": "path_missing",

@@ -994,7 +994,10 @@ def _load_source_config():
         d["_legacy_mode_migrated"] = m      # 供调用方（如启动横幅）如实告知用户
     db = (d.get("analyzer_db") or "").strip()
     if db:
-        store.ANALYZER_DB = db
+        # 2026-10-11：配置里可以写**相对 Analyzer 安装目录**的路径（`output/bilibili_history.db`），
+        # 由 store.resolve_analyzer_db 拼成完整路径。换机器时改 `ANALYZER_HOME` 即可，
+        # 不必再手改这条绝对路径（旧配置写绝对路径仍原样兼容）。
+        store.ANALYZER_DB = store.resolve_analyzer_db(db)
     return d
 
 
@@ -2440,7 +2443,8 @@ class Handler(BaseHTTPRequestHandler):
                     return
             old_db, old_mode = store.ANALYZER_DB, store.get_source_mode()
             if db:
-                store.ANALYZER_DB = db
+                # 同 _load_source_config：支持相对写法，落盘的也是**解析后的完整路径**
+                store.ANALYZER_DB = store.resolve_analyzer_db(db)
             if mode:
                 store.set_source_mode(mode)
             try:
