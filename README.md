@@ -1,7 +1,7 @@
 # BilibiliHistoryFinder — B站历史查看器
 
-> 状态：功能完整可用（Phase 1 已定稿）
-> 最后更新：2026-10-09
+> 状态：**两条线均已完成可用**
+> 最后更新：2026-10-11
 
 一个**本地单机**的 B站观看历史查看器：把观看历史长期留存到本地 SQLite，用类 B站网页端的界面浏览、搜索、筛选，并自动找出「还没看完」的视频。
 
@@ -11,7 +11,25 @@
 
 ---
 
-## 1. 它能做什么
+## 0. 两个入口（先看你走哪条）
+
+本仓库有**两个互相独立、互不依赖的入口**，按需要选一个（也可以两个都用，各存各的数据）：
+
+| | **入口 A · 服务端** | **入口 B · 浏览器** |
+| --- | --- | --- |
+| **怎么用** | 本机跑 `start.bat`，开 `http://127.0.0.1:8765` | 油猴脚本装到浏览器，直接作用在 B站历史页 |
+| **代码在哪** | `src/` ＋ `data/` ＋ `start.bat` | [`userscript/`](userscript/)（**自成一体**） |
+| **看什么** | 本地全量历史（不受 3 个月窗口限制），高级筛选、批量操作、备份、导出 Excel | 当前浏览过的历史，卡片角标、分类视图、可视化规则编辑器 |
+| **抓数据靠谁** | Analyzer（唯一持凭证）＋ `collector.py` 遗留兜底 | **不需要 Analyzer**：浏览器 hook 旁听页面自己的请求 |
+| **要凭证** | 依赖 Analyzer 的 SESSDATA | 不需要 |
+| **文档** | 本文件 §§1–6 ＋ [`doc/`](doc/) | **[`userscript/说明.md`](userscript/说明.md)**（真相源）· [`README.md`](userscript/README.md)（操作手册） |
+| **产物** | 直接运行，无需构建 | `userscript/dist/bili_history.user.js`（`python userscript/build.py` 生成） |
+
+⚠️ **两条线的数据不共享**：入口 B 的数据只存在你浏览器的 IndexedDB 里，与入口 A 的 SQLite 库彼此独立。要把浏览器的数据带进服务端，走「入口 B 导出 JSON → 入口 A 导入」这条路。
+
+---
+
+## 1. 入口 A（服务端）能做什么
 
 - **本地留存**：突破 B站官方「近 ~1000 条 / 3 个月滚动覆盖」的限制，从你开始用它的那天起一条不漏。
 - **类网页端浏览**：封面 + 标题 + UP主 + 相对时间 + 进度条，点击跳转 B站观看。
@@ -135,8 +153,10 @@ BilibiliHistoryFinder/
 ├── config.json                # ⚠️ 在仓库根（不在 data/）：web_port ＋ collector 用 SESSDATA
 ├── start.bat / stop.bat       # 启动 / 关闭（自动探测 Python，顺带拉起 / 关闭 Analyzer）
 ├── dev/                       # 测试资产（回归 / 单测 / 假后端桩）
-└── userscript/                # 浏览器脚本方向（见 §7）
+└── userscript/                # ★ 入口 B：浏览器脚本（自成一体，见 §7 与其内 说明.md）
 ```
+
+> 两个入口的边界：**入口 A**（`src/` `data/` `config.json` `start.bat`）**入口 B**（`userscript/`）各自独立，无代码互相 import。
 
 - **主数据源**：Analyzer 的 SQLite，**read-only 直连**，本仓库从不写它。
 - **采集**：`collector.py` 仅用标准库（`urllib.request` / `sqlite3` / `json`），当前仅作遗留兜底。
@@ -168,15 +188,20 @@ BilibiliHistoryFinder/
 
 ---
 
-## 7. 浏览器脚本方向（`userscript/`）
+## 7. 入口 B（浏览器脚本，`userscript/`）
 
-独立于本体的**下一个方向**：把续看规则能力直接带进 B站网页版（在历史页上加角标与筛选入口），**不依赖 Analyzer**，也不改动本体任何功能。
+> 完整说明以 [`userscript/说明.md`](userscript/说明.md) 为准（那里是这条线的真相源）。本节只做指路。
 
-- 当前处于**可行性探针**阶段（`userscript/probe.user.js`）：只验证一件事 —— 能否稳定拦到历史接口的完整响应。
-- 该探针**只读**：不发请求、不回写、不改动页面既有元素。
-- 详细安装与判定标准见 `userscript/README.md`。
+把续看规则能力直接带进 B站网页版（历史页上加角标与筛选入口），**不依赖 Analyzer**，也不改动入口 A 任何功能。
 
-> 本体（§1–§7）与它互不影响；它尚未产出可用功能。
+- **产物**：`userscript/dist/bili_history.user.js`（**0.4.1**）—— IndexedDB 双存储 ／ 引擎移植＋对拍 ／ 卡片角标 ／ 分类视图 ／ 可视化规则编辑器 ／ 导出；两个悬浮面板默认关闭。
+- **验证**：**9 套 · 215 项断言全绿**（含构建产物端到端）。
+- 真实接口与页面结构固化在 [`userscript/SCHEMA.md`](userscript/SCHEMA.md)（23 个顶层字段 ＋ `history` 子对象 8 字段 ＋ 真实 DOM 结构）。
+- 真实页选择器已按实测回填（`main.history-record` / `.bili-video-card`；卡片无 `kid` 属性，故按链接 `uri` 反查）。
+- 「主动补请求」按方案（限制 1）已定 ＝ **被动旁听，不做**（只覆盖你实际浏览过的分类）。
+- 安装与操作：`userscript/README.md`；阶段内的决策与历史留档在 `userscript/过程/`。
+
+> **两条线互不影响**：入口 B 不读写 `data/`、不碰 `config.json`、不依赖 `start.bat`；入口 A 也不 import `userscript/` 任何文件。唯一的往来是手动导出的 JSON。
 
 ---
 
